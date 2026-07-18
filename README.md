@@ -1,30 +1,82 @@
 # battle-engine
 
-An ML/search battle engine for competitive Pokémon — "Stockfish for Pokémon."
+**An ML/search battle engine for competitive Pokémon — "Stockfish for Pokémon."**
 
-The engine plays (and analyzes) Pokémon Showdown battles using game-tree search and
-machine learning, built in deliberate stages that mirror how chess engines actually
-evolved: hand-crafted evaluation + search first, then a learned evaluation trained on
-millions of human replays (the "NNUE moment"), then reinforcement learning via
-self-play. It is the intelligence layer behind
-[BattleBrain](../battle-brain), an iOS companion app that surfaces the engine's
-per-turn win-probability analysis for replay review.
+The engine plays and analyzes [Pokémon Showdown](https://pokemonshowdown.com/) battles
+using game-tree search and machine learning, built in deliberate stages that mirror
+how chess engines actually evolved: hand-crafted evaluation + search first, then a
+learned evaluation trained on millions of human replays (the "NNUE moment"), then
+reinforcement learning through self-play.
 
-Built as a learning project: every stage has a version that trains on a laptop
-(M4 MacBook Air), with objective strength gates (head-to-head win rates against the
-previous stage's bot) instead of vibes.
+It is the intelligence layer behind
+[**BattleBrain**](https://github.com/eykzhang/battle-brain), a native iOS companion
+app that surfaces the engine's per-turn win-probability analysis for replay review —
+the same relationship Stockfish has to a chess GUI.
 
-## Roadmap
+## Why Pokémon is a hard AI problem
+
+Chess engines get to assume a lot that Pokémon takes away. Every turn in a Pokémon
+battle is:
+
+- **Simultaneous** — both players commit moves at once, so there is no simple
+  minimax alternation; reasoning about the opponent's concurrent choice is part of
+  every decision (formally, each turn is a matrix game, not a tree node).
+- **Stochastic** — damage rolls, critical hits, secondary effects, and accuracy
+  checks mean identical decisions produce different futures; search must reason over
+  outcome distributions, not lines.
+- **Imperfect-information** — the opponent's movesets, items, abilities, and EV
+  spreads are hidden and only revealed through play, so the engine must maintain
+  beliefs about what it hasn't seen.
+
+Any one of these breaks textbook chess techniques; Pokémon has all three at once.
+That combination — and the fact that strong prior work exists to benchmark against —
+is what makes it a genuinely interesting engine-building problem rather than a toy.
+
+## Approach
+
+One deliberate scoping decision up front: the engine **reuses the official Pokémon
+Showdown simulator** as its rules engine (via a local server and
+[poke-env](https://github.com/hsahovic/poke-env)) rather than re-implementing gen-9
+battle mechanics — a multi-year project in itself, and the same choice made by
+essentially all serious research in this space. Effort goes into the interesting
+part: search, evaluation, and learning.
+
+Development is staged, and each stage must **beat the previous stage's bot
+head-to-head** (500+ battles, measured by a benchmark harness with confidence
+intervals) before the project advances — objective strength gates, not vibes:
 
 | Phase | What | Gate |
 |---|---|---|
-| 0 | Harness: local Showdown server, poke-env, baseline bots, benchmark script | max-damage vs random measured |
-| 1 | Classical search + hand-crafted eval (no ML) | >70% vs max-damage over 500+ battles |
-| 2 | Supervised learning: win-probability + imitation models on human replays | beats Phase-1 bot head-to-head |
-| 3 | Reinforcement learning: PPO self-play from the imitation policy | beats Phase-2 bot head-to-head |
-| 4+ | Stretch: C++ search core (MCTS + embedded NNUE-style inference), gen9OU | ladder GXE |
+| **0** | The lab: local Showdown server, poke-env harness, baseline bots (random, max-damage), benchmark script | baselines measured |
+| **1** | Classical engine: hand-crafted evaluation function + lookahead search over damage-calculated outcomes | >70% win rate vs max-damage over 500+ battles |
+| **2** | First ML: a learned win-probability evaluation and a move-prediction (imitation) model, trained on millions of parsed human replays; the learned eval replaces the hand-crafted one inside the search | beats the Phase-1 bot head-to-head |
+| **3** | Reinforcement learning: PPO self-play, initialized from the Phase-2 imitation policy | beats the Phase-2 bot head-to-head |
+| **4+** | *Stretch*: a C++ search core — fast forward model + MCTS with an embedded, NNUE-style compiled inference of the learned eval, bound to Python via pybind11; gen9 OU support with opponent-set inference | ladder GXE |
 
-Format: `gen9randombattle` (the standard bot-development ladder), gen9OU as stretch.
+The end-state architecture mirrors Stockfish and Leela Chess Zero exactly: **train in
+Python, search and infer in C++.**
+
+Format: `gen9randombattle` first (the standard bot-development ladder), gen9 OU as
+stretch.
+
+## Engineering constraints (on purpose)
+
+- **Laptop-first.** Every training run must complete on a MacBook Air (M4) in at most
+  an overnight run — measured by timing one epoch / 1k battles and extrapolating
+  before committing. Cloud GPUs are an optional accelerator, never a dependency.
+  Constraints like this force the parts that actually teach you something: careful
+  state encoding, small models, and honest measurement.
+- **Strength is the metric.** ML metrics (loss, accuracy, calibration) are tracked,
+  but no phase ships on them — only on head-to-head win rate.
+- **Fair play.** The engine never provides live move recommendations to a human
+  during ranked play (against Showdown's rules). Its analysis is post-hoc replay
+  review; ladder runs of the bot itself follow Showdown's bot etiquette.
+
+## Status
+
+**Phase 0 in progress** — repo scaffolded; local Showdown server + poke-env harness
+running and verified end-to-end (scripted battles complete on the local simulator).
+Next: max-damage baseline bot and the benchmark harness.
 
 ## Setup
 
@@ -52,6 +104,6 @@ cd pokemon-showdown && node pokemon-showdown start --no-security
 
 ## Prior art this builds on
 
-- [poke-env](https://github.com/hsahovic/poke-env) — Python/Gymnasium interface to Showdown
-- [Foul Play](https://pmariglia.github.io/posts/foul-play/) — the strongest classical bot (Rust forward model + MCTS/DUCT)
-- [Metamon](https://github.com/UT-Austin-RPL/metamon) — offline RL baselines + 3.5M+ parsed human replay trajectories
+- [poke-env](https://github.com/hsahovic/poke-env) — Python/Gymnasium interface to Pokémon Showdown
+- [Foul Play](https://pmariglia.github.io/posts/foul-play/) — the strongest classical bot (Rust forward model, MCTS with DUCT for simultaneous moves)
+- [Metamon](https://github.com/UT-Austin-RPL/metamon) — offline RL baselines and 3.5M+ parsed human replay trajectories
