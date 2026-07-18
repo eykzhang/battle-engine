@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local Pokémon Showdown server checkout (cloned per README, not vendored)
+pokemon-showdown/
+
+# Training artifacts / datasets (large, regenerable)
+data/
+runs/
+
+# macOS
+.DS_Store

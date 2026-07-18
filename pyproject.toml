@@ -1,0 +1,14 @@
+[project]
+name = "battle-engine"
+version = "0.1.0"
+description = "ML/search Pokémon battle engine — 'Stockfish for Pokémon' (learning project)"
+requires-python = ">=3.10"
+dependencies = [
+    "poke-env>=0.15",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
