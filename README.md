@@ -74,9 +74,41 @@ stretch.
 
 ## Status
 
-**Phase 0 in progress** — repo scaffolded; local Showdown server + poke-env harness
-running and verified end-to-end (scripted battles complete on the local simulator).
-Next: max-damage baseline bot and the benchmark harness.
+**Phase 0 gate met.** Benchmark harness built (Wilson-interval win rates over N
+battles); three baselines measured head-to-head over 500 battles each:
+
+| Matchup | Win rate (95% CI) |
+|---|---|
+| max-damage vs random | 91.8% [89.1, 93.9] |
+| heuristic vs random | 99.8% [98.9, 100.0] |
+| heuristic vs max-damage | 90.0% [87.1, 92.3] |
+
+**Phase 1 gates met.** `TwoPlySearchPlayer`: 2-ply lookahead (my move, opponent's assumed
+best known reply) over a hand-crafted eval and an expected-damage calculator verified
+against Showdown's own simulator source.
+
+| Matchup | Win rate (95% CI) | Gate |
+|---|---|---|
+| search vs max-damage | 84.8% [81.4, 87.7] | ✅ >70% target |
+| search vs heuristic | 59.2% [54.8, 63.4] | ✅ clear win |
+
+Getting there took two rounds of evidence-driven debugging. Replay inspection first
+showed the bot never switched proactively (fixed with a switch-urgency bonus), but that
+barely moved the win rate (~38-39%) — the tell that something bigger was still wrong. An
+independent Opus review (before anything was committed) then found the real bug:
+`expected_damage` was dividing real damage by the opponent's `max_hp`, but poke-env
+reports that as a 0-100 percent scale for the opponent's Pokemon mid-battle, not real HP
+— so nearly every attack looked like a near-guaranteed opponent faint, drowning out any
+other consideration (including switching). Fixed, verified independently, and confirmed
+by rerunning the benchmark: heuristic win rate went 39.0% → 59.2%.
+
+Remaining known gap: the bot still never uses non-damaging moves (status/setup/hazards),
+since a 0-damage move can never outrank a damaging one in the current ranking —
+`SimpleHeuristicsPlayer` has explicit logic for that. Left for Phase 2, whose learned eval
+should pick this signal up from data rather than more hand-crafted logic.
+
+Next: Phase 2 — learned win-probability eval + move-prediction model on human replay
+data, swapped into the same search.
 
 ## Setup
 
@@ -98,7 +130,11 @@ cd pokemon-showdown && node pokemon-showdown start --no-security
 # Terminal 2: smoke test — two random bots play three battles
 .venv/bin/python scripts/smoke_test.py
 
-# Tests
+# Benchmark two bots head-to-head with a 95%-confidence win rate
+# --p1/--p2 choices: random, maxdamage, heuristic, search (our Phase-1 bot)
+.venv/bin/python scripts/benchmark.py --p1 search --p2 maxdamage --n-battles 500
+
+# Tests (the harness integration test auto-skips if the server isn't running)
 .venv/bin/pytest
 ```
 

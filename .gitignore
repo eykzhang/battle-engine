@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
 
 # Local Pokémon Showdown server checkout (cloned per README, not vendored)
 pokemon-showdown/
