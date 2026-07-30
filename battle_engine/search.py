@@ -17,13 +17,20 @@ Named simplifications (consistent with damage.py/evaluation.py):
 - Only the two active Pokemon's HP changes in the projection — switching in
   doesn't take hazard chip damage, and non-damaging move effects (status,
   boosts, hazards) aren't projected forward, matching evaluate()'s own scope.
+
+Phase 2 (milestone E): TwoPlySearchPlayer's scoring function is injectable
+(`eval_fn`), not hardcoded to evaluate() — the search *shape* (2-ply,
+best-known-reply, switch-urgency patch) stays the same, only the function
+that scores a projected state changes. `win_prob.make_eval_fn` adapts a
+trained WinProbModel into this same shape for a head-to-head benchmark
+against the Phase-1 hand-crafted bot.
 """
 
 from __future__ import annotations
 
 import copy
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.battle.move import Move
@@ -34,6 +41,8 @@ from poke_env.player.battle_order import BattleOrder
 
 from battle_engine.damage import expected_damage
 from battle_engine.evaluation import evaluate, type_matchup_score
+
+EvalFn = Callable[[object], float]
 
 # How much a shallow 2-ply search undervalues escaping a bad matchup: an
 # attack's HP-swing value is directly visible within the search horizon, but
@@ -111,19 +120,52 @@ def _project_after_action(
         opponent_active_pokemon=projected_opp_active,
         side_conditions=battle.side_conditions,
         opponent_side_conditions=battle.opponent_side_conditions,
+        # Passed through unchanged (a 1-turn damage projection doesn't
+        # change field conditions) - evaluate() doesn't read these, but
+        # encoding.battle_view_from_poke_env does, and would AttributeError
+        # without them. Needed for milestone E's learned eval_fn to work.
+        weather=battle.weather,
+        fields=battle.fields,
     )
 
 
-def _switch_urgency_bonus(battle: AbstractBattle) -> float:
+def _switch_urgency_bonus(battle: AbstractBattle, weight: float) -> float:
     """How much extra credit to give switch candidates this turn, scaled by
     how unfavorable the current matchup already is (0 if it's fine)."""
     current_matchup = type_matchup_score(
         battle.active_pokemon, battle.opponent_active_pokemon
     )
-    return max(0.0, -current_matchup) * SWITCH_URGENCY_WEIGHT
+    return max(0.0, -current_matchup) * weight
 
 
 class TwoPlySearchPlayer(Player):
+    def __init__(
+        self,
+        *args,
+        eval_fn: EvalFn = evaluate,
+        switch_urgency_weight: float = SWITCH_URGENCY_WEIGHT,
+        **kwargs,
+    ):
+        """eval_fn scores a projected battle-like state from its own
+        perspective — see evaluation.evaluate()'s docstring for the exact
+        duck-typed interface it (and any replacement) must accept. Defaults
+        to the Phase-1 hand-crafted eval, unchanged from before this
+        parameter existed.
+
+        switch_urgency_weight is separate from eval_fn on purpose: it was
+        tuned empirically for evaluate()'s scale (roughly [-4, 4], summed
+        hand-picked weights) and doesn't necessarily transfer to a
+        differently-scaled eval_fn — e.g. win_prob.make_eval_fn's [0, 1]
+        probability output, where even one unfavorable type matchup's
+        default bonus (up to ~4.0) would swamp any real difference between
+        candidates (typically well under 0.1). Pass 0.0 explicitly for such
+        an eval_fn rather than silently reusing a weight tuned for a
+        different scale.
+        """
+        super().__init__(*args, **kwargs)
+        self._eval_fn = eval_fn
+        self._switch_urgency_weight = switch_urgency_weight
+
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         if battle.active_pokemon is None or battle.opponent_active_pokemon is None:
             return self.choose_random_move(battle)
@@ -137,11 +179,11 @@ class TwoPlySearchPlayer(Player):
         if not candidates:
             return self.choose_random_move(battle)
 
-        switch_bonus = _switch_urgency_bonus(battle)
+        switch_bonus = _switch_urgency_bonus(battle, self._switch_urgency_weight)
 
         def score(candidate: tuple[Union[Move, Pokemon], Optional[Move], Pokemon]) -> float:
             _, my_move, my_active_after = candidate
-            value = evaluate(_project_after_action(battle, my_active_after, my_move))
+            value = self._eval_fn(_project_after_action(battle, my_active_after, my_move))
             if my_move is None:  # this candidate is a switch
                 value += switch_bonus
             return value

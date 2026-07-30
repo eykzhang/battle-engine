@@ -66,8 +66,111 @@ Decision: stop Phase 1 here rather than build status/setup-move modeling now —
 gates are now genuinely met. Phase 2's learned eval is expected to pick up on setup/
 status value that the hand-crafted eval structurally can't express.
 
-Next: Phase 2 (first ML) — learned win-probability eval + move-prediction model trained
-on Metamon's replay dataset, swapped into the same search shape.
+Phase 2 (first ML) started: state encoding is built and tested —
+`battle_engine/encoding.py` maps either a live poke-env battle or one turn of a
+Metamon parsed replay into the same fixed-size (316-dim) vector via two adapters
+(`battle_view_from_poke_env`, `battle_view_from_replay_state`) over a shared
+`BattleView`/`PokemonView` intermediate representation, `tests/test_encoding.py`
+covers shape, edge cases (fainted/unknown slots), and adapter parity on an
+equivalent state. The replay schema was verified against real downloaded data, not
+assumed from metamon's docs — those describe a `ParsedReplay`/`turnlist` shape that
+doesn't match the actual `.json.lz4` files, which are `{"states": [...], "actions":
+[...]}` with each state already flattened/POV-relative. `scripts/
+fetch_replay_sample.py` streams Metamon's gen9ou.tar.gz (20+GB on Hugging Face) and
+decompresses it member-by-member, stopping once it's collected N ELO-filtered
+replays, so a laptop-sized dev sample never requires the full download.
+
+Known, accepted scope limit in the v1 encoder: opponent-side detail beyond the
+current active Pokemon is a single "fraction remaining" scalar, not per-mon slots —
+a replay's single state doesn't carry stats for opponent Pokemon that aren't
+currently active, only a remaining-count. Revisit if the win-prob model's accuracy
+looks bottlenecked on this.
+
+Since then: added ability handling to the matchup-score dimension — known
+type-immunity abilities (Levitate, Water Absorb, Flash Fire, Wonder Guard, ...) are
+folded into `_type_multiplier` via `_TYPE_IMMUNITY_ABILITIES` rather than given their
+own dimension (gen 9 has hundreds of abilities; a learned embedding is the right tool
+for full ability identity, once an actual model exists to attach one to). Caught a
+real test bug while building this: an early test used Rotom to demonstrate "ability
+unrevealed vs. revealed", but Rotom only has one possible ability in-game, so poke-env
+correctly auto-fills it as public knowledge — silently making the comparison a no-op.
+Fixed by switching to Bronzong (genuinely ambiguous: Levitate/Heatproof/Heavy Metal).
+
+Dataset pipeline (Phase 2 milestone C): `battle_engine/dataset.py` / `scripts/
+build_dataset.py` build cached `(vector, label)` arrays (`data/dataset/{train,val}
+.npz`) from fetched replays, split by *battle* (not file, not turn — see below).
+Label is each replay's *final* outcome (filename's WIN/LOSS suffix, cross-checked
+against the last state), not the per-state `battle_won`/`battle_lost` flag, which is
+`False`/`False` for nearly the whole game and would otherwise train the model toward
+"is the game already over and won this turn" instead of a real win-probability
+signal.
+
+Win-probability model (Phase 2 milestone D) is built and trained once:
+`battle_engine/win_prob.py` (`WinProbModel`: `316(ish) → hidden → ReLU → Dropout →
+1`, `train()`, `accuracy()`/`calibration_error()`) and `scripts/train_win_prob.py`.
+Two independent Opus reviews (same practice that caught the Phase-1 HP-percent-scale
+bug) found and fixed real bugs across milestones B–D. The pattern is consistent
+enough to call out on its own: **every review so far has found something real by
+checking actual downloaded data and library source, not by trusting docstrings** —
+why "evidence over assumption" stays a hard rule here, not a nice-to-have.
+
+Bugs found and fixed, first review (milestones A/B — `encoding.py`/`fetch_replay_sample.py`):
+- Fainted teammates silently vanished from the replay-derived encoding (Metamon's
+  `available_switches` never lists them) but not the live-battle one (poke-env keeps
+  them in `battle.team`). Fixed with `battle_views_from_replay()` — needs a whole
+  replay's turn sequence, not one state, to notice a teammate disappeared.
+- Fixing that surfaced its own bug: tracking identity by Pokemon "name" breaks on
+  in-battle form changes (Terapagos → `terapagosterastal` on Tera, Minior →
+  `miniormeteor`). Fixed by keying on `base_species` instead (also used for stable
+  bench-slot ordering on both adapters — replay bench order wasn't stable turn to
+  turn either).
+- Live-battle hazard encoding reported every simultaneously-active condition; real
+  replay data's hazard field is single-valued/overwritten. Narrowed the live side to
+  match (a deliberate fidelity trade, the user's call, not a bug by itself).
+- `fetch_replay_sample.py`: added a request timeout (was unbounded), reports
+  achieved date-range (an early run was found to be temporally biased — 30/30 files
+  from one month), added `--accept-probability` to trade bandwidth for a wider
+  spread.
+
+Bugs found and fixed, second review (milestone D, plus a re-check of the first
+review's fixes against a much larger real sample — 2,060 replays instead of 30):
+- **`scripts/train_win_prob.py` was saving the *final*-epoch model while printing
+  "best val_loss at epoch k"** — since this model reliably overfits well before
+  training ends, the saved checkpoint was the single worst one of the run, silently.
+  `train()` now tracks and returns the best-val-loss state dict directly.
+- **Train/val leakage**: ~2.3% of Metamon's archived battles are stored from both
+  players' POV as separate files sharing one battle id; splitting by file let some
+  land with one POV in train and the mirrored POV (same game, inverted label) in val.
+  `split_replays` now groups by battle id.
+- The hazard-narrowing fix above was incomplete: Aurora Veil and Tailwind weren't in
+  the vocabulary at all (a real miss, not the documented tradeoff), and `battle_field`
+  (terrain) has the identical single-valued-masking issue (Trick Room/Gravity could
+  mask an active terrain). Both fixed the same way, now sourced from poke-env's own
+  `STACKABLE_CONDITIONS` rather than a hand-maintained guess at which conditions are
+  turn- vs. count-tracked. The original "no removal signal, so narrowing is the only
+  option" reasoning also turned out shakier than assumed — the field does revert to
+  `noconditions` on a clean sweep — so fuller hazard reconstruction is a real,
+  deliberately-deferred option now, not a closed question.
+- `calibration_error` silently dropped predictions of exactly 1.0 (fell outside
+  every `[lo, hi)` bin) — latent today, but exactly the failure mode a longer/bigger
+  training run reaches. `predict_proba` left the model permanently in `eval()` mode
+  instead of restoring the caller's prior mode.
+- `battle_view_from_poke_env` would raise a confusing bench-overflow assertion at
+  team preview (no active Pokemon yet, but `battle.team` already has all 6) — now a
+  clear, intentional `ValueError` instead.
+- `fetch_replay_sample.py`'s "idempotent" re-run skip check didn't count existing
+  files toward the target, so re-running with the same `--n` always added N *more*
+  files instead of topping up to N total — fixed, and now skips the network
+  entirely if the target's already met.
+
+Current real numbers (2,060 replays, ~2,013 distinct battles): 55,446 train / 6,406
+val states, best val_loss 0.664 at epoch 2 of 30 (val_acc 0.633, cal_err 0.104),
+overfitting sets in almost immediately after. Real but modest signal — nowhere near
+wired into search yet.
+
+Next: milestone E — swap the trained model into `search.py`'s scoring (behind
+`evaluate()`'s interface) and re-benchmark against the Phase-1 bot. That head-to-head
+win rate is the actual Phase 2 gate, not any of the training metrics above.
 
 ## Hard rules
 
@@ -98,17 +201,33 @@ cd pokemon-showdown && node pokemon-showdown start --no-security
 
 # Tests (integration test auto-skips if the local server isn't running)
 .venv/bin/pytest
+
+# Pull a small ELO-filtered sample of Metamon's gen9ou replay dataset (streams the
+# 20+GB archive, stops after --n replays; never downloads it whole). Needs the `ml`
+# extra installed: .venv/bin/pip install -e ".[ml,dev]"
+.venv/bin/python scripts/fetch_replay_sample.py --n 200 --min-elo 1200
+
+# Build the cached (vector, win/loss-label) dataset from fetched replays
+.venv/bin/python scripts/build_dataset.py --replay-dir data/replays_raw --out-dir data/dataset
+
+# Train the win-probability MLP on the cached dataset; saves the best-val-loss
+# checkpoint (not the final epoch) to data/models/win_prob.pt
+.venv/bin/python scripts/train_win_prob.py
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
-Add new commands here as the harness/training scripts land — don't leave this stale.
+`data/` (fetched replay samples) is gitignored too — regenerate via the fetch script
+above rather than committing it. Add new commands here as the harness/training
+scripts land — don't leave this stale.
 
 ## Layout
 
 - `battle_engine/` — the package (bots, eval, encoding, search)
-- `scripts/` — runnable entry points (smoke test, benchmarks, training)
+- `scripts/` — runnable entry points (smoke test, benchmarks, replay fetching, training)
 - `tests/` — pytest (state encoding, damage calc, harness determinism w/ seeded RNG)
 - `pokemon-showdown/` — local simulator checkout (gitignored)
+- `data/` — gitignored: `replays_raw/` (fetched replays), `dataset/` (cached train/val
+  arrays), `models/` (trained checkpoints) — see commands above
 
 ## Git workflow
 

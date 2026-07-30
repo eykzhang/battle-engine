@@ -107,8 +107,36 @@ since a 0-damage move can never outrank a damaging one in the current ranking �
 `SimpleHeuristicsPlayer` has explicit logic for that. Left for Phase 2, whose learned eval
 should pick this signal up from data rather than more hand-crafted logic.
 
-Next: Phase 2 — learned win-probability eval + move-prediction model on human replay
-data, swapped into the same search.
+**Phase 2 pipeline built end-to-end; first gate attempt not yet met.** A learned
+win-probability model — a small MLP trained on human replay data from
+[Metamon](https://github.com/UT-Austin-RPL/metamon) — now scores search's candidate
+moves in place of the hand-crafted Phase-1 evaluation:
+
+- **State encoding**: a fixed-size vector representation of a battle state, with two
+  adapters (live poke-env battles, parsed human replays) feeding the same model.
+- **Data pipeline**: a streaming fetcher that ELO-filters replays without downloading
+  Metamon's full 20+GB archive, and a dataset builder that gets the win/loss labeling
+  right (a replay's *final* outcome, not its still-undecided per-turn state) and
+  splits train/val by battle to avoid leakage.
+- **Training**: a small MLP (PyTorch), evaluated on validation loss, accuracy, and
+  calibration, not accuracy alone.
+
+Two more rounds of independent code review (the same practice that caught Phase 1's
+bug) found and fixed real correctness issues before this was trusted for a benchmark
+— including a live-vs-replay data mismatch in the state encoding and a training bug
+that was silently saving each run's *worst* checkpoint instead of its best.
+
+| Matchup | Win rate (95% CI) | Gate |
+|---|---|---|
+| learned eval vs. Phase-1 search | 37.6% [33.5, 41.9] | ❌ not met |
+
+The shortfall has a diagnosed cause, not a mysterious one: the training set (~2,000
+replays) is still small for the model's input size, and this first benchmark ran on a
+different battle format than the model trained on (gen9 OU team-building
+infrastructure doesn't exist yet for a same-format comparison). Revisiting model
+quality — more data, a matched-format benchmark — before Phase 3.
+
+Next: Phase 3 groundwork (PPO self-play), interleaved with closing the Phase 2 gate.
 
 ## Setup
 

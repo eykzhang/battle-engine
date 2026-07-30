@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from poke_env.battle.move import Move
 
 from battle_engine.search import (
+    SWITCH_URGENCY_WEIGHT,
     TwoPlySearchPlayer,
     _apply_damage,
     _opponent_best_reply,
@@ -20,6 +21,8 @@ def _battle(my_team, my_active, opp_team, opp_active, available_moves=(), availa
         opponent_active_pokemon=opp_active,
         side_conditions={},
         opponent_side_conditions={},
+        weather={},
+        fields={},
         available_moves=list(available_moves),
         available_switches=list(available_switches),
     )
@@ -114,7 +117,7 @@ def test_switch_urgency_bonus_is_zero_in_a_fine_matchup():
     opp_active = make_mon("blissey")  # neutral matchup either way
     battle = _battle([my_active], my_active, [opp_active], opp_active)
 
-    assert _switch_urgency_bonus(battle) == 0.0
+    assert _switch_urgency_bonus(battle, SWITCH_URGENCY_WEIGHT) == 0.0
 
 
 def test_switch_urgency_bonus_is_positive_in_a_bad_matchup():
@@ -123,7 +126,7 @@ def test_switch_urgency_bonus_is_positive_in_a_bad_matchup():
     opp_active = make_mon("donphan")
     battle = _battle([my_active], my_active, [opp_active], opp_active)
 
-    assert _switch_urgency_bonus(battle) > 0.0
+    assert _switch_urgency_bonus(battle, SWITCH_URGENCY_WEIGHT) > 0.0
 
 
 def test_search_player_switches_out_of_a_bad_matchup_even_with_a_real_attack_available():
@@ -150,3 +153,61 @@ def test_search_player_switches_out_of_a_bad_matchup_even_with_a_real_attack_ava
     order = player.choose_move(battle)
 
     assert order.order.species == "tangela"
+
+
+def test_project_after_action_passes_through_weather_and_fields_unchanged():
+    # Real bug caught while wiring milestone E: this used to omit weather/
+    # fields entirely, which evaluate() never reads but
+    # encoding.battle_view_from_poke_env does (AttributeError without them).
+    my_active = make_mon("garchomp")
+    opp_active = make_mon("dragapult")
+    battle = _battle([my_active], my_active, [opp_active], opp_active)
+    battle.weather = {"sandstorm": 1}
+    battle.fields = {"grassyterrain": 1}
+
+    projected = _project_after_action(battle, my_active, None)
+
+    assert projected.weather == {"sandstorm": 1}
+    assert projected.fields == {"grassyterrain": 1}
+
+
+def test_eval_fn_defaults_to_evaluate():
+    player = TwoPlySearchPlayer(battle_format="gen9randombattle", start_listening=False)
+
+    from battle_engine.evaluation import evaluate
+    assert player._eval_fn is evaluate
+
+
+def test_custom_eval_fn_overrides_the_default_and_actually_gets_used():
+    # A custom eval_fn that scores purely by my_active's species name length
+    # (an arbitrary, clearly-not-evaluate() signal) should change which
+    # candidate wins versus the real evaluate()-driven choice.
+    my_active = make_mon("charizard")
+    my_bench = make_mon("tangela")  # shorter name than charizard
+    opp_active = make_mon("gastrodon")
+    battle = _battle(
+        [my_active, my_bench], my_active, [opp_active], opp_active,
+        available_moves=[Move("flamethrower", gen=9)],
+        available_switches=[my_bench],
+    )
+
+    def prefer_shorter_active_species(state) -> float:
+        return -len(state.active_pokemon.species)
+
+    player = TwoPlySearchPlayer(
+        battle_format="gen9randombattle", start_listening=False,
+        eval_fn=prefer_shorter_active_species, switch_urgency_weight=0.0,
+    )
+    order = player.choose_move(battle)
+
+    # "tangela" (7 chars) beats "charizard" (9 chars) under this eval_fn,
+    # regardless of what evaluate() would have preferred here.
+    assert order.order.species == "tangela"
+
+
+def test_switch_urgency_weight_zero_disables_the_bonus():
+    my_active = make_mon("electrode")
+    opp_active = make_mon("donphan")  # Electric into Ground: 0x, worst matchup
+    battle = _battle([my_active], my_active, [opp_active], opp_active)
+
+    assert _switch_urgency_bonus(battle, 0.0) == 0.0

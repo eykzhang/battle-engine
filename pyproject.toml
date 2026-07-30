@@ -9,6 +9,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+ml = ["torch", "requests", "lz4", "numpy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
