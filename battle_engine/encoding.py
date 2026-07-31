@@ -101,7 +101,7 @@ Named simplifications (same convention as damage.py/evaluation.py):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -182,6 +182,83 @@ _TYPE_IMMUNITY_ABILITIES: Dict[str, PokemonType] = {
 }
 _UNKNOWN_ABILITY_TOKEN = "unknownability"  # Metamon's placeholder for "not yet revealed"
 
+# Real gap found 2026-07-31, after milestone E's first gate result (30.2%,
+# format-mismatch-corrected) came in well below the >50% target: replay
+# inspection during diagnosis showed the trained model ranking a switch into
+# a healthy Heavy-Duty-Boots/Roost/Defog pivot *below* staying in with an
+# about-to-faint attacker - exactly the kind of decision that needs item and
+# moveset knowledge (hazard immunity, recovery, hazard removal) this encoder
+# was never giving it. Both adapters' raw data actually carry this (verified:
+# a real downloaded replay state's per-mon dict has 'item' and a full 'moves'
+# list with name/type/category/base_power/priority; poke-env's live
+# Pokemon has the same via .item and .moves), it just wasn't being read.
+#
+# Move *identity* isn't one-hot encoded (same "too many distinct values for a
+# hand-built vector" reasoning as abilities) - instead, each mon's known
+# moveset is summarized into a handful of hand-engineered features via
+# Showdown's own movedex flags (_MOVES_DEX), the same "verify against real
+# data/library source, don't hand-guess" approach _HAZARD_TOKENS and
+# _TYPE_IMMUNITY_ABILITIES already use:
+# - has_recovery: any known move has movedex flags.heal (Roost, Recover, ...)
+# - has_hazard_setup: any known move sets a hazard side condition
+#   (sideCondition in _HAZARD_SETUP_CONDITIONS - Stealth Rock/Spikes/Toxic
+#   Spikes/Sticky Web, not screens, which don't affect switch-safety the
+#   same way)
+# - has_hazard_removal: known move name in _HAZARD_REMOVAL_MOVES - unlike the
+#   features above, Showdown's movedex has no data-level flag for this (it's
+#   coded as onHit simulator logic, not declared data), so this is a short,
+#   verifiable hardcoded list, same spirit as _HAZARD_TOKENS itself
+# - has_setup_boost: any known *self*-targeted move's movedex entry has a
+#   positive `boosts` value (Swords Dance, Calm Mind, Dragon Dance, ...).
+#   Gated on target == "self" - a real false-positive bug caught by review
+#   (2026-07-31): Swagger/Flatter also have positive top-level `boosts`
+#   values but apply them to the *opponent* (target: "normal"), so an
+#   earlier version of this check flagged them as setup moves too. Still
+#   imprecise for the rare opponent-debuff move with a *negative* boosts
+#   entry (Screech), which correctly does NOT set this flag, an acceptable
+#   miss. Belly Drum and Acupressure are real self-buffing moves with no
+#   declarative `boosts` field at all (implemented via onHit simulator
+#   logic instead, same reason has_hazard_removal needs a hardcoded list) -
+#   _ONHIT_SETUP_MOVES below, same short-verifiable-list pattern.
+#   Curse is deliberately left off that list even though it's also
+#   onHit/boosts=None: its target is "normal" and its effect is genuinely
+#   type-dependent (stat boost + self-damage for non-Ghost users, target-
+#   damage + no boost for Ghost users) - can't be resolved without the
+#   user's type at lookup time, so treating it as "not a setup move" is the
+#   conservative, defensible choice, not a gap.
+# - has_pivot: any known move has movedex flags.selfSwitch (U-turn, Volt
+#   Switch, Parting Shot, ...) - relevant to switch-safety reasoning
+#   specifically, distinct from has_priority below
+# - has_priority: any known move has priority > 0
+# - max_base_power: the highest base_power among known damaging moves,
+#   normalized - a coarse "how hard can this thing hit" signal
+# - move type coverage: multi-hot over types appearing among known moves -
+#   distinct from the mon's own types (used for STAB/matchup), this is about
+#   what a switch-in can threaten back with
+_MOVES_DEX = GenData.from_gen(9).moves
+_HAZARD_SETUP_CONDITIONS = {"stealthrock", "spikes", "toxicspikes", "stickyweb"}
+_HAZARD_REMOVAL_MOVES = {"rapidspin", "defog", "courtchange", "tidyup", "mortalspin"}
+_ONHIT_SETUP_MOVES = {"bellydrum", "acupressure"}
+_MAX_BASE_POWER_SCALE = 250.0  # Explosion/Self-Destruct-class outliers, a loose ceiling
+
+# Verified against the real replay vocabulary: the 20 most common held
+# items. An "other known item" bucket below covers everything outside this
+# list rather than silently treating a rare item as blank/no-item. Original
+# 2026-07-31 pass sampled ~640 states across 800 replays and put
+# blackglasses 20th; review re-checked against a larger 400-file sample and
+# found blacksludge (338 occurrences) is actually more common than
+# blackglasses (214) - swapped. Low-severity either way (a mis-ranked vocab
+# item just falls into the "other known" bucket instead of a dedicated
+# slot, nothing corrupts), but worth keeping accurate since re-verifying is
+# cheap.
+_ITEM_VOCAB = [
+    "leftovers", "heavydutyboots", "rockyhelmet", "boosterenergy", "lifeorb",
+    "choiceband", "choicescarf", "choicespecs", "assaultvest", "airballoon",
+    "focussash", "wellspringmask", "toxicorb", "loadeddice", "lightclay",
+    "heatrock", "weaknesspolicy", "damprock", "eviolite", "blacksludge",
+]
+_UNKNOWN_ITEM_TOKENS = {None, "", "noitem", "unknownitem", "unknown_item"}
+
 _POKEMON_VEC_LEN = (
     1  # known
     + 1  # hp_fraction
@@ -190,6 +267,11 @@ _POKEMON_VEC_LEN = (
     + len(_ALL_TYPES)
     + len(_BOOST_NAMES)
     + len(_STAT_NAMES)
+    + len(_ITEM_VOCAB) + 1  # item one-hot + "other known item" bucket
+    + 5  # has_recovery, has_hazard_setup, has_hazard_removal, has_setup_boost, has_pivot
+    + 1  # has_priority
+    + 1  # max_base_power (normalized)
+    + len(_ALL_TYPES)  # move type coverage (distinct from the mon's own types above)
 )
 VECTOR_LEN = (
     _POKEMON_VEC_LEN * (1 + MAX_BENCH + 1)  # my active, my bench, opponent active
@@ -199,6 +281,67 @@ VECTOR_LEN = (
     + len(_TERRAIN_NAMES)
     + 1  # active-vs-active type matchup score
 )
+
+
+@dataclass
+class MoveSummary:
+    """Hand-engineered summary of a Pokemon's known moveset - see the
+    _MOVES_DEX comment block above for why these specific features and not
+    raw move identity. Both adapters build this via _move_summary_features
+    from a plain list of move-id strings, so the derivation logic itself
+    isn't duplicated per adapter.
+    """
+    has_recovery: bool = False
+    has_hazard_setup: bool = False
+    has_hazard_removal: bool = False
+    has_setup_boost: bool = False
+    has_pivot: bool = False
+    has_priority: bool = False
+    max_base_power: int = 0
+    move_types: frozenset = frozenset()
+
+
+def _move_summary_features(move_ids: Sequence[str]) -> MoveSummary:
+    summary = MoveSummary()
+    max_bp = 0
+    move_types = set()
+    has_recovery = has_hazard_setup = has_hazard_removal = False
+    has_setup_boost = has_pivot = has_priority = False
+    for move_id in move_ids:
+        entry = _MOVES_DEX.get(move_id)
+        if entry is None:  # unrecognized/typo-guarded - skip rather than crash
+            continue
+        flags = entry.get("flags", {})
+        if flags.get("heal"):
+            has_recovery = True
+        if entry.get("sideCondition") in _HAZARD_SETUP_CONDITIONS:
+            has_hazard_setup = True
+        if move_id in _HAZARD_REMOVAL_MOVES:
+            has_hazard_removal = True
+        if move_id in _ONHIT_SETUP_MOVES:
+            has_setup_boost = True
+        elif entry.get("target") == "self" and any(
+            v > 0 for v in entry.get("boosts", {}).values()
+        ):
+            has_setup_boost = True
+        if flags.get("selfSwitch") or entry.get("selfSwitch"):
+            has_pivot = True
+        if entry.get("priority", 0) > 0:
+            has_priority = True
+        max_bp = max(max_bp, entry.get("basePower", 0) or 0)
+        move_type = entry.get("type")
+        if move_type:
+            move_types.add(PokemonType.from_name(move_type))
+    return MoveSummary(
+        has_recovery=has_recovery,
+        has_hazard_setup=has_hazard_setup,
+        has_hazard_removal=has_hazard_removal,
+        has_setup_boost=has_setup_boost,
+        has_pivot=has_pivot,
+        has_priority=has_priority,
+        max_base_power=max_bp,
+        move_types=frozenset(move_types),
+    )
 
 
 @dataclass
@@ -215,6 +358,10 @@ class PokemonView:
     # type-immunity abilities. None means "no ability" or "not yet revealed";
     # those are indistinguishable from the outside, same as in a real battle.
     ability: Optional[str] = None
+    # None means no item held OR not yet revealed - same "indistinguishable
+    # from the outside" convention as ability above (see _UNKNOWN_ITEM_TOKENS).
+    item: Optional[str] = None
+    moves: MoveSummary = field(default_factory=MoveSummary)
 
     @staticmethod
     def unknown() -> "PokemonView":
@@ -227,6 +374,8 @@ class PokemonView:
             boosts={name: 0 for name in _BOOST_NAMES},
             base_stats={name: 0 for name in _STAT_NAMES},
             ability=None,
+            item=None,
+            moves=MoveSummary(),
         )
 
 
@@ -253,6 +402,10 @@ def _pad_bench(bench: list) -> list:
 # --- poke-env (live battle) adapter -----------------------------------------
 
 
+def _poke_env_item(mon: Pokemon) -> Optional[str]:
+    return None if mon.item in _UNKNOWN_ITEM_TOKENS else mon.item
+
+
 def _poke_env_pokemon_view(mon: Optional[Pokemon]) -> PokemonView:
     if mon is None:
         return PokemonView.unknown()
@@ -265,6 +418,8 @@ def _poke_env_pokemon_view(mon: Optional[Pokemon]) -> PokemonView:
         boosts=dict(mon.boosts),
         base_stats=dict(mon.base_stats),
         ability=mon.ability,  # None if not yet revealed, already normalized (to_id_str)
+        item=_poke_env_item(mon),
+        moves=_move_summary_features([m.id for m in mon.moves.values()]),
     )
 
 
@@ -389,6 +544,17 @@ def _replay_ability(mon: dict) -> Optional[str]:
     return None if mon["ability"] == _UNKNOWN_ABILITY_TOKEN else mon["ability"]
 
 
+def _replay_item(mon: dict) -> Optional[str]:
+    return None if mon["item"] in _UNKNOWN_ITEM_TOKENS else mon["item"]
+
+
+def _replay_moves(mon: dict) -> MoveSummary:
+    # mon["moves"] entries are already Showdown id-form ("stealthrock", not
+    # "Stealth Rock") - verified against a real downloaded replay - so each
+    # name indexes _MOVES_DEX directly, same as the live adapter's move.id.
+    return _move_summary_features([m["name"] for m in mon["moves"]])
+
+
 def _replay_pokemon_view(mon: Optional[dict]) -> PokemonView:
     if mon is None:
         return PokemonView.unknown()
@@ -405,6 +571,8 @@ def _replay_pokemon_view(mon: Optional[dict]) -> PokemonView:
         boosts={name: mon[f"{name}_boost"] for name in _BOOST_NAMES},
         base_stats={name: mon[f"base_{name}"] for name in _STAT_NAMES},
         ability=_replay_ability(mon),
+        item=_replay_item(mon),
+        moves=_replay_moves(mon),
     )
 
 
@@ -417,7 +585,9 @@ def _replay_pokemon_view_fainted(mon: dict) -> PokemonView:
     Reconstructed here from the last snapshot this replay had of the mon,
     with hp/status/boosts overwritten to reflect having fainted - its exact
     HP right before fainting isn't recoverable from this data, only that
-    it's now 0, and boosts don't survive a faint anyway.
+    it's now 0, and boosts don't survive a faint anyway. item/moves are kept
+    from that last snapshot (unlike hp/status/boosts, they don't change on
+    fainting, and a fainted mon can't be switched to regardless).
     """
     return PokemonView(
         known=True,
@@ -428,6 +598,8 @@ def _replay_pokemon_view_fainted(mon: dict) -> PokemonView:
         boosts={name: 0 for name in _BOOST_NAMES},
         base_stats={name: mon[f"base_{name}"] for name in _STAT_NAMES},
         ability=_replay_ability(mon),
+        item=_replay_item(mon),
+        moves=_replay_moves(mon),
     )
 
 
@@ -539,6 +711,36 @@ def _base_stat_vector(base_stats: Dict[str, int]) -> np.ndarray:
     )
 
 
+def _item_vector(item: Optional[str]) -> np.ndarray:
+    vec = np.zeros(len(_ITEM_VOCAB) + 1, dtype=np.float32)
+    if item is None:
+        return vec
+    if item in _ITEM_VOCAB:
+        vec[_ITEM_VOCAB.index(item)] = 1.0
+    else:
+        vec[-1] = 1.0  # known item, outside the curated vocab
+    return vec
+
+
+def _move_summary_vector(moves: MoveSummary) -> np.ndarray:
+    flags = np.array(
+        [
+            1.0 if moves.has_recovery else 0.0,
+            1.0 if moves.has_hazard_setup else 0.0,
+            1.0 if moves.has_hazard_removal else 0.0,
+            1.0 if moves.has_setup_boost else 0.0,
+            1.0 if moves.has_pivot else 0.0,
+            1.0 if moves.has_priority else 0.0,
+        ],
+        dtype=np.float32,
+    )
+    max_bp = np.array([moves.max_base_power / _MAX_BASE_POWER_SCALE], dtype=np.float32)
+    coverage = np.zeros(len(_ALL_TYPES), dtype=np.float32)
+    for t in moves.move_types:
+        coverage[_ALL_TYPES.index(t)] = 1.0
+    return np.concatenate([flags, max_bp, coverage])
+
+
 def _encode_pokemon(view: PokemonView) -> np.ndarray:
     return np.concatenate(
         [
@@ -549,6 +751,8 @@ def _encode_pokemon(view: PokemonView) -> np.ndarray:
             _multi_hot_types(view.types),
             _boost_vector(view.boosts),
             _base_stat_vector(view.base_stats),
+            _item_vector(view.item),
+            _move_summary_vector(view.moves),
         ]
     )
 

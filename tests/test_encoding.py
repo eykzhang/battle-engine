@@ -39,6 +39,7 @@ def _battle(
 def _replay_pokemon(
     name="garchomp", hp_pct=1.0, status="nostatus", types="dragon ground",
     boosts=None, base_stats=None, ability="unknownability", base_species=None,
+    item="unknownitem", moves=None,
 ):
     boosts = boosts or {}
     base_stats = base_stats or {
@@ -51,7 +52,8 @@ def _replay_pokemon(
         "types": types,
         "status": status,
         "ability": ability,
-        "moves": [],
+        "item": item,
+        "moves": moves or [],
         **{f"{stat}_boost": boosts.get(stat, 0) for stat in
            ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")},
         **{f"base_{stat}": base_stats[stat] for stat in
@@ -284,6 +286,111 @@ def test_replay_adapter_maps_unknown_ability_token_to_none():
 
     assert view.opp_active.ability is None
     assert view.my_active.ability == "roughskin"
+
+
+def test_replay_adapter_maps_unknown_item_token_to_none():
+    mon = _replay_pokemon("dragapult", item="unknownitem")
+    revealed = _replay_pokemon("garchomp", item="heavydutyboots")
+    no_item = _replay_pokemon("blissey", item="noitem")
+    state = _replay_state(revealed, mon, available_switches=[no_item])
+
+    view = battle_view_from_replay_state(state)
+
+    assert view.opp_active.item is None
+    assert view.my_active.item == "heavydutyboots"
+    assert view.my_bench[0].item is None  # "noitem" folds to None, same as unrevealed
+
+
+def test_move_summary_detects_recovery_hazard_setup_removal_pivot_priority():
+    # One Pokemon whose real moveset exercises every MoveSummary flag at
+    # once, checked against Showdown's own movedex (_MOVES_DEX) rather than
+    # hand-picked expectations - roost/stealthrock/rapidspin/swordsdance/
+    # uturn/suckerpunch are real, stable moves, not synthetic test fixtures.
+    mon = _replay_pokemon(
+        "garchomp",
+        moves=[
+            {"name": "roost"},        # flags.heal
+            {"name": "stealthrock"},  # sideCondition -> hazard setup
+            {"name": "rapidspin"},    # hardcoded hazard-removal set
+            {"name": "swordsdance"},  # boosts.atk > 0
+        ],
+    )
+    state = _replay_state(mon, _replay_pokemon("dragapult"))
+
+    view = battle_view_from_replay_state(state)
+    moves = view.my_active.moves
+
+    assert moves.has_recovery is True
+    assert moves.has_hazard_setup is True
+    assert moves.has_hazard_removal is True
+    assert moves.has_setup_boost is True
+    assert moves.has_pivot is False
+    assert moves.has_priority is False
+    assert moves.max_base_power == 50  # rapidspin is a 50-BP damaging move, not pure utility
+
+    pivot_and_priority = _replay_pokemon(
+        "talonflame",
+        moves=[
+            {"name": "uturn"},        # selfSwitch
+            {"name": "suckerpunch"},  # priority 1
+            {"name": "tackle"},       # base_power 40, no flags above
+        ],
+    )
+    state2 = _replay_state(pivot_and_priority, _replay_pokemon("dragapult"))
+    moves2 = battle_view_from_replay_state(state2).my_active.moves
+
+    assert moves2.has_pivot is True
+    assert moves2.has_priority is True
+    assert moves2.has_recovery is False
+    assert moves2.max_base_power == 70  # uturn=70, suckerpunch=70, tackle=40 - the max
+
+
+def test_has_setup_boost_ignores_opponent_targeted_buffs_and_catches_onhit_setup_moves():
+    # Regression test for a real bug a review caught (2026-07-31): the
+    # original check flagged *any* move with a positive value anywhere in
+    # its movedex boosts dict, without checking who the boost applies to.
+    # Swagger/Flatter have positive boosts values but target: "normal" -
+    # they buff the OPPONENT (while confusing/taunting them), not the user.
+    # The Swords Dance case in the test above would have passed even before
+    # this fix (it's a genuine self-boost), so it didn't guard against this.
+    opponent_buffer = _replay_pokemon("wobbuffet", moves=[{"name": "swagger"}, {"name": "flatter"}])
+    state = _replay_state(opponent_buffer, _replay_pokemon("dragapult"))
+    assert battle_view_from_replay_state(state).my_active.moves.has_setup_boost is False
+
+    # The other half of the same bug: Belly Drum and Acupressure are real,
+    # competitively significant self-buff moves with NO declarative boosts
+    # field at all (implemented via onHit simulator logic instead), so the
+    # boosts-dict check alone always missed them - _ONHIT_SETUP_MOVES exists
+    # specifically to catch these two.
+    belly_drummer = _replay_pokemon("azumarill", moves=[{"name": "bellydrum"}])
+    state2 = _replay_state(belly_drummer, _replay_pokemon("dragapult"))
+    assert battle_view_from_replay_state(state2).my_active.moves.has_setup_boost is True
+
+    acupressure_user = _replay_pokemon("smeargle", moves=[{"name": "acupressure"}])
+    state3 = _replay_state(acupressure_user, _replay_pokemon("dragapult"))
+    assert battle_view_from_replay_state(state3).my_active.moves.has_setup_boost is True
+
+
+def test_item_encodes_as_one_hot_with_other_bucket_for_rare_items():
+    known_vocab_item = _replay_pokemon("garchomp", item="leftovers")
+    rare_item = _replay_pokemon("garchomp", item="mail")  # not in _ITEM_VOCAB
+    unrevealed = _replay_pokemon("garchomp", item="unknownitem")
+
+    vocab_vec = enc._item_vector(battle_view_from_replay_state(
+        _replay_state(known_vocab_item, _replay_pokemon("dragapult"))
+    ).my_active.item)
+    rare_vec = enc._item_vector(battle_view_from_replay_state(
+        _replay_state(rare_item, _replay_pokemon("dragapult"))
+    ).my_active.item)
+    unrevealed_vec = enc._item_vector(battle_view_from_replay_state(
+        _replay_state(unrevealed, _replay_pokemon("dragapult"))
+    ).my_active.item)
+
+    assert vocab_vec.sum() == 1.0
+    assert vocab_vec[enc._ITEM_VOCAB.index("leftovers")] == 1.0
+    assert rare_vec.sum() == 1.0
+    assert rare_vec[-1] == 1.0  # "other known item" bucket
+    assert unrevealed_vec.sum() == 0.0
 
 
 def test_replay_adapter_parses_verified_schema():

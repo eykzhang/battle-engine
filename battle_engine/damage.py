@@ -69,6 +69,28 @@ def estimate_stat(mon: Pokemon, stat: str) -> float:
     return int(int(2 * mon.base_stats[stat] + 31) * mon.level / 100) + 5
 
 
+def _fixed_damage(attacker: Pokemon, defender: Pokemon, move: Move) -> float | None:
+    """Raw (pre-accuracy) damage for moves with a fixed-damage formula
+    (Seismic Toss, Night Shade: attacker's level; Dragon Rage, Sonic Boom: a
+    flat number) instead of the base_power/stat formula - poke-env exposes
+    this via Move.damage ('level', an int, or 0 for normal moves). These
+    moves bypass STAB, crit, and the damage roll entirely (real Showdown
+    mechanics), but type immunity (not resistance/weakness scaling) still
+    applies. None if `move` isn't one of these - not a fixed-damage move.
+
+    HP-dependent variants (Super Fang, Final Gambit, Endeavor - poke-env
+    marks these with a damageCallback, not a plain `damage` value) aren't
+    handled: they need the *actual* defender HP, not an estimate, and their
+    formulas aren't simple scalars. Left out deliberately, same spirit as
+    this module's other named simplifications.
+    """
+    if move.damage == "level":
+        return attacker.level
+    if isinstance(move.damage, int) and move.damage > 0:
+        return move.damage
+    return None
+
+
 def expected_damage(attacker: Pokemon, defender: Pokemon, move: Move) -> float:
     """Expected damage dealt by `move`, as a fraction of defender's real max
     HP (via estimate_stat, not defender.max_hp directly — see its docstring:
@@ -81,7 +103,16 @@ def expected_damage(attacker: Pokemon, defender: Pokemon, move: Move) -> float:
     Returns 0.0 for status moves (no base power) — their non-damage effects
     (stat boosts, status conditions, hazards) aren't modeled by this function.
     """
-    if move.category == MoveCategory.STATUS or not move.base_power:
+    if move.category == MoveCategory.STATUS:
+        return 0.0
+
+    fixed = _fixed_damage(attacker, defender, move)
+    if fixed is not None:
+        if defender.damage_multiplier(move.type) == 0:  # type immunity still applies
+            return 0.0
+        return fixed * move.accuracy / estimate_stat(defender, "hp")
+
+    if not move.base_power:
         return 0.0
 
     atk_stat, def_stat = _attack_defense_stats(move)

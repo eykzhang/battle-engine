@@ -56,8 +56,11 @@ intervals) before the project advances — objective strength gates, not vibes:
 The end-state architecture mirrors Stockfish and Leela Chess Zero exactly: **train in
 Python, search and infer in C++.**
 
-Format: `gen9randombattle` first (the standard bot-development ladder), gen9 OU as
-stretch.
+Format: `gen9randombattle` first (the standard bot-development ladder, Phases 0-1).
+Phase 2's training data is human `gen9ou` replays, so real `gen9ou` benchmarking
+(constructed teams, validated against the local Showdown ruleset) now exists
+alongside it — full ladder-ready `gen9ou` play (opponent-set inference, etc.) is
+still stretch scope.
 
 ## Engineering constraints (on purpose)
 
@@ -107,36 +110,48 @@ since a 0-damage move can never outrank a damaging one in the current ranking �
 `SimpleHeuristicsPlayer` has explicit logic for that. Left for Phase 2, whose learned eval
 should pick this signal up from data rather than more hand-crafted logic.
 
-**Phase 2 pipeline built end-to-end; first gate attempt not yet met.** A learned
-win-probability model — a small MLP trained on human replay data from
-[Metamon](https://github.com/UT-Austin-RPL/metamon) — now scores search's candidate
-moves in place of the hand-crafted Phase-1 evaluation:
+**Phase 2 built end-to-end, gate not yet met — four honest rounds of iteration,
+plateaued.** A learned win-probability model (small MLP, PyTorch) trained on human
+replay data from [Metamon](https://github.com/UT-Austin-RPL/metamon) scores search's
+candidate moves in place of the hand-crafted Phase-1 evaluation, and a second
+imitation (move-prediction) model was also built, closing out both of Phase 2's
+originally-planned deliverables:
 
-- **State encoding**: a fixed-size vector representation of a battle state, with two
+- **State encoding**: a 656-dim vector representation of a battle state (species,
+  types, HP, status, boosts, stats, held item, and a hand-engineered moveset summary —
+  recovery/hazard-setup/hazard-removal/setup-boost/pivot/priority/coverage), with two
   adapters (live poke-env battles, parsed human replays) feeding the same model.
 - **Data pipeline**: a streaming fetcher that ELO-filters replays without downloading
-  Metamon's full 20+GB archive, and a dataset builder that gets the win/loss labeling
-  right (a replay's *final* outcome, not its still-undecided per-turn state) and
-  splits train/val by battle to avoid leakage.
-- **Training**: a small MLP (PyTorch), evaluated on validation loss, accuracy, and
-  calibration, not accuracy alone.
+  Metamon's full 20+GB archive, temporally spread (30,000 replays, Dec 2023 → May
+  2026) rather than clustered in one month, and a dataset builder that gets the
+  win/loss labeling right (a replay's *final* outcome) and splits train/val by battle
+  to avoid leakage.
+- **Two models**: `WinProbModel` (state → P(win), two hidden layers) feeds
+  `TwoPlySearchPlayer`'s eval function; `ImitationModel` (state → predicted human
+  action, 13-class classifier over a verified real action-space scheme) is built and
+  validated but not yet integrated anywhere.
 
-Two more rounds of independent code review (the same practice that caught Phase 1's
-bug) found and fixed real correctness issues before this was trusted for a benchmark
-— including a live-vs-replay data mismatch in the state encoding and a training bug
-that was silently saving each run's *worst* checkpoint instead of its best.
+Several rounds of independent code review (same practice that caught Phase 1's bug)
+found and fixed real correctness issues throughout — a live-vs-replay encoding
+mismatch, a checkpoint-saving bug, a damage-calculation gap for fixed-damage moves
+(Seismic Toss and similar), and two feature-encoding bugs in how setup-boosting moves
+were detected.
 
-| Matchup | Win rate (95% CI) | Gate |
+| Matchup (on-distribution, gen9ou) | Win rate (95% CI) | Gate |
 |---|---|---|
-| learned eval vs. Phase-1 search | 37.6% [33.5, 41.9] | ❌ not met |
+| learned eval vs. Phase-1 search (final) | 35.6% [31.5, 39.9] | ❌ not met |
 
-The shortfall has a diagnosed cause, not a mysterious one: the training set (~2,000
-replays) is still small for the model's input size, and this first benchmark ran on a
-different battle format than the model trained on (gen9 OU team-building
-infrastructure doesn't exist yet for a same-format comparison). Revisiting model
-quality — more data, a matched-format benchmark — before Phase 3.
+The full trajectory — 30.2% → 38.4% → 39.6% → 35.6% across format-mismatch fixes,
+more/fresher data, richer features, more model capacity, and bug fixes — plateaued in
+the same band after the first real jump. Read as a real signal, not noise: a learned
+eval bolted onto the same shallow 2-ply search structurally can't see switching's
+multi-turn value beyond a hand-tuned patch, and that's plausibly the actual ceiling on
+this axis, not a bug still waiting to be found.
 
-Next: Phase 3 groundwork (PPO self-play), interleaved with closing the Phase 2 gate.
+Next: open decision between more Phase 2 tuning (deeper search, data beyond Metamon)
+or moving to Phase 3 (PPO self-play, which sidesteps this specific ceiling by
+learning a policy directly instead of ranking states through a fixed-depth lookahead —
+now with both a value-function and a policy warm-start candidate available).
 
 ## Setup
 
@@ -159,8 +174,9 @@ cd pokemon-showdown && node pokemon-showdown start --no-security
 .venv/bin/python scripts/smoke_test.py
 
 # Benchmark two bots head-to-head with a 95%-confidence win rate
-# --p1/--p2 choices: random, maxdamage, heuristic, search (our Phase-1 bot)
+# --p1/--p2 choices: random, maxdamage, heuristic, search (Phase-1), learned (Phase-2)
 .venv/bin/python scripts/benchmark.py --p1 search --p2 maxdamage --n-battles 500
+.venv/bin/python scripts/benchmark.py --p1 learned --p2 search --format gen9ou --n-battles 500
 
 # Tests (the harness integration test auto-skips if the server isn't running)
 .venv/bin/pytest

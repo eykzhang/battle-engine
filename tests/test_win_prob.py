@@ -6,7 +6,7 @@ from battle_engine.win_prob import WinProbModel, accuracy, calibration_error, tr
 
 
 def test_model_forward_pass_returns_one_logit_per_example():
-    model = WinProbModel(hidden_size=8)
+    model = WinProbModel(hidden_sizes=(8,))
     x = torch.zeros(5, VECTOR_LEN)
 
     logits = model(x)
@@ -15,7 +15,7 @@ def test_model_forward_pass_returns_one_logit_per_example():
 
 
 def test_predict_proba_squashes_logits_into_zero_one():
-    model = WinProbModel(hidden_size=8)
+    model = WinProbModel(hidden_sizes=(8,))
     x = torch.randn(10, VECTOR_LEN)
 
     probs = model.predict_proba(x)
@@ -66,7 +66,7 @@ def test_training_loop_reduces_loss_on_a_trivially_separable_dataset():
     x = rng.normal(size=(n, VECTOR_LEN)).astype(np.float32)
     y = (x[:, 0] > 0).astype(np.float32)  # label = sign of one feature
 
-    model = WinProbModel(hidden_size=16, dropout=0.0)
+    model = WinProbModel(hidden_sizes=(16,), dropout=0.0)
     history, _ = train(
         model, x, y, x, y,
         epochs=50, batch_size=16, lr=1e-2, weight_decay=0.0,
@@ -87,7 +87,7 @@ def test_training_loop_runs_on_real_shaped_tiny_dataset():
     x_val = rng.normal(size=(5, VECTOR_LEN)).astype(np.float32)
     y_val = rng.integers(0, 2, size=5).astype(np.float32)
 
-    model = WinProbModel(hidden_size=8)
+    model = WinProbModel(hidden_sizes=(8,))
     history, best_state = train(
         model, x_train, y_train, x_val, y_val,
         epochs=2, batch_size=8, device="cpu", verbose=False,
@@ -116,7 +116,7 @@ def test_train_returns_the_best_checkpoint_not_the_final_epoch():
     x_val = rng.normal(size=(32, VECTOR_LEN)).astype(np.float32)
     y_val = rng.integers(0, 2, size=32).astype(np.float32)  # unrelated to x_val
 
-    model = WinProbModel(hidden_size=64, dropout=0.0)
+    model = WinProbModel(hidden_sizes=(64,), dropout=0.0)
     history, best_state = train(
         model, x_train, y_train, x_val, y_val,
         epochs=40, batch_size=16, lr=1e-2, weight_decay=0.0,
@@ -126,7 +126,7 @@ def test_train_returns_the_best_checkpoint_not_the_final_epoch():
     best_metrics = min(history, key=lambda m: m.val_loss)
     assert history[-1].val_loss > best_metrics.val_loss  # confirms overfitting really happened
 
-    reloaded = WinProbModel(hidden_size=64, dropout=0.0)
+    reloaded = WinProbModel(hidden_sizes=(64,), dropout=0.0)
     reloaded.load_state_dict(best_state)
     with torch.no_grad():
         logits = reloaded(torch.from_numpy(x_val).float())
@@ -154,7 +154,7 @@ def test_predict_proba_restores_prior_train_mode():
     # never restore the caller's prior mode, so calling it mid-training-loop
     # (e.g. for early-stopping logic) would silently leave dropout off for
     # the rest of training.
-    model = WinProbModel(hidden_size=8, dropout=0.5)
+    model = WinProbModel(hidden_sizes=(8,), dropout=0.5)
     model.train()
 
     model.predict_proba(torch.randn(4, VECTOR_LEN))

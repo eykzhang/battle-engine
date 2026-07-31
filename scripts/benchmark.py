@@ -9,14 +9,15 @@ Start the local Showdown server first (see README), then e.g.:
 wires it into TwoPlySearchPlayer's scoring via win_prob.make_eval_fn, in place of
 evaluate() — same search shape as "search" (the Phase-1 bot), different eval.
 
-Caveat worth knowing before trusting this number: the default --format is
-gen9randombattle (Phase 0/1's format, auto-generated teams, no team-building
-infra needed), but the model was trained on gen9ou human replays (constructed
-OU teams). A "learned" benchmark on gen9randombattle is testing the model on
-team compositions and movesets it never saw in training - a real distribution
-mismatch, not just a formality. Interpret a loss here cautiously; it may
-reflect the format mismatch more than the model's quality on its actual
-target distribution.
+The model was trained on gen9ou human replays (constructed OU teams), but the
+default --format is gen9randombattle (Phase 0/1's format, auto-generated
+teams, no team-building infra needed) - a "learned" benchmark on
+gen9randombattle tests the model on team compositions and movesets it never
+saw in training, a real distribution mismatch, not just a formality. Pass
+`--format gen9ou` to benchmark on-distribution instead; teams are then drawn
+from battle_engine.teams's small pool of real Smogon sample teams (gen9ou
+requires a submitted team - poke-env has no built-in generator for it, unlike
+gen9randombattle).
 """
 
 import argparse
@@ -27,7 +28,19 @@ from poke_env.player import MaxBasePowerPlayer, Player, RandomPlayer, SimpleHeur
 
 from battle_engine.benchmark import run_benchmark
 from battle_engine.search import TwoPlySearchPlayer
+from battle_engine.teams import RandomTeamFromPool
 from battle_engine.win_prob import WinProbModel, make_eval_fn
+
+# Best point estimate from a 7-point sweep (0.0-0.2, 80 battles each, gen9ou)
+# run after diagnosing that the learned eval - with no switch-urgency
+# compensation at all - undervalues switching away from a critically low-HP
+# Pokemon relative to attacking with it (same structural blind spot the
+# Phase-1 switch-urgency patch fixed for evaluate(), just never replaced for
+# the learned eval's different scale). 0.0 scored 28.7%; 0.03/0.05/0.08 all
+# clustered around 40-42.5%; 0.12 dipped to 31.2% (likely noise at N=80,
+# CIs overlap) before 0.15/0.2 partially recovered. Worth re-sweeping with a
+# larger N or a finer grid if the model is retrained again.
+LEARNED_SWITCH_URGENCY_WEIGHT = 0.08
 
 PLAYERS = {
     "random": RandomPlayer,
@@ -38,18 +51,27 @@ PLAYERS = {
 CHOICES = sorted(PLAYERS) + ["learned"]
 
 
+# Formats poke-env/Showdown generate a team for server-side - no submitted
+# team needed. Everything else (gen9ou, the only other format this CLI
+# actually targets today) needs one, hence RandomTeamFromPool below. An
+# explicit allowlist rather than `!= "gen9randombattle"` - review flagged
+# the negative check as a footgun: any *other* auto-team format (e.g.
+# gen8randombattle) would have silently gotten an OU-team pool instead of
+# no team, if this CLI's --format were ever pointed there.
+_AUTO_TEAM_FORMATS = {"gen9randombattle"}
+
+
 def _make_player(name: str, battle_format: str, model_path: Path) -> Player:
+    team = None if battle_format in _AUTO_TEAM_FORMATS else RandomTeamFromPool()
     if name == "learned":
         model = WinProbModel.load(model_path)
         return TwoPlySearchPlayer(
             battle_format=battle_format,
+            team=team,
             eval_fn=make_eval_fn(model),
-            # Not the default: see TwoPlySearchPlayer's docstring for why a
-            # weight tuned for evaluate()'s scale would swamp a [0, 1]
-            # probability output instead of complementing it.
-            switch_urgency_weight=0.0,
+            switch_urgency_weight=LEARNED_SWITCH_URGENCY_WEIGHT,
         )
-    return PLAYERS[name](battle_format=battle_format)
+    return PLAYERS[name](battle_format=battle_format, team=team)
 
 
 def parse_args() -> argparse.Namespace:

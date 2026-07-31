@@ -12,9 +12,18 @@ dropping while val stalls or rises, that's overfitting.
 
 Architecture and training choices, explained once here rather than repeated
 in comments below:
-- One hidden layer (ReLU) — nonlinearity is what lets the model represent
-  feature *interactions* (e.g. "type matchup matters more at low HP") that a
-  linear model (equivalent to evaluate()'s weighted sum) structurally can't.
+- Two hidden layers (ReLU) by default, not one — bumped from a single
+  64-unit layer after adding item/moveset features (encoding.py, 2026-07-31)
+  took the input from 316 to 656 dims: measured directly, the old single-
+  layer architecture didn't just fail to benefit from the new dimensions, it
+  got *worse* (val_acc 0.651->0.636, and a head-to-head benchmark dropped
+  32.0% from 38.4%) - more input dimensions gave a fixed-capacity net more
+  ways to overfit the same ~800k training rows, not more signal to use.
+  Nonlinearity (any hidden layer) is what lets the model represent feature
+  *interactions* (e.g. "type matchup matters more at low HP") that a linear
+  model (equivalent to evaluate()'s weighted sum) structurally can't; a
+  second layer lets it compose those interactions further (e.g. "matchup x
+  HP x whether the switch-in resists the active hazard").
 - Dropout (randomly zeroes hidden units during training only) and Adam's
   weight_decay (an L2 penalty added to the loss) are both regularization —
   ways to discourage the model from memorizing training-set idiosyncrasies,
@@ -34,7 +43,7 @@ import copy
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Tuple
+from typing import Callable, Dict, Iterator, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -44,14 +53,15 @@ from battle_engine.encoding import VECTOR_LEN, battle_view_from_poke_env, encode
 
 
 class WinProbModel(nn.Module):
-    def __init__(self, hidden_size: int = 64, dropout: float = 0.2):
+    def __init__(self, hidden_sizes: Sequence[int] = (128, 64), dropout: float = 0.3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(VECTOR_LEN, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1),
-        )
+        layers: List[nn.Module] = []
+        in_size = VECTOR_LEN
+        for size in hidden_sizes:
+            layers += [nn.Linear(in_size, size), nn.ReLU(), nn.Dropout(dropout)]
+            in_size = size
+        layers.append(nn.Linear(in_size, 1))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Raw logits, shape (batch,) — not probabilities. Use predict_proba
@@ -62,13 +72,13 @@ class WinProbModel(nn.Module):
     @staticmethod
     def load(path: Path) -> "WinProbModel":
         """Loads a checkpoint saved by scripts/train_win_prob.py: a dict of
-        {state_dict, hidden_size, dropout}, not a bare state_dict, so the
+        {state_dict, hidden_sizes, dropout}, not a bare state_dict, so the
         architecture doesn't have to be remembered/guessed separately from
         the CLI flags used to train it (a gap review pointed out).
         """
         checkpoint = torch.load(path, map_location="cpu")
         model = WinProbModel(
-            hidden_size=checkpoint["hidden_size"], dropout=checkpoint["dropout"]
+            hidden_sizes=checkpoint["hidden_sizes"], dropout=checkpoint["dropout"]
         )
         model.load_state_dict(checkpoint["state_dict"])
         return model
@@ -232,10 +242,15 @@ def make_eval_fn(model: WinProbModel) -> Callable[[object], float]:
     max-ranking candidates within one search call - no rescaling needed,
     only relative order matters.
 
-    Pass switch_urgency_weight=0.0 when constructing TwoPlySearchPlayer with
-    this eval_fn, not the default tuned for evaluate(): see
-    TwoPlySearchPlayer's own docstring for why reusing that weight unchanged
-    would let the switch-urgency patch swamp the model's actual predictions.
+    Don't reuse switch_urgency_weight's default (tuned for evaluate()'s
+    roughly [-4, 4] scale) unchanged with this eval_fn - it would swamp a
+    [0, 1] probability output. But don't zero it either: replay-inspection
+    diagnosis found the learned eval, with no switch-urgency term at all,
+    undervalues switching away from a critically low-HP Pokemon relative to
+    attacking with it - the same blind spot the switch-urgency patch exists
+    to fix for evaluate(), just silently unfixed for this eval_fn. See
+    scripts/benchmark.py's LEARNED_SWITCH_URGENCY_WEIGHT for a swept value
+    on this scale.
     """
     model.eval()
 

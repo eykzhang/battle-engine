@@ -1,12 +1,14 @@
-"""Train the win-probability MLP (Phase 2 milestone D) on the cached dataset
-built by scripts/build_dataset.py.
+"""Train the imitation model (Phase 2's originally-planned second
+milestone) on the cached action dataset built by
+scripts/build_action_dataset.py.
 
 Check the printed "train: N states" line for the dataset's actual current
-size rather than assuming a number — it grows as more replays get fetched.
-Watch val_loss: if it stops improving or rises while train_loss keeps
-dropping, that's overfitting (see battle_engine/win_prob.py's docstring).
+size rather than assuming a number. Watch val_loss: if it stops improving
+or rises while train_loss keeps dropping, that's overfitting - see
+battle_engine/win_prob.py's docstring for why that's expected on this
+project's still-small dataset, same reasoning applies here.
 
-    .venv/bin/python scripts/train_win_prob.py
+    .venv/bin/python scripts/train_imitation.py
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from battle_engine.win_prob import WinProbModel, train
+from battle_engine.imitation import ImitationModel, train
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,11 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
         "--device", default="cpu",
-        help="cpu or mps - cpu is likely faster at this dataset's current tiny scale "
+        help="cpu or mps - cpu is likely faster at this dataset's current scale "
              "(MPS transfer/kernel-launch overhead isn't worth it yet)",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", type=Path, default=Path("data/models/win_prob.pt"))
+    parser.add_argument("--out", type=Path, default=Path("data/models/imitation.pt"))
     return parser.parse_args()
 
 
@@ -47,11 +49,11 @@ def main() -> None:
     torch.manual_seed(args.seed)
     hidden_sizes = tuple(int(s) for s in args.hidden_sizes.split(","))
 
-    train_data = np.load(args.dataset_dir / "train.npz")
-    val_data = np.load(args.dataset_dir / "val.npz")
+    train_data = np.load(args.dataset_dir / "train_actions.npz")
+    val_data = np.load(args.dataset_dir / "val_actions.npz")
     print(f"train: {train_data['X'].shape[0]} states, val: {val_data['X'].shape[0]} states")
 
-    model = WinProbModel(hidden_sizes=hidden_sizes, dropout=args.dropout)
+    model = ImitationModel(hidden_sizes=hidden_sizes, dropout=args.dropout)
     history, best_state = train(
         model,
         train_data["X"], train_data["y"],
@@ -60,13 +62,6 @@ def main() -> None:
         weight_decay=args.weight_decay, device=args.device,
     )
 
-    # Real bug caught by review: this used to save model.state_dict() here,
-    # i.e. the *final*-epoch weights, while printing "best val_loss at epoch
-    # k" below - since this model reliably overfits well before the run
-    # ends, that saved the single worst checkpoint while claiming otherwise.
-    # train() now hands back the best-val-loss state dict directly.
-    # Move to CPU before saving (also review-caught): a state dict saved
-    # from an MPS run is device-bound on load without map_location.
     checkpoint = {
         "state_dict": {k: v.cpu() for k, v in best_state.items()},
         "hidden_sizes": hidden_sizes,
@@ -80,7 +75,7 @@ def main() -> None:
     print(f"\nSaved best-epoch model to {args.out}")
     print(
         f"Best val_loss={best.val_loss:.4f} at epoch {best_epoch}/{len(history)} "
-        f"(val_acc={best.val_accuracy:.3f}, val_cal_err={best.val_calibration_error:.3f})"
+        f"(val_top1_acc={best.val_top1_accuracy:.3f})"
     )
     if history[-1].val_loss > best.val_loss * 1.1:
         print("Note: training continued well past the best epoch (val_loss rose "
