@@ -97,6 +97,88 @@ Named simplifications (same convention as damage.py/evaluation.py):
   Speed Boost, Protean, Multiscale, Unaware, ...) aren't modeled at all;
   representing those well is a job for a learned ability embedding once an
   actual model exists, not something to hand-derive here.
+
+Real gap found 2026-08-01, diagnosing Phase 3's PPO win-rate plateau against
+the search bot (replay inspection again, same technique that found the
+Phase-1 switch bug and Phase-2 damage-calc bugs): a real, quantifiable
+pathology, not just noise — the trained policy repeatedly re-used a
+protect-counter move (Protect, Endure, ...) right after it had just failed,
+walking back into Showdown's own escalating-failure mechanic (each
+consecutive use drops the success chance geometrically) and taking large,
+predictable HP losses as a direct result (verified turn-by-turn: HP crashing
+from 1.00 to 0.54 immediately after a 2nd consecutive Protect, in a battle
+the policy went on to lose). This is a genuine encoder gap, not a training-
+config problem: poke-env already tracks the exact mechanic per-Pokemon
+(`Pokemon.protect_counter`, incremented on a successful protect-counter
+move, reset to 0 on a failed one, a non-protect move, or a switch-out) but
+nothing here was reading it, so no model trained on this vector could ever
+learn "don't protect again, it's about to fail" — the information needed to
+make that call was structurally invisible to it.
+
+`PokemonView.protect_counter` (an `int`, encoded as a single normalized
+scalar — see `_PROTECT_COUNTER_SCALE`) fixes this:
+- Live adapter: `mon.protect_counter` directly — exact, poke-env's own
+  tracked value, correct for active and benched Pokemon alike (poke-env
+  itself already resets it to 0 on switch-out, so reading it off a bench
+  slot needs no special-casing).
+- Replay adapter: no equivalent field exists in a Metamon replay state (only
+  `player_prev_move`/`opponent_prev_move` — see below for what these
+  actually mean) — reconstructed across a whole replay's turn sequence the
+  same way fainted teammates already are (`battle_views_from_replay`, not
+  the single-state function, which can't do this and documents 0 as its
+  gap the same way it already does for fainted teammates). A deliberate,
+  verified simplification versus poke-env's exact semantics: increments on
+  any consecutive same-side use of a protect-counter move by the same
+  active Pokemon (tracked via species-identity continuity, resetting the
+  streak on any switch), without attempting to detect success vs. failure.
+  Faithfully reconstructing the real failure-reset would need inferring
+  "did this Protect actually block the hit" from hp_pct deltas alone, which
+  is confounded by residual status damage (burn/poison/toxic keep ticking
+  through a *successful* Protect) — trading one approximation for a
+  noisier one, so deliberately not attempted.
+
+  **A real bug in this reconstruction, found by independent review
+  (2026-08-01), after the feature had already been built, tested, and used
+  to retrain both Phase-2 models once**: `player_prev_move`/
+  `opponent_prev_move` are NOT "the move used on the transition into this
+  state" — they're "the last move this Pokemon has ever used," carried
+  forward byte-for-byte (name AND current_pp AND every other field)
+  unchanged across states where that side didn't actually act (Metamon
+  emits extra decision states, e.g. for the opponent's forced switch after
+  a KO, where the player's own side did nothing at all). The original
+  version had no way to tell a genuine second consecutive protect from a
+  stale carried-over one — both showed the name "protect" — so it kept
+  incrementing an already-resolved streak. Measured against real per-move
+  PP as independent ground truth (a move's own `current_pp` only drops on
+  an actual use): 59.4% of reconstructed streak-2 values and 41.7% of
+  streak-3 values were wrong as a direct, quantified result. Fixed by
+  comparing each side's whole `prev_move` dict to the previous state's: if
+  identical, nothing happened for that side this transition, so the
+  PREVIOUS streak value carries forward unchanged (neither incremented nor
+  reset) rather than being read as a fresh use - a signal available
+  directly from `states` with no need to thread the replay's separate
+  per-state action labels through this function. Re-verified against
+  independent moveset-PP ground truth after the fix: 1,238/1,242 (99.7%)
+  of streak>=2 reconstructions now correspond to a real PP drop (up from
+  the pre-fix ~41-59% error rate) across a 3,000-replay sample.
+
+  The original numbers quoted here as "verification" were themselves
+  corrupted by this bug and have been corrected: re-run after the fix,
+  across a 3,000-replay/91,385-state sample, a nonzero streak occurs on
+  1.34% of (state, side) pairs (matches the original 1.35% claim, though
+  that number was actually the nonzero-streak rate, not "protect-counter
+  moves as a fraction of states," a mismatch the review also caught), the
+  longest streak seen is now 2 (not 3, and the false 4s/5s the bug produced
+  in the actual training dataset are gone), and streak>=2 correlates with
+  that Pokemon fainting the same turn only 11.4% of the time (70 total
+  instances, 8 at a faint) — NOT "every instance," which was the review's
+  most important catch: the original "always ends in a faint" claim was
+  reading its own bug's artifact (the post-faint phantom state) as
+  independent confirmation, not measuring the real underlying pattern at
+  all. The feature is still worth having — genuine multi-use protect
+  streaks are real and rare in human play, matching the live adapter's
+  exact semantics — but the original "validates itself" framing was
+  circular, not evidence.
 """
 
 from __future__ import annotations
@@ -181,6 +263,19 @@ _TYPE_IMMUNITY_ABILITIES: Dict[str, PokemonType] = {
     "wellbakedbody": PokemonType.FIRE,
 }
 _UNKNOWN_ABILITY_TOKEN = "unknownability"  # Metamon's placeholder for "not yet revealed"
+
+# Moves that increment poke-env's own Pokemon.protect_counter (verified
+# against poke_env.battle.move's private _PROTECT_MOVES/_PROTECT_COUNTER_MOVES
+# constants directly, not guessed - not importable, since they're private,
+# so the exact name set is duplicated here rather than reconstructed by hand).
+# Mat Block is a real protect-like move but deliberately excluded, matching
+# poke-env's own _PROTECT_COUNTER_MOVES (side-protect moves wideguard/
+# quickguard DO increment the counter; matblock does not).
+_PROTECT_COUNTER_MOVES = {
+    "protect", "detect", "endure", "spikyshield", "kingsshield", "banefulbunker",
+    "burningbulwark", "obstruct", "maxguard", "silktrap", "wideguard", "quickguard",
+}
+_PROTECT_COUNTER_SCALE = 5.0  # real streaks are rare/short (see module docstring); a loose ceiling
 
 # Real gap found 2026-07-31, after milestone E's first gate result (30.2%,
 # format-mismatch-corrected) came in well below the >50% target: replay
@@ -272,6 +367,7 @@ _POKEMON_VEC_LEN = (
     + 1  # has_priority
     + 1  # max_base_power (normalized)
     + len(_ALL_TYPES)  # move type coverage (distinct from the mon's own types above)
+    + 1  # protect_counter (normalized)
 )
 VECTOR_LEN = (
     _POKEMON_VEC_LEN * (1 + MAX_BENCH + 1)  # my active, my bench, opponent active
@@ -362,6 +458,15 @@ class PokemonView:
     # from the outside" convention as ability above (see _UNKNOWN_ITEM_TOKENS).
     item: Optional[str] = None
     moves: MoveSummary = field(default_factory=MoveSummary)
+    # How many consecutive turns this Pokemon has just used a protect-
+    # counter move (Protect, Endure, ...) - see module docstring for why
+    # this is a real feature, not a nice-to-have, and how each adapter
+    # computes it (exact via poke-env's own tracking on the live side,
+    # a verified approximation reconstructed from replay history on the
+    # other). 0 for an off-field (bench/unknown) Pokemon, which is always
+    # correct, not just a placeholder - poke-env itself resets the real
+    # counter to 0 on switch-out.
+    protect_counter: int = 0
 
     @staticmethod
     def unknown() -> "PokemonView":
@@ -376,6 +481,7 @@ class PokemonView:
             ability=None,
             item=None,
             moves=MoveSummary(),
+            protect_counter=0,
         )
 
 
@@ -420,6 +526,7 @@ def _poke_env_pokemon_view(mon: Optional[Pokemon]) -> PokemonView:
         ability=mon.ability,  # None if not yet revealed, already normalized (to_id_str)
         item=_poke_env_item(mon),
         moves=_move_summary_features([m.id for m in mon.moves.values()]),
+        protect_counter=mon.protect_counter,
     )
 
 
@@ -555,7 +662,14 @@ def _replay_moves(mon: dict) -> MoveSummary:
     return _move_summary_features([m["name"] for m in mon["moves"]])
 
 
-def _replay_pokemon_view(mon: Optional[dict]) -> PokemonView:
+def _replay_pokemon_view(mon: Optional[dict], protect_counter: int = 0) -> PokemonView:
+    """protect_counter defaults to 0 - correct for bench slots (an off-field
+    Pokemon's real streak is 0, poke-env resets it on switch-out too - see
+    PokemonView's docstring) and for single-state callers that can't
+    reconstruct it at all (battle_view_from_replay_state). Only
+    battle_views_from_replay, which has the whole turn sequence to work
+    with, ever passes a real nonzero value in.
+    """
     if mon is None:
         return PokemonView.unknown()
     status_token = mon["status"]
@@ -573,6 +687,7 @@ def _replay_pokemon_view(mon: Optional[dict]) -> PokemonView:
         ability=_replay_ability(mon),
         item=_replay_item(mon),
         moves=_replay_moves(mon),
+        protect_counter=protect_counter,
     )
 
 
@@ -601,6 +716,75 @@ def _replay_pokemon_view_fainted(mon: dict) -> PokemonView:
         item=_replay_item(mon),
         moves=_replay_moves(mon),
     )
+
+
+def _replay_protect_streaks(states: list) -> Tuple[list, list]:
+    """Per-state (my, opponent) protect-counter-streak reconstruction - see
+    module docstring for the exact simplification versus poke-env's real
+    protect_counter (increments regardless of success/failure; resets on a
+    non-protect-counter move OR a change of active species, not attempting
+    to detect a failed protect specifically).
+
+    Needs the whole turn sequence, same reason fainted-teammate
+    reconstruction does: state[i]'s streak depends on what was chosen and
+    who was active in state[i-1], not on state[i] alone.
+
+    A first version of this function treated state[i]'s player_prev_move/
+    opponent_prev_move as "the move used on the i-1 -> i transition" -
+    wrong, and a real bug (found by independent review, 2026-08-01):
+    Metamon's prev_move fields are "the last move this Pokemon has ever
+    used", carried forward UNCHANGED across states where that side didn't
+    actually act (e.g. an extra decision state generated for the
+    opponent's forced switch after a KO, where nothing happened on this
+    side at all) - not reset each turn. Verified directly: across a real
+    sample, whenever a side's prev_move dict is byte-identical to the
+    previous state's (name AND current_pp AND every other field), no new
+    move actually happened; whenever the same move name is genuinely
+    reused, current_pp always differs. The original version had no way to
+    tell these apart from name alone, so a stale carried-over "protect"
+    silently kept incrementing an already-resolved streak - measured against
+    real per-move PP as ground truth: 59.4% of reconstructed streak-2 values
+    and 41.7% of streak-3 values were wrong as a direct result.
+
+    Fixed by carrying the PREVIOUS streak forward unchanged (rather than
+    incrementing OR resetting) whenever this side's prev_move dict is
+    identical to last state's - "nothing happened for this side, so
+    whatever was true a moment ago is still true now" - a self-contained
+    signal that needs no extra data (like the replay's separate per-state
+    action labels) threaded through this function.
+    """
+    my_streaks: list = []
+    opp_streaks: list = []
+    my_streak = opp_streak = 0
+    my_prev_species: Optional[str] = None
+    opp_prev_species: Optional[str] = None
+    my_prev_move: Optional[dict] = None
+    opp_prev_move: Optional[dict] = None
+
+    for state in states:
+        my_species = _species_key(state["player_active_pokemon"])
+        opp_species = _species_key(state["opponent_active_pokemon"])
+        my_move = state["player_prev_move"]
+        opp_move = state["opponent_prev_move"]
+
+        if my_species != my_prev_species:
+            my_streak = 0
+        elif my_move != my_prev_move:
+            my_streak = my_streak + 1 if my_move["name"] in _PROTECT_COUNTER_MOVES else 0
+        # else: no real action for this side this transition - my_streak
+        # (already computed for the previous state) carries forward as-is.
+
+        if opp_species != opp_prev_species:
+            opp_streak = 0
+        elif opp_move != opp_prev_move:
+            opp_streak = opp_streak + 1 if opp_move["name"] in _PROTECT_COUNTER_MOVES else 0
+
+        my_streaks.append(my_streak)
+        opp_streaks.append(opp_streak)
+        my_prev_species, opp_prev_species = my_species, opp_species
+        my_prev_move, opp_prev_move = my_move, opp_move
+
+    return my_streaks, opp_streaks
 
 
 def _replay_hazards(conditions: str) -> set:
@@ -651,9 +835,11 @@ def battle_views_from_replay(states: list) -> list:
     bench past 5 slots and trip _pad_bench's assert. Left as a loud failure
     rather than silently handled, consistent with why that assert exists.
     """
+    my_protect_streaks, opp_protect_streaks = _replay_protect_streaks(states)
+
     seen: Dict[str, dict] = {}
     views = []
-    for state in states:
+    for state, my_streak, opp_streak in zip(states, my_protect_streaks, opp_protect_streaks):
         active = state["player_active_pokemon"]
         switches = state["available_switches"]
         seen[_species_key(active)] = active
@@ -672,9 +858,11 @@ def battle_views_from_replay(states: list) -> list:
         ]
 
         views.append(BattleView(
-            my_active=_replay_pokemon_view(active),
+            my_active=_replay_pokemon_view(active, protect_counter=my_streak),
             my_bench=_pad_bench(bench),
-            opp_active=_replay_pokemon_view(state["opponent_active_pokemon"]),
+            opp_active=_replay_pokemon_view(
+                state["opponent_active_pokemon"], protect_counter=opp_streak
+            ),
             opp_remaining_fraction=state["opponents_remaining"] / 6,
             my_hazards=_replay_hazards(state["player_conditions"]),
             opp_hazards=_replay_hazards(state["opponent_conditions"]),
@@ -753,6 +941,10 @@ def _encode_pokemon(view: PokemonView) -> np.ndarray:
             _base_stat_vector(view.base_stats),
             _item_vector(view.item),
             _move_summary_vector(view.moves),
+            np.array(
+                [min(view.protect_counter, _PROTECT_COUNTER_SCALE) / _PROTECT_COUNTER_SCALE],
+                dtype=np.float32,
+            ),
         ]
     )
 

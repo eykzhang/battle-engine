@@ -117,10 +117,13 @@ candidate moves in place of the hand-crafted Phase-1 evaluation, and a second
 imitation (move-prediction) model was also built, closing out both of Phase 2's
 originally-planned deliverables:
 
-- **State encoding**: a 656-dim vector representation of a battle state (species,
-  types, HP, status, boosts, stats, held item, and a hand-engineered moveset summary —
-  recovery/hazard-setup/hazard-removal/setup-boost/pivot/priority/coverage), with two
-  adapters (live poke-env battles, parsed human replays) feeding the same model.
+- **State encoding**: a fixed-size vector representation of a battle state (species,
+  types, HP, status, boosts, stats, held item, protect-counter risk, and a
+  hand-engineered moveset summary — recovery/hazard-setup/hazard-removal/setup-boost/
+  pivot/priority/coverage), with two adapters (live poke-env battles, parsed human
+  replays) feeding the same model. Check `battle_engine.encoding.VECTOR_LEN` for the
+  real current dimension rather than trusting a number here — it's changed more than
+  once as features were added (316 → 656 → 663).
 - **Data pipeline**: a streaming fetcher that ELO-filters replays without downloading
   Metamon's full 20+GB archive, temporally spread (30,000 replays, Dec 2023 → May
   2026) rather than clustered in one month, and a dataset builder that gets the
@@ -148,10 +151,47 @@ eval bolted onto the same shallow 2-ply search structurally can't see switching'
 multi-turn value beyond a hand-tuned patch, and that's plausibly the actual ceiling on
 this axis, not a bug still waiting to be found.
 
-Next: open decision between more Phase 2 tuning (deeper search, data beyond Metamon)
-or moving to Phase 3 (PPO self-play, which sidesteps this specific ceiling by
-learning a policy directly instead of ranking states through a fixed-depth lookahead —
-now with both a value-function and a policy warm-start candidate available).
+**Phase 3 (RL) plumbing built and reviewed; strength verification intentionally
+deferred.** PPO self-play sidesteps Phase 2's ceiling by learning a policy directly
+rather than ranking states through a fixed-depth lookahead. Built and independently
+reviewed (twice) before any real-scale run:
+
+- **Action-space reconciliation**: poke-env's Gymnasium environment exposes its own
+  26-way action scheme; the Phase-2 imitation model was trained on a different,
+  13-way one matching this project's own state-encoding conventions. A bidirectional
+  translation layer plus a custom Gymnasium env make the two interoperable.
+- **Masked PPO** ([stable-baselines3](https://github.com/DLR-RM/stable-baselines3) +
+  [sb3-contrib](https://github.com/Stable-Baselines-Team/stable-baselines3-contrib)'s
+  `MaskablePPO`): illegal actions are excluded at the action-distribution level, not
+  merely corrected after the fact — a real training-quality problem was measured and
+  fixed here (56% of actions were illegal under a fresh policy, and the naive
+  "substitute a random legal move" fallback was silently misattributing credit).
+- **Warm start from both Phase-2 models**: the win-probability model seeds the critic,
+  the imitation model seeds the actor — made possible by re-shaping PPO's network to
+  match their architecture exactly (verified via bit-identical output reproduction,
+  not just matching shapes).
+- **Self-play** against a small pool of frozen snapshots of the policy's own past
+  weights, refreshed periodically during training.
+- **Real progress tracking during training**: periodic head-to-head evaluation
+  against the Phase-1 search bot via real games (not a proxy metric), checkpointing,
+  and resumable runs.
+
+A planned long training run was intentionally paused partway through (proving
+checkpoint/resume works cleanly) rather than run to completion blind. Replay
+inspection during that pause — the same technique that found Phase 1's and Phase 2's
+bugs — surfaced a real, quantifiable pathology: the policy was repeatedly re-using
+Protect immediately after it had just failed, walking back into Showdown's own
+escalating-failure mechanic and taking large, predictable losses as a direct result.
+Traced to a genuine encoder gap (the risk was structurally invisible to any model
+trained on the old vector) and fixed by adding it as a feature, reconstructed
+correctly for historical replay data (no equivalent field exists there — a
+non-trivial reconstruction problem in its own right, corrected once after an
+independent review caught a real bug in the first attempt at it) and read exactly
+off poke-env for live play.
+
+Whether this actually moves the strength plateau is a real, open question —
+deliberately not yet re-measured; that's the next thing to do, not something to
+assume.
 
 ## Setup
 
@@ -174,9 +214,13 @@ cd pokemon-showdown && node pokemon-showdown start --no-security
 .venv/bin/python scripts/smoke_test.py
 
 # Benchmark two bots head-to-head with a 95%-confidence win rate
-# --p1/--p2 choices: random, maxdamage, heuristic, search (Phase-1), learned (Phase-2)
+# --p1/--p2 choices: random, maxdamage, heuristic, search (Phase-1), learned (Phase-2), ppo (Phase-3)
 .venv/bin/python scripts/benchmark.py --p1 search --p2 maxdamage --n-battles 500
 .venv/bin/python scripts/benchmark.py --p1 learned --p2 search --format gen9ou --n-battles 500
+
+# Phase 3: masked PPO self-play training, warm-started from the Phase-2 models,
+# with periodic real-game evaluation against the search bot and checkpointing
+.venv/bin/python scripts/train_ppo.py --timesteps 2000 --n-steps 256
 
 # Tests (the harness integration test auto-skips if the server isn't running)
 .venv/bin/pytest

@@ -1,6 +1,8 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from poke_env.battle.field import Field
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
@@ -13,8 +15,10 @@ from battle_engine.encoding import (
     VECTOR_LEN,
     BattleView,
     PokemonView,
+    _PROTECT_COUNTER_SCALE,
     battle_view_from_poke_env,
     battle_view_from_replay_state,
+    battle_views_from_replay,
     encode,
 )
 from conftest import make_mon
@@ -61,10 +65,25 @@ def _replay_pokemon(
     }
 
 
+def _replay_move(name="nomove", current_pp=0):
+    # current_pp must vary between two calls with the same name that are
+    # meant to represent two genuinely SEPARATE real uses of that move -
+    # real replay data's prev_move dict is a full snapshot (byte-identical
+    # across states where nothing happened for that side, see
+    # encoding.py's _replay_protect_streaks docstring), so two calls with
+    # identical args here look, to that function, exactly like a real
+    # replay's "nothing happened" carry-over rather than two distinct uses.
+    return {
+        "name": name, "move_type": "nomove", "category": "nomove",
+        "base_power": 0, "accuracy": 1.0, "priority": 0, "current_pp": current_pp, "max_pp": 16,
+    }
+
+
 def _replay_state(
     player_active, opponent_active, available_switches=None,
     opponents_remaining=6, player_conditions="noconditions",
     opponent_conditions="noconditions", weather="noweather", battle_field="nofield",
+    player_prev_move=None, opponent_prev_move=None,
 ):
     return {
         "player_active_pokemon": player_active,
@@ -75,6 +94,8 @@ def _replay_state(
         "opponent_conditions": opponent_conditions,
         "weather": weather,
         "battle_field": battle_field,
+        "player_prev_move": player_prev_move or _replay_move(),
+        "opponent_prev_move": opponent_prev_move or _replay_move(),
     }
 
 
@@ -570,3 +591,168 @@ def test_encoder_handles_every_state_in_every_real_fetched_replay():
             assert np.isfinite(vec).all()
             total_states += 1
     assert total_states > 0
+
+
+# --- protect_counter (2026-08-01, Phase 3 win-rate-plateau diagnosis) -------
+
+
+def test_protect_counter_passes_through_exactly_on_live_adapter():
+    # poke-env's own Pokemon.protect_counter is the exact, real mechanic
+    # (see module docstring) - the live adapter should read it directly,
+    # not reimplement any part of the reset/increment logic itself.
+    mine = make_mon("garchomp")
+    mine._protect_counter = 2
+    theirs = make_mon("dragapult")
+    view = battle_view_from_poke_env(_battle([mine], mine, [theirs], theirs))
+
+    assert view.my_active.protect_counter == 2
+
+
+def test_protect_counter_encodes_as_a_normalized_scalar_and_clamps():
+    # _encode_pokemon appends protect_counter as the LAST field of a single
+    # Pokemon's block (see encoding.py) - testing that block directly avoids
+    # fragile index arithmetic into the full multi-Pokemon concatenated
+    # vector encode() returns.
+    view_at_0 = PokemonView.unknown()
+    view_at_0.known = True  # unknown() zeroes protect_counter too; only care about that field here
+
+    vec_at_0 = enc._encode_pokemon(replace(view_at_0, protect_counter=0))
+    vec_at_2 = enc._encode_pokemon(replace(view_at_0, protect_counter=2))
+    vec_at_999 = enc._encode_pokemon(replace(view_at_0, protect_counter=999))
+
+    assert vec_at_0[-1] == pytest.approx(0.0)
+    assert vec_at_2[-1] == pytest.approx(2.0 / _PROTECT_COUNTER_SCALE)
+    assert vec_at_999[-1] == pytest.approx(1.0)  # far beyond any real streak - must clamp
+
+
+def test_bench_and_single_state_replay_pokemon_always_show_zero_protect_counter():
+    # A bench mon's real streak is always 0 (poke-env itself resets on
+    # switch-out) - and battle_view_from_replay_state (single-state, no
+    # history) has no way to reconstruct a nonzero value at all, same
+    # documented gap as fainted-teammate reconstruction.
+    zapdos = _replay_pokemon("zapdos")
+    state = _replay_state(
+        _replay_pokemon("garchomp"), _replay_pokemon("dragapult"),
+        available_switches=[zapdos],
+        player_prev_move=_replay_move("protect", current_pp=15),
+    )
+    view = battle_view_from_replay_state(state)
+
+    assert view.my_bench[0].protect_counter == 0
+    # Single-state adapter: even the ACTIVE mon's protect_counter can't be
+    # reconstructed without history, so it's always 0 here too, regardless
+    # of that state's own prev_move.
+    assert view.my_active.protect_counter == 0
+
+
+def test_replay_protect_streak_increments_across_consecutive_same_side_uses():
+    # current_pp decreases each real use (16, 15, 14, ...) - real replay
+    # data's prev_move dict changes (at minimum, current_pp drops) on every
+    # genuine reuse; two states with the byte-identical dict instead mean
+    # nothing happened for that side that transition (see
+    # _replay_protect_streaks' docstring) and must NOT be read as a second
+    # use of the same move.
+    active = _replay_pokemon("garchomp")
+    opponent = _replay_pokemon("dragapult")
+    states = [
+        _replay_state(active, opponent, player_prev_move=_replay_move("nomove")),
+        _replay_state(active, opponent, player_prev_move=_replay_move("protect", current_pp=15)),
+        _replay_state(active, opponent, player_prev_move=_replay_move("protect", current_pp=14)),
+    ]
+
+    views = battle_views_from_replay(states)
+
+    assert [v.my_active.protect_counter for v in views] == [0, 1, 2]
+
+
+def test_replay_protect_streak_carries_forward_unchanged_across_a_phantom_no_action_state():
+    """The real bug an independent review found (2026-08-01): Metamon emits
+    extra decision states where one side didn't actually act (e.g. the
+    opponent choosing a forced switch after a KO) - the prev_move field in
+    those states isn't reset to "nomove", it's an exact byte-for-byte copy
+    of the last state's prev_move (verified against real replay data: same
+    name AND same current_pp). The original version of this function had
+    no way to distinguish that from a genuine second consecutive protect
+    (both showed the name "protect"), so it kept incrementing an
+    already-resolved streak - measured, this made 59.4% of reconstructed
+    streak-2 values wrong. The fix: an identical prev_move dict means carry
+    the PREVIOUS streak forward as-is, neither incrementing nor resetting.
+    """
+    active = _replay_pokemon("garchomp")
+    opponent = _replay_pokemon("dragapult")
+    protect_at_15 = _replay_move("protect", current_pp=15)
+    states = [
+        _replay_state(active, opponent, player_prev_move=_replay_move("nomove")),
+        _replay_state(active, opponent, player_prev_move=protect_at_15),
+        # Phantom state: byte-identical prev_move dict, nothing really
+        # happened for this side - must NOT be read as a second protect.
+        _replay_state(active, opponent, player_prev_move=dict(protect_at_15)),
+        # A genuine second use afterwards - pp actually drops now.
+        _replay_state(active, opponent, player_prev_move=_replay_move("protect", current_pp=14)),
+    ]
+
+    views = battle_views_from_replay(states)
+
+    assert [v.my_active.protect_counter for v in views] == [0, 1, 1, 2]
+
+
+def test_replay_protect_streak_resets_on_a_different_move():
+    # A leading "nomove" state models the real, always-present turn-1 state
+    # (see _replay_protect_streaks' docstring: the very first state of any
+    # real replay has no prior action to compare against, so its own streak
+    # is unconditionally 0 regardless of what its own prev_move claims -
+    # untestable/meaningless as a "does this move count" case on its own,
+    # since real data never actually puts a protect-counter move there).
+    active = _replay_pokemon("garchomp")
+    opponent = _replay_pokemon("dragapult")
+    states = [
+        _replay_state(active, opponent, player_prev_move=_replay_move("nomove")),
+        _replay_state(active, opponent, player_prev_move=_replay_move("protect", current_pp=15)),
+        _replay_state(active, opponent, player_prev_move=_replay_move("earthquake", current_pp=7)),
+        _replay_state(active, opponent, player_prev_move=_replay_move("protect", current_pp=14)),
+    ]
+
+    views = battle_views_from_replay(states)
+
+    assert [v.my_active.protect_counter for v in views] == [0, 1, 0, 1]
+
+
+def test_replay_protect_streak_resets_when_the_active_species_changes():
+    garchomp = _replay_pokemon("garchomp")
+    zapdos = _replay_pokemon("zapdos")
+    opponent = _replay_pokemon("dragapult")
+    states = [
+        _replay_state(garchomp, opponent, player_prev_move=_replay_move("nomove")),
+        _replay_state(garchomp, opponent, player_prev_move=_replay_move("protect", current_pp=15)),
+        _replay_state(garchomp, opponent, player_prev_move=_replay_move("protect", current_pp=14)),
+        # A switch - real replay data shows the PRIOR mon's prev_move
+        # frozen/carried over here just as often as "nomove" (see
+        # _replay_protect_streaks' docstring - the field is a per-side
+        # "last real move used", not turn-scoped), but the reset is keyed
+        # on species identity changing, not on prev_move's value at all -
+        # this deliberately reuses the exact same dict to prove that.
+        _replay_state(zapdos, opponent, available_switches=[garchomp],
+                      player_prev_move=_replay_move("protect", current_pp=14)),
+    ]
+
+    views = battle_views_from_replay(states)
+
+    assert [v.my_active.protect_counter for v in views] == [0, 1, 2, 0]
+
+
+def test_replay_protect_streak_tracks_opponent_side_independently():
+    active = _replay_pokemon("garchomp")
+    opponent = _replay_pokemon("dragapult")
+    states = [
+        _replay_state(active, opponent, player_prev_move=_replay_move("nomove"),
+                      opponent_prev_move=_replay_move("nomove")),
+        _replay_state(active, opponent, player_prev_move=_replay_move("earthquake", current_pp=7),
+                      opponent_prev_move=_replay_move("protect", current_pp=15)),
+        _replay_state(active, opponent, player_prev_move=_replay_move("protect", current_pp=15),
+                      opponent_prev_move=_replay_move("protect", current_pp=14)),
+    ]
+
+    views = battle_views_from_replay(states)
+
+    assert [v.my_active.protect_counter for v in views] == [0, 0, 1]
+    assert [v.opp_active.protect_counter for v in views] == [0, 1, 2]

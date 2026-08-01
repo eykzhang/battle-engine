@@ -9,6 +9,15 @@ Start the local Showdown server first (see README), then e.g.:
 wires it into TwoPlySearchPlayer's scoring via win_prob.make_eval_fn, in place of
 evaluate() — same search shape as "search" (the Phase-1 bot), different eval.
 
+"ppo" loads a trained Phase-3 PPO checkpoint (scripts/train_ppo.py --save) via
+battle_engine.ppo_eval.load_ppo_player — a genuinely different mechanism from
+"search"/"learned": no lookahead at all, a direct state -> action policy learned
+through self-play rather than ranking states with a 2-ply search. Needs
+--ppo-model-path (default data/models/ppo.zip) and only makes sense on gen9ou
+(what it was trained on) — same distribution-mismatch caveat "learned" has on
+gen9randombattle, undocumented here since this project's only real PPO training
+target has been gen9ou from the start.
+
 The model was trained on gen9ou human replays (constructed OU teams), but the
 default --format is gen9randombattle (Phase 0/1's format, auto-generated
 teams, no team-building infra needed) - a "learned" benchmark on
@@ -27,6 +36,7 @@ from pathlib import Path
 from poke_env.player import MaxBasePowerPlayer, Player, RandomPlayer, SimpleHeuristicsPlayer
 
 from battle_engine.benchmark import run_benchmark
+from battle_engine.ppo_eval import load_ppo_player
 from battle_engine.search import TwoPlySearchPlayer
 from battle_engine.teams import RandomTeamFromPool
 from battle_engine.win_prob import WinProbModel, make_eval_fn
@@ -48,7 +58,7 @@ PLAYERS = {
     "heuristic": SimpleHeuristicsPlayer,
     "search": TwoPlySearchPlayer,
 }
-CHOICES = sorted(PLAYERS) + ["learned"]
+CHOICES = sorted(PLAYERS) + ["learned", "ppo"]
 
 
 # Formats poke-env/Showdown generate a team for server-side - no submitted
@@ -61,7 +71,9 @@ CHOICES = sorted(PLAYERS) + ["learned"]
 _AUTO_TEAM_FORMATS = {"gen9randombattle"}
 
 
-def _make_player(name: str, battle_format: str, model_path: Path) -> Player:
+def _make_player(
+    name: str, battle_format: str, model_path: Path, ppo_model_path: Path
+) -> Player:
     team = None if battle_format in _AUTO_TEAM_FORMATS else RandomTeamFromPool()
     if name == "learned":
         model = WinProbModel.load(model_path)
@@ -71,6 +83,8 @@ def _make_player(name: str, battle_format: str, model_path: Path) -> Player:
             eval_fn=make_eval_fn(model),
             switch_urgency_weight=LEARNED_SWITCH_URGENCY_WEIGHT,
         )
+    if name == "ppo":
+        return load_ppo_player(ppo_model_path, battle_format=battle_format, team=team)
     return PLAYERS[name](battle_format=battle_format, team=team)
 
 
@@ -81,13 +95,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-battles", type=int, default=500)
     parser.add_argument("--format", default="gen9randombattle")
     parser.add_argument("--model-path", type=Path, default=Path("data/models/win_prob.pt"))
+    parser.add_argument("--ppo-model-path", type=Path, default=Path("data/models/ppo.zip"))
     return parser.parse_args()
 
 
 async def main() -> None:
     args = parse_args()
-    p1 = _make_player(args.p1, args.format, args.model_path)
-    p2 = _make_player(args.p2, args.format, args.model_path)
+    p1 = _make_player(args.p1, args.format, args.model_path, args.ppo_model_path)
+    p2 = _make_player(args.p2, args.format, args.model_path, args.ppo_model_path)
     result = await run_benchmark(p1, p2, n_battles=args.n_battles)
     print(result)
 

@@ -362,6 +362,328 @@ now with both a value-function warm-start candidate (`win_prob.py`) and a policy
 warm-start candidate (`imitation.py`) available, once the action-space reconciliation
 above is resolved).
 
+### Phase 3 started (2026-07-31): action-space reconciliation, then PPO/SB3 wiring
+
+Decision: (b) above — moving to Phase 3 groundwork rather than further Phase 2
+tuning, per the roadmap's own order (PPO via stable-baselines3 first, "working
+plumbing before hand-rolling anything").
+
+**Action-space reconciliation** (`battle_engine/action_space.py`): translates between
+`dataset.py`'s 13-way Metamon action scheme (what the imitation model was trained on,
+and what this project's own state encoding's species-sorted bench ordering matches)
+and poke-env's native 26-way Gymnasium `SinglesEnv` scheme (0-5 switch by raw
+`battle.team` position, 6-9 move, 10-25 four gimmick blocks — mega/z-move/dynamax
+none of which exist in gen9 OU, plus tera). Both directions needed, not just
+metamon→poke-env: `battle_engine/rl_env.py`'s `MetamonActionSinglesEnv` (a
+`SinglesEnv` subclass exposing `Discrete(13)` instead of the native `Discrete(26)`,
+chosen over the native space because `PokeEnv.embed_battle` is abstract regardless of
+action-space choice, so this project's own encoding — species-sorted bench, no raw
+team-position feature — is used either way, and native 26-way switch actions would be
+an unlearnable target against that observation) overrides
+`action_to_order`/`order_to_action`/`get_action_mask`/`get_action_space_size`.
+
+Two independent reviews (same "verify against real library source, not comments"
+practice as every prior milestone) found and fixed real bugs:
+- **First review**: `order_to_action` was missing entirely (inherited `SinglesEnv`'s
+  native 26-way version) — poke-env's `SingleAgentWrapper` calls it on the
+  *opponent's* real move to feed back through this env's own `step()`, so without an
+  override the opponent's actual actions were silently corrupted one step later. Also
+  fixed: the `battle._wait` mask fallback was inferred unsoundly (now explicit), a
+  `-1`/`-2` sentinel collision, `get_action_space_size` still reporting 26.
+- **Second review** (after `embed_battle`/`calc_reward`/`observation_spaces` and
+  `scripts/train_ppo.py` were built): `strict=False` (used so an undertrained PPO
+  policy's illegal picks don't crash training) silently substitutes a *different,
+  randomly chosen* move — measured 56.2% of sampled actions illegal under a fresh
+  near-uniform policy on real gen9ou states, meaning PPO was crediting the action it
+  picked with the outcome of a different action poke-env actually played. Real fix
+  (masking) deliberately deferred to the very next session, not patched in place. Also
+  fixed: this project's own translation-layer `ValueError`s bypassed the
+  strict/non-strict contract entirely (always raised, now respect `strict` like every
+  other illegal-action case); a dead `team=` arg on the `SingleAgentWrapper` opponent
+  that leaked a real, unclosed, never-actually-used websocket connection per
+  `build_env()` call (`SingleAgentWrapper` never lets `opponent` actually play — it
+  only calls `opponent.choose_move`/`teampreview` as pure decision functions over the
+  battle `env.agent2` is really playing — fixed via `start_listening=False`); a
+  docstring with the SB3 `CombinedExtractor` concatenation order backwards
+  (`action_mask` first at columns 0:13, `observation` second at 13:669 — Gymnasium's
+  `spaces.Dict` sorts keys alphabetically — matters for the deferred imitation-weight
+  transplant).
+
+**PPO wiring** (`scripts/train_ppo.py`): `MetamonActionSinglesEnv` +
+stable-baselines3's `PPO("MultiInputPolicy", ...)` via poke-env's `SingleAgentWrapper`,
+training against a fixed `RandomPlayer` (not self-play yet). Laptop feasibility
+measured (per the hard rule below): ~660 steps/s, ~108-117 steps/battle (~6
+battles/sec) — puts "hundreds of thousands of battles" at roughly 14 hours, inside an
+overnight run, on a single environment with no parallelism.
+
+**Action masking** (same session, right after the second review, since the review
+found illegal-action substitution was a real training-quality problem — see above):
+switched from plain `PPO` to `sb3-contrib`'s `MaskablePPO` + `ActionMasker`, wired to
+`MetamonActionSinglesEnv.get_action_mask` via a new `sb3_contrib_action_mask_fn` in
+`rl_env.py` (kept in the package, not the script, for the same reason everything else
+here is: so it has real unit-test coverage instead of only being exercised by manual
+script runs). Verified concretely, not just "should work": the pre-masking run logged
+dozens of `Invalid action ... Defaulting to random move` warnings per few hundred
+steps; the post-masking run logs zero across the same test, and throughput is
+unaffected (~660 steps/s either way — masking is cheap, just a logit adjustment
+before sampling).
+
+**Imitation/win-prob weight init** (`battle_engine/ppo_warm_start.py`, same session):
+masking made this possible — since legality is now enforced at the action-distribution
+level, the network no longer needs `action_mask` as an input *feature*, so
+`ObservationOnlyExtractor` drops it, making PPO's trunk exactly `VECTOR_LEN`-shaped
+again (not `VECTOR_LEN + ACTION_SPACE_SIZE` via `CombinedExtractor`). Paired with
+`net_arch=[128, 64]` and `activation_fn=nn.ReLU` (matching both Phase-2 checkpoints
+exactly, verified against the real saved `state_dict`s, not assumed), PPO's actor
+trunk is now literally the same shape as `ImitationModel`'s and the critic trunk the
+same shape as `WinProbModel`'s, so `load_warm_start_weights` copies `Linear` weights
+directly rather than approximating across a mismatch: `imitation.pt`'s trunk+output →
+`policy.mlp_extractor.policy_net` + `policy.action_net`, `win_prob.pt`'s → `.value_net`
+equivalents. Verified end-to-end, not just shape-checked: the warm-started policy
+reproduces bit-identical logits/values to the two source checkpoints on the same input
+(`tests/test_ppo_warm_start.py`). `WinProbModel`'s output is a win-probability logit,
+not a calibrated return estimate — a directionally-reasonable value-function start,
+left unrescaled since PPO's own value loss corrects scale through training and
+guessing at a rescaling without a real run to check it against would be exactly the
+kind of unverified assumption this project avoids. `scripts/train_ppo.py --warm-start`
+is now the default (`--no-warm-start` to train from scratch); a quick real run showed
+the qualitative difference immediately — `explained_variance` starts at ~0.65 instead
+of a random-init run's negative value, and episode reward is already positive in the
+second rollout instead of consistently negative.
+
+**Self-play** (`battle_engine/self_play.py`, same session — the last of the three
+review-motivated follow-ups): `FrozenPolicyPlayer` (a poke-env `Player`) samples a
+new frozen snapshot of the trainee's own past weights once per battle (tracked via
+`battle.battle_tag`, not per turn — a policy that switched personality mid-battle
+wouldn't be a coherent opponent), from a small pool (`max_snapshots`, default 5) kept
+fresh by `SelfPlaySnapshotCallback` pushing a copy of the live policy's weights every
+`snapshot_interval` timesteps during `model.learn()`. Buildable directly on top of the
+warm-start work: the frozen opponent is just another `MaskableActorCriticPolicy` built
+with the same `warm_start_policy_kwargs()`, so any snapshot of the trainee's
+`state_dict()` loads into it with no translation needed. Seeded with the trainee's own
+starting weights (so battle 1 has a real opponent, not an empty pool) —
+`scripts/train_ppo.py --opponent {self-play,random}` (self-play is now the default;
+`random` kept for quick smoke tests). Verified with a real run against the local
+server (`--snapshot-interval 256 --max-snapshots 3` over 1024 timesteps): snapshots
+pushed and sampled correctly, zero illegal-action warnings (masking still applies
+regardless of opponent), no errors.
+
+This closes out all three review-motivated follow-ups from this session (masking,
+warm-start, self-play) — 138 tests passing.
+
+### Third review (2026-08-01, scoped to masking/warm-start/self-play)
+
+Same practice, verified against real library source and real instrumented training
+runs rather than re-reading prior summaries. Findings and fixes:
+- **`--no-warm-start` was silently changing the architecture, not just the init** —
+  gating `policy_kwargs` itself on `--warm-start` meant the `--no-warm-start` path got
+  SB3's *defaults* (`net_arch` `{64,64}` per head, `Tanh`, sees `action_mask` as an
+  input feature, ~95k params) instead of the warm-start shape (`[128,64]`, `ReLU`,
+  observation-only, ~186k params) — confounding architecture with initialization for
+  any future "does warm-start help" comparison (a real Phase-3 gate input). Fixed:
+  `warm_start_policy_kwargs()` now always applies; `--no-warm-start` only skips
+  `load_warm_start_weights`.
+- **The value/actor gradient-coupling risk `ppo_warm_start.py` flagged as a
+  possibility was measured, not just theorized**: stable-baselines3 applies one
+  global gradient-norm clip across the whole policy, so `WinProbModel`'s uncalibrated
+  win-probability-logit scale (vs. the discounted-return scale PPO's critic actually
+  predicts) does throttle the warm-started actor's effective gradient — 2.8x smaller
+  on the very first update, measured on a real instrumented run with a
+  matched-architecture random-init control to isolate this from the confound above.
+  Converges to the control's magnitude by about update 4 (~1k timesteps into a run
+  planned for hundreds of thousands) — real and measured, but self-correcting early
+  enough not to be worth guessing at a rescaling factor for. `ppo_warm_start.py`'s
+  docstring now states this with numbers instead of as a hedge.
+- **A self-play test was vacuous** (`test_choose_move_only_resamples_a_snapshot_between_battles_not_within_one`,
+  now `test_choose_move_resamples_between_battles_but_not_within_one`): it seeded only
+  one snapshot, so "resampling didn't change anything" held whether or not resampling
+  actually happened — proven by mutation testing (swapping the `battle_tag` check for
+  an unconditional resample still passed the old test). Fixed by seeding two
+  distinguishable snapshots and asserting both directions: unchanged within a
+  `battle_tag`, and a real weight change observable across enough distinct ones.
+  Re-verified the fixed test actually fails against the same mutation before trusting
+  it.
+- **The websocket-leak pattern the second review fixed in `build_env()` had crept back
+  into `tests/test_rl_env.py`'s real-server integration test** (predated that fix, was
+  never updated) — same `start_listening=False`, no `team=` fix applied there too.
+
+Checked and confirmed correct, no bug: the full masking chain through
+`DummyVecEnv`→`Monitor`→`ActionMasker`→`SingleAgentWrapper` (verified `gymnasium`
+1.3.0's `Wrapper` has no `__getattr__`, but `get_wrapper_attr` recurses correctly
+regardless — mask matched the live observation byte-for-byte across a full real run);
+no concurrency hazard between `FrozenPolicyPlayer`'s inference and the trainee's
+gradient updates (both confirmed `MainThread`-only via real instrumentation); the two
+policies' `state_dict()` key sets are identical; the warm-start-then-seed ordering in
+`train_ppo.py` is correct as written; snapshot independence/eviction both hold.
+
+Not yet done: an actual real-scale training run (the small feasibility runs above are
+all far too short to show real learning) and the eventual Phase 3 gate check
+(RL-tuned policy beats the Phase-2 supervised bot head-to-head, plus a real ladder GXE
+number).
+
+### Sanity run (2026-08-01): plumbing proven, plateau found, real behavioral bug diagnosed
+
+`scripts/train_ppo.py` gained `--resume-from` (loads a `--checkpoint` `.zip` and continues
+training via SB3's `reset_num_timesteps=False`, `--timesteps` meaning "more steps," not
+a new absolute target; forces `--warm-start` off with a visible message, since the
+resumed weights already *are* the trained state). Verified against a real checkpoint,
+not just constructed: `num_timesteps`/`n_steps`/`policy_kwargs` (including
+`ObservationOnlyExtractor`) all round-trip correctly through `MaskablePPO.load`. A
+separate small verification run (`--resume-from` the 500,000-step checkpoint,
+`--eval-interval 1024`) confirmed `EvalVsOpponentCallback`/`SelfPlaySnapshotCallback`
+(both keyed on `self.num_timesteps`, which correctly continues from 500,000 rather than
+resetting to 0) fire on the *original absolute* schedule: the first eval landed at
+500,736 — the next multiple of 1,024 counting from 0 (500,736 = 489 × 1,024), i.e. the
+schedule behaves as if training had never stopped, not as if a new count started at the
+resume point. (`CheckpointCallback` specifically does NOT get this property — see
+`scripts/train_ppo.py`'s comment, fixed after an independent review, 2026-08-01, caught
+an earlier version of this note wrongly claiming it did; harmless for a resume landing
+on a round multiple of both intervals, as this project's actual resumed run did.)
+
+A planned 1,000,000-timestep self-play run (warm-started, masked, `--eval-interval
+20000 --eval-battles 20` against `TwoPlySearchPlayer`) was deliberately stopped at
+560k to save usage, then resumed from the 500k checkpoint and run to completion —
+47 eval points total, clean finish, zero errors, zero leaked connections, unbroken
+checkpoint chain 100k→1,000,000, final model saved to `data/models/ppo.zip`.
+
+**Result: a real, honest plateau, not a run that needed more time.** Win rate vs.
+`TwoPlySearchPlayer` climbed from ~20% early to a ~28-32% band by mid-run and stayed
+there — the second half of the run (500k-1,000,000, i.e. doubling total training)
+showed no further improvement over the first half. Decision: **do not commit to the
+planned overnight run as-configured** — doubling steps already failed to move the
+needle, so scaling to ~27x more compute (an "overnight" budget at this throughput)
+on the identical setup is a bad bet. This mirrors Phase 2's own milestone-E lesson:
+diagnose before scaling compute blindly.
+
+**Diagnosis, ranked**: (1) self-play's opponent pool was too narrow/stale relative to
+total training length (`max_snapshots=5`, `snapshot_interval=4096` — a rolling ~2%
+window of training history); (2) the trainee never once played `TwoPlySearchPlayer`
+during training, only itself — self-play converging to "beats recent self" doesn't
+have to transfer to "beats 2-ply lookahead"; (3) reward-shaping weights and PPO's own
+hyperparameters were never tuned past their initial defaults.
+
+**A fourth, more concrete cause was found via qualitative diagnosis** (`scripts/
+inspect_ppo_replays.py`, new diagnostic script — same "watch real replays" technique
+that found Phase 1's switch bug and Phase 2's damage-calc bugs): the trained policy
+repeatedly re-used a protect-counter move (Protect, Endure, ...) immediately after it
+had just failed, walking back into Showdown's own escalating-failure mechanic (each
+consecutive use drops success chance geometrically) and taking large, predictable HP
+losses as a direct, quantified result — verified turn-by-turn against real
+`Pokemon.protect_counter`/HP data, not just repeated-action-name pattern-matching: HP
+crashing from 1.00 to 0.54 immediately after a 2nd consecutive Protect, in a battle
+the policy went on to lose, the same pattern twice in one game. Also found (a
+separate, not-yet-addressed issue): genuine multi-dozen-turn stalling switch-loops
+between the trainee and the search bot, matching the "auto-tie at turn 1000" server
+warnings observed during the sanity run's own eval battles.
+
+**Root cause of the protect-spam pathology: a real encoder gap, not a training-config
+problem.** poke-env already tracks the exact mechanic (`Pokemon.protect_counter`) but
+`encoding.py` never read it — no model trained on the old vector could structurally
+learn "don't protect again, it's about to fail," the information was invisible to it.
+Fixed: `PokemonView.protect_counter` (`encoding.py`), exact via `mon.protect_counter`
+on the live adapter, reconstructed from replay turn-sequence history on the other (no
+equivalent field exists in Metamon's per-state schema — a verified, named
+simplification: increments on consecutive same-side use of a protect-counter move,
+resetting on a different move or an active-species change, without attempting to
+detect success/failure specifically, which would need inferring "no incoming damage"
+from hp_pct deltas — confounded by residual status damage ticking through a
+*successful* Protect. Checked against real data before accepting the trade: a
+300-replay/8,815-state sample shows protect-counter moves in only 1.35% of states,
+longest observed streak 3, and every observed streak-of-2-or-more instance ended in
+that Pokemon fainting the same turn — independent confirmation, on real human games,
+that the simplified streak still captures the real pattern). `VECTOR_LEN` 656 → 663.
+
+Datasets rebuilt and both Phase-2 models retrained on the new vector (sample counts
+match the pre-change run exactly, confirming nothing else broke): `win_prob.pt`
+val_acc 0.634 (consistent with the historical ~0.63-0.64 band — one added scalar
+among 663 dims isn't expected to move aggregate win-prediction accuracy much; the
+real payoff is expected in the RL policy's live decisions, not this number).
+`imitation.pt` val_top1_acc 0.245 (matches the prior number exactly). 150 tests
+passing (7 new, covering both adapters' exact/reconstructed semantics and the
+encoding's clamp/normalization).
+
+**Important, expected side effect**: all pre-existing PPO checkpoints (`ppo.zip`,
+`data/models/checkpoints/*.zip` from this sanity run) are now shape-incompatible
+with the new 663-dim observation space — `--resume-from` on any of them will fail.
+Kept on disk as a historical record of the plateau result, not resumable.
+
+### Fourth review (2026-08-01, scoped to this session's resume/protect_counter/retrain work)
+
+Same practice, verified against real data and library source rather than the prior
+session's own summary. One real HIGH-severity bug found in the just-built feature
+itself, plus a serious verification-integrity finding, a flaky test, and low-severity
+issues — all fixed and re-verified, not just noted.
+
+- **`_replay_protect_streaks` over-counted streaks — a real bug in the reconstruction
+  logic, not the documented success/failure simplification.** `player_prev_move`/
+  `opponent_prev_move` are NOT "the move used on this transition" — they're "the last
+  move this side has ever used," carried forward byte-for-byte (name AND `current_pp`
+  AND every other field) across states where that side didn't actually act (Metamon
+  emits extra decision states, e.g. for the opponent's forced switch after a KO, where
+  the player's own side did nothing). The original version had no way to distinguish a
+  genuine second consecutive protect from a stale carried-over one — both showed the
+  name "protect" — so it kept incrementing an already-resolved streak. Measured against
+  real per-move PP as independent ground truth: **59.4% of reconstructed streak-2
+  values and 41.7% of streak-3 values were wrong.** Fixed by comparing each side's
+  whole `prev_move` dict to the previous state's: identical means nothing happened for
+  that side this transition, so the streak carries forward unchanged rather than being
+  read as a fresh use — a signal available directly from `states`, no need to thread
+  the replay's separate action labels through. Re-verified post-fix against the same
+  independent ground truth: 1,238/1,242 (99.7%) of streak≥2 reconstructions now
+  correspond to a real PP drop, across a 3,000-replay sample.
+- **The original "verification" numbers in `encoding.py`'s docstring and this file were
+  themselves corrupted by the bug they were meant to validate** — a serious catch, since
+  the whole point of quoting them was to demonstrate the simplification was checked
+  against real data, not asserted. "Longest observed streak 3" was false (the actual
+  pre-fix dataset contains streak values corresponding to 4 and 5). "Every streak-2+
+  instance ended in a faint" was false (only 28-39% did, depending on sample) — worse,
+  the reasoning was circular: the bug's own post-faint phantom state was *creating*
+  those streak≥2-at-faint instances, so the "confirmation" was reading the artifact of
+  the bug as evidence the approximation was sound. Post-fix, re-measured honestly: a
+  nonzero streak occurs on 1.34% of (state, side) pairs, longest streak seen is 2 (not
+  3+), and streak≥2 correlates with a same-turn faint only 11.4% of the time (70
+  instances, 8 at a faint) — genuine multi-use protect streaks are just rare in human
+  play, which is a fine, honest characterization; "always ends badly" was never true.
+- **`tests/test_rl_env.py`'s real-server integration test was flaky**: measured 7/40
+  (17.5%) failures hitting its 200-step cap before a battle terminated — random-vs-random
+  gen9ou battles regularly run long (this session's own diagnosis found real
+  multi-dozen-turn stalling switch-loops), and Showdown itself only force-ends via
+  auto-tie at turn 1000. Fixed by raising the cap to 1050 — safely past that
+  server-enforced hard limit, so every real battle deterministically terminates before
+  the cap rather than merely being statistically likely to; re-run 5/5 clean afterward.
+- **Two low-severity issues, both fixed**: `scripts/inspect_ppo_replays.py` leaked both
+  websocket connections on any exception (no `try/finally` around the battle loop,
+  unlike `ppo_eval.py`'s own `EvalVsOpponentCallback`, which gets this right) — fixed.
+  `scripts/train_ppo.py`'s resume comment claimed `CheckpointCallback`'s save interval
+  is keyed on absolute `num_timesteps` like this project's own two callbacks
+  (`EvalVsOpponentCallback`, `SelfPlaySnapshotCallback`) — false, verified against
+  installed SB3 source: `CheckpointCallback` uses `self.n_calls`, which resets to 0
+  every fresh `main()` invocation regardless of resume, so its save *cadence* is
+  calls-since-this-run-started, not the absolute schedule (the saved filename's own
+  timestep number is still absolute and correct). Harmless for a resume landing on a
+  round multiple of both intervals (as the actual sanity-run resume did), but the
+  comment was wrong and is now fixed. `README.md` still said "656-dim vector" —
+  updated to point at `VECTOR_LEN` instead of a hardcoded number, the same
+  "don't trust a stale dimension in a comment" rule this project has stated (and
+  violated, then caught) more than once now.
+- Checked and confirmed correct, no bug: `_PROTECT_COUNTER_MOVES`'s transcription
+  (exact set-equality match against poke-env's real private constant), opponent-side
+  switch-detection symmetry, first-state (i=0) handling, `_species_key`/`base_species`
+  form-change safety, `_encode_pokemon`'s field placement, `PokemonView.unknown()`/
+  fainted-teammate defaults, dataset/checkpoint freshness (all four `.npz` files and
+  both `.pt` checkpoints confirmed 663-wide via direct inspection, not just mtimes),
+  and `--resume-from`'s actual n_steps/policy_kwargs/num_timesteps round-trip.
+
+Datasets rebuilt and both models retrained a second time on the corrected encoder
+(sample counts unchanged, confirming nothing else broke): `win_prob.pt` val_acc 0.644,
+`imitation.pt` val_top1_acc 0.243 — both consistent with the historical band. 151 tests
+passing.
+
+Next: rerun the sanity-run methodology (self-play + eval-vs-search-bot tracking) with
+the now-correctly-reconstructed protect_counter feature in place to see whether it
+moves the plateau, before deciding on self-play-pool-widening/mixed-opponent-training
+(still real, still not done) or an overnight run.
+
 ## Hard rules
 
 - **Laptop-first**: every training run must fit on the M4 MacBook Air (measure one
@@ -423,27 +745,56 @@ cd pokemon-showdown && node pokemon-showdown start --no-security
 # ruleset (banlist isn't static - don't trust a team's legality from its source,
 # see battle_engine/teams.py's module docstring)
 node pokemon-showdown validate-team gen9ou < packed_team.txt
+
+# Phase 3: masked PPO training (sb3-contrib's MaskablePPO) against self-play
+# (frozen snapshots of the trainee's own past weights - default) or a fixed
+# RandomPlayer (--opponent random, for quick smoke tests). Warm-starts from
+# data/models/{imitation,win_prob}.pt by default (--no-warm-start to skip).
+# Needs the local server running and stable-baselines3 + sb3-contrib installed
+# (both in the `ml` extra). --n-steps controls the rollout length before each
+# policy update (small here for a quick feasibility check; SB3's own default is
+# 2048); --snapshot-interval/--max-snapshots tune the self-play pool.
+# --eval/--checkpoint (both on by default) periodically benchmark the live
+# policy against TwoPlySearchPlayer (real games, not a proxy metric) and
+# periodically save the model so a long run survives an interruption -
+# --resume-from continues from a saved checkpoint instead of starting cold
+# (--timesteps then means MORE steps, not a new absolute target).
+.venv/bin/python scripts/train_ppo.py --timesteps 2000 --n-steps 256
+.venv/bin/python scripts/train_ppo.py --resume-from data/models/checkpoints/ppo_500000_steps.zip --timesteps 500000
+
+# Diagnostic (not a benchmark tool): plays a few real games between a saved
+# PPO checkpoint and the search bot, logging each turn's chosen order plus
+# HP/protect_counter - the "watch real replays" technique that found the
+# protect-spam pathology behind Phase 3's win-rate plateau (see Status above).
+.venv/bin/python scripts/inspect_ppo_replays.py --n-battles 6
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
-`data/` (fetched replay samples) is gitignored too — regenerate via the fetch script
-above rather than committing it. Add new commands here as the harness/training
-scripts land — don't leave this stale.
+`data/` (fetched replay samples, trained models) is gitignored too — regenerate via
+the fetch/train scripts above rather than committing it. Add new commands here as the
+harness/training scripts land — don't leave this stale.
 
 ## Layout
 
 - `battle_engine/` — the package: bots (`search.py`), eval (`evaluation.py`,
   `damage.py`), state encoding (`encoding.py`), dataset building (`dataset.py`),
   models (`win_prob.py`, `imitation.py`), benchmark harness (`benchmark.py`), team
-  pool for gen9ou (`teams.py`)
+  pool for gen9ou (`teams.py`); Phase 3: action-space translation (`action_space.py`),
+  the PPO-facing Gymnasium env (`rl_env.py`), imitation/win-prob weight transplant
+  (`ppo_warm_start.py`), self-play (`self_play.py`), periodic real-game eval callback
+  + benchmark-facing PPO loader (`ppo_eval.py`)
 - `scripts/` — runnable entry points (smoke test, benchmarks, replay fetching,
-  dataset building, training)
+  dataset building, training, PPO training, PPO replay diagnosis
+  `inspect_ppo_replays.py`)
 - `tests/` — pytest (state encoding, damage calc, dataset/action-label logic, model
-  training loops, harness determinism w/ seeded RNG)
+  training loops, harness determinism w/ seeded RNG, action-space translation, the
+  PPO env — including one real-server integration test — PPO warm-start weight
+  transplant, self-play, PPO eval/benchmark loading)
 - `pokemon-showdown/` — local simulator checkout (gitignored)
 - `data/` — gitignored: `replays_raw/` (fetched replays), `dataset/` (cached train/val
   arrays for both the win-prob and action-label datasets), `models/` (trained
-  checkpoints: `win_prob.pt`, `imitation.pt`) — see commands above
+  checkpoints: `win_prob.pt`, `imitation.pt`, and PPO checkpoints once
+  `train_ppo.py --save` is used) — see commands above
 
 ## Git workflow
 

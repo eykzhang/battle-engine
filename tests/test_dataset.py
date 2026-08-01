@@ -33,6 +33,13 @@ def _pokemon(**overrides) -> dict:
     return base
 
 
+def _move(name="nomove") -> dict:
+    return {
+        "name": name, "move_type": "nomove", "category": "nomove",
+        "base_power": 0, "accuracy": 1.0, "priority": 0, "current_pp": 0, "max_pp": 0,
+    }
+
+
 def _state(won: bool, lost: bool, active=None, available_switches=None) -> dict:
     return {
         "player_active_pokemon": active or _pokemon(),
@@ -45,6 +52,8 @@ def _state(won: bool, lost: bool, active=None, available_switches=None) -> dict:
         "battle_field": "nofield",
         "battle_won": won,
         "battle_lost": lost,
+        "player_prev_move": _move(),
+        "opponent_prev_move": _move(),
     }
 
 
