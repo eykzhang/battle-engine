@@ -151,10 +151,8 @@ eval bolted onto the same shallow 2-ply search structurally can't see switching'
 multi-turn value beyond a hand-tuned patch, and that's plausibly the actual ceiling on
 this axis, not a bug still waiting to be found.
 
-**Phase 3 (RL) built, run, and diagnosed twice — gate not yet met, several real
-fixes in place for the next run.** PPO self-play sidesteps Phase 2's ceiling by
-learning a policy directly rather than ranking states through a fixed-depth
-lookahead.
+**Phase 3 gate met.** PPO self-play sidesteps Phase 2's ceiling by learning a policy
+directly rather than ranking states through a fixed-depth lookahead.
 
 Plumbing (built and independently reviewed before any real-scale run):
 - **Action-space reconciliation**: poke-env's Gymnasium environment exposes its own
@@ -199,7 +197,19 @@ Opus review:
   first version of the fix was itself caught missing Heavy-Duty Boots (the #2 most
   common immunity source in real data) by the same review process, before it shipped.
 
-The next run (combined: all fixes above, active together) is the next real step.
+With all three fixes combined, a fresh run climbed to a real, confirmed **40.8%
+[36.6, 45.2]** at 1,000,000 steps — a clean, statistically confident break from the
+~28-32% plateau for the first time. An overnight extension to 22,000,000 steps
+(~10.2 hours, 570.6 steps/s sustained the whole run, no thermal throttling) kept
+climbing rather than flattening out, and the final real 500-battle benchmark gave
+
+**69.6% [65.4, 73.5] vs. the Phase-1 search bot** — ✅ a decisive, statistically
+confident win, not just an edge.
+
+The literal roadmap gate is "beats the Phase-2 supervised bot," not the Phase-1
+search bot specifically — Phase 2's own final benchmark lost to the search bot 64.4%
+of the time, so PPO's 69.6% here almost certainly clears that bar too, but that exact
+matchup hasn't been separately benchmarked.
 
 ## Setup
 

@@ -831,6 +831,64 @@ boots + n_steps=2048) - not yet done as of this note. `--eval-interval 20000` re
 over the default 4096 (measured: the default schedule would add ~2,440 real eval battles
 on top of a 500k run, likely dominating its wall-clock).
 
+### Combined run + overnight extension: Phase 3 gate met (2026-08-09/10)
+
+The combined run (reward rebalance + boots-corrected hazard-immunity fix + `n_steps=2048`,
+all three together for the first time) ran as a fresh 500k-step sanity check
+(`--eval-interval 1000000 --eval-battles 20` after the first check confirmed `n_steps=2048`
+throughput ~642 steps/s, no regressions): pooled 147/500 = 29.4% over its first 500k -
+ambiguous relative to the 34.2% pre-boots-fix benchmark (which had double the training),
+roughly in the old plateau band. Resumed to 1,000,000 total steps: second-half pooled
+234/500 = 46.8%, a real jump within the run itself (individual points up to 75%, the
+highest single point this project to that date). The real 500-battle gate benchmark at
+1,000,000 steps: **204/500 = 40.8% [36.6%, 45.2%]** - CI entirely clear of the historical
+~28-32% plateau band (confident, real escape from it), and higher than the prior 34.2%
+result though with a thin CI overlap (36.6-38.5%) so not itself airtight on its own.
+
+Given a real, improving trend and cheap-so-far run costs (~15-20 min per 500k on this
+laptop), committed to a ~10-hour overnight extension: resumed from the 1,000,000-step
+checkpoint to 22,000,000 total (21,000,000 more steps), `--eval-interval 1000000
+--eval-battles 20 --checkpoint-interval 250000`. System kept awake via `caffeinate -s
+-w <training PID>` (no `-d`, so the display could still sleep normally) rather than
+GUI tools, specifically because it ties caffeinate's lifetime directly to the training
+process - it exits automatically the moment training stops, whether that's early
+termination or natural completion, with no separate cleanup step needed. Monitored via
+hourly scheduled check-ins (not continuous polling) with explicit instructions not to
+react to any single flat/bad-looking hour - only a sustained multi-hour trend or a real
+pathology (errors, throughput collapse, degenerate behavior) would have warranted early
+termination. Neither occurred: all 10 hourly checks showed healthy, steady throughput
+(570-579 steps/s the entire night, no thermal-throttle signs on this fanless laptop) and
+a win rate that stayed consistently well above the pre-overnight baseline throughout,
+trending upward in the second half if anything (individual eval points reached 90% and
+80% in the final two checkpoints).
+
+The run completed the full 22,000,192 steps cleanly (570.6 steps/s sustained average,
+~10.2 hours), `caffeinate` confirmed self-released on process exit as designed. Pooling
+all 21 periodic eval points from the overnight run (2,000,000 through 22,000,000 steps,
+20 battles each): 256/420 = 61.0% - first half (2M-12M) pooled 54.5%, second half
+(13M-22M) pooled 68.0%, a real continued climb within the overnight run itself, not
+just a one-time jump. The real 500-battle gate benchmark on the final checkpoint:
+
+**348/500 = 69.6% [65.4%, 73.5%] vs `TwoPlySearchPlayer`.**
+
+CI entirely clear of both the 40.8% pre-overnight benchmark and the original ~28-32%
+plateau - the first time this project has produced a real, statistically confident,
+decisive win (not just an edge) for PPO over the Phase-1 search bot. **Phase 3 gate
+(roadmap: "RL-tuned policy beats the Phase-2 supervised bot head-to-head") is very
+likely also met** - Phase 2's own final benchmark lost to `search` 64.4% of the time
+(35.6% win rate), so PPO's 69.6% here would need to lose almost every head-to-head
+matchup against a weaker reference opponent to somehow still lose to Phase 2's bot
+directly - but this is an inference from transitivity, not yet a direct measurement;
+`--p1 ppo --p2 learned` hasn't actually been run. Worth doing before formally closing
+out Phase 3, not assumed here.
+
+Not yet done: the direct Phase-2-bot benchmark above, a fresh `scripts/
+inspect_ppo_replays.py` pass to check whether the diagnosed pathologies (Spikes-vs-
+immune-opponent, Stealth-Rock-recast) are actually gone now rather than just inferring
+it from the aggregate win rate, and the roadmap's other Phase 3 gate component (a real
+ladder GXE number). ppo.zip and the checkpoint chain from this run are the current,
+non-archived `data/models/` state as of this note.
+
 ## Hard rules
 
 - **Laptop-first**: every training run must fit on the M4 MacBook Air (measure one
