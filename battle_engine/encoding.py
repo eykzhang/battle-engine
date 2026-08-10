@@ -97,6 +97,26 @@ Named simplifications (same convention as damage.py/evaluation.py):
   Speed Boost, Protean, Multiscale, Unaware, ...) aren't modeled at all;
   representing those well is a job for a learned ability embedding once an
   actual model exists, not something to hand-derive here.
+- `my_active_hazard_immune`/`opp_active_hazard_immune` (`_is_hazard_immune`,
+  2026-08-09): whether each active Pokemon is immune to ground-based entry
+  hazards (Flying-type, Levitate, and Heavy-Duty Boots are immune to
+  Spikes/Toxic Spikes/Sticky Web; Boots additionally blocks Stealth Rock —
+  independent of the type chart / `_TYPE_IMMUNITY_ABILITIES` above, which is
+  about damaging-move effectiveness, not hazards). Added after real replay
+  inspection of a trained PPO policy (see CLAUDE.md's Phase 3 status) caught
+  it spamming Spikes 32 turns straight against a Flying-type opponent it
+  could never affect — nothing in the vector could tell it why. Originally
+  Flying/Levitate-only (`_is_grounded`); an independent review the same day
+  measured Heavy-Duty Boots as the #2 most common immunity source (5.19% of
+  a 20,610-state sample, ahead of Levitate's 2.46%) and the only one that
+  also blocks Stealth Rock — the first version confidently mislabeled every
+  boots holder as vulnerable. Fixed and renamed (see `_is_hazard_immune`'s
+  own docstring for the full accounting, including what's still deliberately
+  out of scope — Iron Ball/Gravity/Magnet Rise/Ingrain/Smack Down/Roost).
+  Hazard stack count (see the hazards bullet above) is a separate, still-open
+  gap this doesn't address — the observed pathology was 100% about immunity
+  (the very first Spikes use already targeted an immune opponent), not the
+  cap.
 
 Real gap found 2026-08-01, diagnosing Phase 3's PPO win-rate plateau against
 the search bot (replay inspection again, same technique that found the
@@ -376,6 +396,7 @@ VECTOR_LEN = (
     + len(_WEATHER_NAMES)
     + len(_TERRAIN_NAMES)
     + 1  # active-vs-active type matchup score
+    + 2  # my_active_hazard_immune, opp_active_hazard_immune
 )
 
 
@@ -989,6 +1010,54 @@ def _type_multiplier(
     return attacking.damage_multiplier(d1, d2, type_chart=_TYPE_CHART)
 
 
+def _is_hazard_immune(mon: PokemonView) -> bool:
+    """Whether mon is immune to ground-based entry hazards (Spikes, Toxic
+    Spikes, Sticky Web - and, via Heavy-Duty Boots specifically, Stealth
+    Rock too) - a real Showdown mechanic that's a completely separate rule
+    from the type chart / _type_multiplier above (Spikes isn't a Ground-type
+    move that gets multiplied against the defender's types, it's a hard
+    immunity check), and was invisible to the encoder entirely before this -
+    found via real replay inspection of a trained PPO policy (see CLAUDE.md's
+    Phase 3 status): it spammed Spikes for 32 consecutive turns against a
+    Flying-type opponent Spikes could never affect, with nothing in the
+    vector able to tell it why every one of those turns was wasted.
+
+    Originally named _is_grounded and Flying/Levitate-only - an independent
+    review (2026-08-09) measured on real replay data (300 replays, 20,610
+    active-mon states) that Heavy-Duty Boots is the #2 most common immunity
+    source (5.19% of states, behind Flying's 17.0%, ahead of Levitate's
+    2.46%) and the *only* one of the three that also blocks Stealth Rock -
+    the original version confidently mislabeled every boots holder as
+    hazard-vulnerable, sitting right next to the raw item feature
+    (_ITEM_VOCAB already includes "heavydutyboots") without using it. Fixed
+    and renamed to describe what the feature actually claims to model.
+
+    Rarer immunity/anti-immunity interactions deliberately NOT modeled, same
+    named-simplification convention as _TYPE_IMMUNITY_ABILITIES' own
+    exclusions (Thick Fat, Soundproof, ...) and Air Balloon here (temporary,
+    lost on any hit): Iron Ball and Gravity (both *ground* an otherwise-
+    Flying/Levitate mon - the inverse direction, would need to be read as a
+    de-immunizer, not modeled), Magnet Rise/Ingrain/Smack Down/Roost (turn-
+    scoped volatile statuses PokemonView doesn't track at all). All measured
+    rarer than Heavy-Duty Boots on the same sample - revisit if evidence
+    says otherwise, same "not attempted, revisit if it matters" standard
+    already used elsewhere in this module.
+
+    Defaults to False (not immune) when types are unknown/empty (active
+    Pokemon's types should always be known in practice on both adapters -
+    this only guards the same team-preview-style edge case
+    _active_matchup_score itself guards below) so an information gap never
+    silently reads as a false immunity signal.
+    """
+    if mon.item == "heavydutyboots":
+        return True
+    if not mon.types:
+        return False
+    if PokemonType.FLYING in mon.types:
+        return True
+    return mon.ability == "levitate"
+
+
 def _active_matchup_score(view: BattleView) -> float:
     """Mirrors evaluation.type_matchup_score's semantics (offense - defense,
     each the best multiplier available across a dual typing), but built from
@@ -1020,6 +1089,13 @@ def encode(view: BattleView) -> np.ndarray:
             _one_hot(view.weather, _WEATHER_NAMES),
             _one_hot(view.terrain, _TERRAIN_NAMES),
             np.array([_active_matchup_score(view)], dtype=np.float32),
+            np.array(
+                [
+                    1.0 if _is_hazard_immune(view.my_active) else 0.0,
+                    1.0 if _is_hazard_immune(view.opp_active) else 0.0,
+                ],
+                dtype=np.float32,
+            ),
         ]
     )
     assert vec.shape == (VECTOR_LEN,)

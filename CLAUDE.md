@@ -684,6 +684,153 @@ the now-correctly-reconstructed protect_counter feature in place to see whether 
 moves the plateau, before deciding on self-play-pool-widening/mixed-opponent-training
 (still real, still not done) or an overnight run.
 
+### Self-play pool widened + search-bot mixing added (2026-08-09)
+
+Before committing to another expensive full-length run, addressed the two remaining
+open items from the sanity-run plateau diagnosis (the `protect_counter` encoder gap
+was already fixed and retrained above, but never actually re-run) — rather than
+re-running with only that one fix and possibly still seeing the plateau for a
+reason already suspected but untouched:
+
+- **Self-play pool was a rolling ~2% window of a long run** (`DEFAULT_MAX_SNAPSHOTS=5`
+  at `DEFAULT_SNAPSHOT_INTERVAL=4096`, over a 1,000,000-timestep run). Widened to 20
+  (~8.2% of the same run) — cheap: each snapshot is one ~186k-param MLP state_dict
+  (~750KB).
+- **The trainee never once played `TwoPlySearchPlayer` during training, only itself**
+  — self-play converging to "beats recent self" was never required to transfer to
+  "beats 2-ply lookahead," and `--eval`'s periodic real games against it only ever
+  *measured* that gap, never trained against it. Fixed with a new
+  `battle_engine/self_play.py::MixedOpponentPlayer` (delegates each battle, resampled
+  once per `battle_tag` like `FrozenPolicyPlayer` already does, to a weighted set of
+  sub-players) and `scripts/train_ppo.py --search-bot-fraction` (default 0.2,
+  self-play only; 0.0 reproduces the old pure-self-play behavior exactly). Wired so
+  `SelfPlaySnapshotCallback`/pool-seeding still target the inner `FrozenPolicyPlayer`
+  directly even when it's wrapped in a `MixedOpponentPlayer`.
+
+Verified with two real short runs against the local server (not just unit tests) — a
+50/50 self-play/search-bot mix and a pure-self-play (`--search-bot-fraction 0.0`) run
+for backward compatibility — both completed cleanly, zero illegal-action warnings,
+zero errors. 4 new tests in `tests/test_self_play.py` (delegation, zero-weight
+sub-players never selected, per-battle-not-per-turn resampling using the same
+mutation-tested shape as `FrozenPolicyPlayer`'s own resampling test). 155 tests
+passing.
+
+Not yet done: an actual real-scale run with all three fixes together
+(`protect_counter`, widened pool, search-bot mixing) — this session's scope was
+building and unit/smoke-verifying the fixes, not spending the wall-clock on a new
+sanity run. That combined run is the next real step before judging whether the
+plateau moves. PPO/reward hyperparameter tuning (the diagnosis's fourth, vaguest
+item) remains deliberately deferred until after that run.
+
+### 500k sanity run + reward rebalance + hazard-immunity encoding fix (2026-08-09)
+
+The combined run above (protect_counter + widened pool + search-bot mixing) was run
+for real: 500,000 timesteps, `--eval-interval 20000 --eval-battles 20`. Periodic
+eval-vs-`TwoPlySearchPlayer` climbed noisily to a final point of 45.0% (9/20), and a
+resume to 1,000,000 total steps kept climbing (final point 55.0% at 920k, ending at
+40.0%). Pooling properly rather than trusting individual n=20 points: first half
+(20k-500k) 122/500 = 24.4%, second half (500k-1,000,000) 163/500 = 32.6% [28.5%,
+36.7%] — at the *top edge* of the old ~28-32% plateau band, not a clean break from it.
+The real, gate-standard 500-battle benchmark on the resulting checkpoint
+(`scripts/benchmark.py --p1 ppo --p2 search --format gen9ou --n-battles 500`) gave
+**171/500 = 34.2% [30.2%, 38.5%]** — a real but modest improvement over the historical
+band, and still a clear loss (PPO still loses to the search bot roughly 2-to-1).
+**Phase 3 gate: still not met.**
+
+Two more fixes followed, both from real diagnosis, not guesses:
+
+**Reward rebalance** (`battle_engine/rl_env.py`): `_FAINTED_VALUE`/`_HP_VALUE` 0.15 ->
+0.05, `_VICTORY_VALUE` unchanged at 1.0. Derived from `PokeEnv.reward_computing_helper`'s
+actual source (each side's 6 Pokemon contribute up to ±value to the state value, so
+worst-case per-battle shaping is `12*value` total, not "per side" as an earlier version
+of this note said - `12*0.15 = 1.8` against the terminal `±1.0` victory term, confirming
+shaping could outweigh winning/losing itself; `12*0.05 = 0.6` keeps a real dense signal
+while staying clearly subordinate).
+
+**Hazard-immunity encoding gap** (`battle_engine/encoding.py`): found via
+`scripts/inspect_ppo_replays.py` on the reward-rebalanced-only checkpoint - a real,
+severe pathology in real gameplay, not a training artifact. Two separate instances:
+- A trained policy spammed Spikes 32 consecutive turns against a Flying-type opponent
+  fully immune to it (turns 114-145 of one real battle) - the vector had no signal at
+  all for hazard-immunity by type/ability, a mechanic entirely separate from the
+  existing type-chart-based matchup-score dimension.
+- A second, distinct pattern (Stealth Rock recast 8 turns straight while the user's own
+  Pokemon's HP drained 58%->6% with no other action taken) turned out NOT to be the
+  same kind of gap on inspection: hazard *presence* was already visible in the vector
+  (`opp_hazards` containing `"stealthrock"`), so this reads as the policy not yet having
+  learned to act on an already-available signal (a training-insufficiency pattern) not
+  a missing-feature one - no encoding fix attempted for this specific case, flagged
+  instead as a candidate that more training/reward-shaping might address, not more
+  features.
+
+Fixed the first (real, structural) gap: `_is_hazard_immune` (`my_active_hazard_immune`/
+`opp_active_hazard_immune`, 2 new scalar dims, `VECTOR_LEN` 663 -> 665) - true for
+Flying-type, Levitate ability, or Heavy-Duty Boots (see the function's own docstring for
+the full accounting and what's deliberately still out of scope: Iron Ball/Gravity/
+Magnet Rise/Ingrain/Smack Down/Roost, all measured rarer than Boots on real data).
+
+An Opus review of this session's full diff (reward rebalance, self-play pool widening,
+search-bot mixing, hazard-immunity encoding), run in parallel with a second, independent
+"look through more replays" pass, both against real library source and real data rather
+than the diff's own comments - found:
+- **The hazard-immunity feature's first version was itself incomplete**: it only
+  checked Flying-type/Levitate, originally named `_is_grounded`. Measured on real replay
+  data (300 replays, 20,610 active-mon states): Heavy-Duty Boots is the #2 most common
+  immunity source (5.19% of states, behind Flying's 17.0%, ahead of Levitate's 2.46%)
+  and the *only* one of the three that also blocks Stealth Rock - the original version
+  confidently mislabeled every boots holder as vulnerable, sitting right next to the raw
+  item feature (`_ITEM_VOCAB` already includes `"heavydutyboots"`) without using it. Real
+  catch: this directly undercuts the fix's own purpose (a boots-holding opponent, ~1 in
+  20 states, would still trigger the same 32-turn-spam pathology). Fixed and renamed
+  before any training used it - datasets rebuilt and both Phase-2 models retrained a
+  third time on the corrected values (not just re-widened dimensions this time - the
+  boots fix changes real feature *values* for ~5% of states, not just vector width).
+- `--search-bot-fraction` outside `[0.0, 1.0]` failed silently rather than raising
+  (`random.choices` only rejects a non-positive *weight total*, and self-play's weight
+  here is always >= 0) - e.g. `1.5` silently resolved to "always pick the search bot,"
+  making a typo read as a successful run of a different experiment. Fixed with an
+  explicit range check.
+- A pre-existing (not introduced this session) websocket leak on `--resume-from`
+  failure: `build_env()` opens real connections before `MaskablePPO.load` is attempted,
+  and any load failure (e.g. a shape mismatch from resuming across an encoding change)
+  left both open with no path to `env.close()`. Fixed with a try/except around the load.
+- Stale dimension numbers in `README.md` and `ppo_warm_start.py`'s docstring (still said
+  "663", now "665") and two inaccuracies in this file's own prior section (said "5 new
+  tests" for `tests/test_self_play.py`, actually 4; a test count that was accurate for
+  its own point in time but easy to misread as current) - both fixed.
+- **Flagged, not yet acted on** (plausible but explicitly not confirmed by the reviewer):
+  cutting `_FAINTED_VALUE`/`_HP_VALUE` 3x may be making the warm-started critic's initial
+  fit *worse*, not just smaller - `WinProbModel`'s output scale doesn't move with the
+  reward rebalance, so shrinking return variance without rescaling the critic could widen
+  the mismatch between them. Measured on 5 short instrumented runs per setting:
+  first-update `explained_variance` was negative in 4/5 runs at 0.05 (one run -2.54) vs.
+  negative in 3/4 at the old 0.15 too - noisy, mostly-negative either way, and this
+  project's own earlier "explained_variance starts at ~0.65 with warm-start" claim
+  (`ppo_warm_start.py`) does not reproduce under either setting on the current encoder.
+  Decision: keep 0.05 for the next run anyway - the mathematical problem it fixes
+  (shaping outweighing the terminal win/loss signal) is confirmed and structural, the
+  warm-start-quality concern is unconfirmed and, per the original gradient-coupling
+  study, this class of effect has previously self-corrected within ~4 of ~244 updates in
+  a 500k-step run - but explicitly flagged here as a real open question to revisit if the
+  next run underperforms again, not silently resolved.
+- Everything else in the diff checked and confirmed correct, no bug: `MixedOpponentPlayer`
+  weighted selection/battle_tag caching, `TwoPlySearchPlayer`'s use as a non-connected
+  decision function, `self_play_opponent` reference-correctness through the
+  `MixedOpponentPlayer` wrapper, `--resume-from`'s interaction with the new opponent code,
+  `VECTOR_LEN` arithmetic and `encode()`'s shape assertion, the `[-1]`->`[-3]` test
+  reindex, and that the new tests are non-vacuous (mutation-tested the same way the
+  2026-08-01 review required of `FrozenPolicyPlayer`'s own resampling test).
+
+Also separately bumped `--n-steps` 256 -> 2048 (stable-baselines3's own default,
+restored after being left at an 8x-smaller dev-speed shortcut through every real
+training run so far, including both plateaus) - `batch_size` stays at SB3's default
+(64), so this is still a clean 32 minibatches/epoch at `n_envs=1`.
+
+Next: the actual combined run (reward rebalance + hazard-immunity fix, corrected for
+boots + n_steps=2048) - not yet done as of this note. `--eval-interval 20000` recommended
+over the default 4096 (measured: the default schedule would add ~2,440 real eval battles
+on top of a 500k run, likely dominating its wall-clock).
+
 ## Hard rules
 
 - **Laptop-first**: every training run must fit on the M4 MacBook Air (measure one

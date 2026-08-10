@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import random
 from collections import deque
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -144,6 +144,51 @@ class FrozenPolicyPlayer(Player):
         return MetamonActionSinglesEnv.action_to_order(
             int(action[0]), battle, fake=False, strict=False
         )
+
+
+class MixedOpponentPlayer(Player):
+    """Delegates each battle to one of several sub-players, sampled by
+    weight and resampled once per battle (the same battle_tag-keyed
+    granularity FrozenPolicyPlayer already uses for snapshot resampling) so
+    a single battle is always played by one coherent opponent, never
+    something that swaps identity mid-game.
+
+    Built for the sanity-run plateau diagnosis (see CLAUDE.md's Phase 3
+    status): pure self-play only ever tests the trainee against itself, so
+    "beats recent snapshots" doesn't have to transfer to "beats
+    TwoPlySearchPlayer" (Phase 3's actual gate opponent) - the trainee could
+    converge on strategies that only work against its own policy family.
+    Mixing a fraction of training battles against a real TwoPlySearchPlayer
+    instance forces the trainee to also solve *that* matchup directly during
+    training, not just at periodic eval checkpoints (--eval already does
+    real games against it, but only ever *measures*, never *trains* against
+    it).
+
+    Sub-players are used exactly like FrozenPolicyPlayer already is in
+    build_env - as pure choose_move/teampreview decision functions over a
+    battle object neither actually owns a live connection for, never
+    battle_against'd directly - so each should be built the same way
+    (start_listening=False, no team=).
+    """
+
+    def __init__(self, *args, players: List[Tuple[float, Player]], seed: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not players:
+            raise ValueError("MixedOpponentPlayer needs at least one (weight, player) pair")
+        self._players = [p for _, p in players]
+        self._weights = [w for w, _ in players]
+        self._rng = random.Random(seed)
+        self._active_battle_tag: Optional[str] = None
+        self._active_player: Optional[Player] = None
+
+    def _select(self, battle_tag: str) -> Player:
+        if battle_tag != self._active_battle_tag:
+            self._active_player = self._rng.choices(self._players, weights=self._weights, k=1)[0]
+            self._active_battle_tag = battle_tag
+        return self._active_player
+
+    def choose_move(self, battle: AbstractBattle) -> BattleOrder:
+        return self._select(battle.battle_tag).choose_move(battle)
 
 
 class SelfPlaySnapshotCallback(BaseCallback):

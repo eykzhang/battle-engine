@@ -4,7 +4,12 @@ import pytest
 import torch
 from poke_env.player.player import Player
 
-from battle_engine.self_play import FrozenPolicyPlayer, SelfPlaySnapshotCallback, build_inference_policy
+from battle_engine.self_play import (
+    FrozenPolicyPlayer,
+    MixedOpponentPlayer,
+    SelfPlaySnapshotCallback,
+    build_inference_policy,
+)
 from conftest import make_mon
 
 
@@ -174,6 +179,83 @@ def test_snapshot_pool_evicts_oldest_beyond_max_snapshots():
         player.add_snapshot(build_inference_policy().state_dict())
 
     assert len(player._snapshots) == 2
+
+
+class _TaggedPlayer(Player):
+    """A minimal Player stub whose choose_move just reports its own
+    identity - lets MixedOpponentPlayer tests check *which* sub-player
+    handled a battle without depending on FrozenPolicyPlayer/
+    TwoPlySearchPlayer's real (and heavier) decision logic.
+    """
+
+    def __init__(self, *args, tag: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tag = tag
+        self.calls = 0
+
+    def choose_move(self, battle):
+        self.calls += 1
+        return self.tag
+
+
+def test_mixed_opponent_player_requires_at_least_one_sub_player():
+    with pytest.raises(ValueError):
+        MixedOpponentPlayer(battle_format="gen9ou", start_listening=False, players=[])
+
+
+def test_mixed_opponent_player_delegates_to_the_only_sub_player():
+    sub = _TaggedPlayer(battle_format="gen9ou", start_listening=False, tag="only")
+    mixed = MixedOpponentPlayer(
+        battle_format="gen9ou", start_listening=False, players=[(1.0, sub)]
+    )
+
+    result = mixed.choose_move(_full_battle())
+
+    assert result == "only"
+    assert sub.calls == 1
+
+
+def test_mixed_opponent_player_zero_weight_sub_player_is_never_selected():
+    always = _TaggedPlayer(battle_format="gen9ou", start_listening=False, tag="always")
+    never = _TaggedPlayer(battle_format="gen9ou", start_listening=False, tag="never")
+    mixed = MixedOpponentPlayer(
+        battle_format="gen9ou",
+        start_listening=False,
+        players=[(1.0, always), (0.0, never)],
+        seed=0,
+    )
+
+    for i in range(20):
+        result = mixed.choose_move(_full_battle(battle_tag=f"battle-{i}"))
+        assert result == "always"
+    assert never.calls == 0
+
+
+def test_mixed_opponent_player_resamples_between_battles_but_not_within_one():
+    """Same mutation-tested shape as FrozenPolicyPlayer's own resampling
+    test (test_choose_move_resamples_between_battles_but_not_within_one) -
+    seeding two distinguishable, non-degenerate sub-players (both nonzero
+    weight) so the assertion actually exercises resampling logic rather than
+    passing regardless of whether it fires.
+    """
+    a = _TaggedPlayer(battle_format="gen9ou", start_listening=False, tag="a")
+    b = _TaggedPlayer(battle_format="gen9ou", start_listening=False, tag="b")
+    mixed = MixedOpponentPlayer(
+        battle_format="gen9ou", start_listening=False, players=[(0.5, a), (0.5, b)], seed=0
+    )
+
+    battle = _full_battle(battle_tag="battle-1")
+    first_result = mixed.choose_move(battle)
+    for _ in range(5):
+        assert mixed.choose_move(battle) == first_result  # same battle_tag - must not resample
+
+    saw_the_other_sub_player_get_picked = False
+    for i in range(20):
+        result = mixed.choose_move(_full_battle(battle_tag=f"battle-{i + 2}"))
+        if result != first_result:
+            saw_the_other_sub_player_get_picked = True
+            break
+    assert saw_the_other_sub_player_get_picked
 
 
 def test_self_play_snapshot_callback_pushes_on_the_configured_interval():

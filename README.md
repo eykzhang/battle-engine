@@ -123,7 +123,7 @@ originally-planned deliverables:
   pivot/priority/coverage), with two adapters (live poke-env battles, parsed human
   replays) feeding the same model. Check `battle_engine.encoding.VECTOR_LEN` for the
   real current dimension rather than trusting a number here — it's changed more than
-  once as features were added (316 → 656 → 663).
+  once as features were added (316 → 656 → 663 → 665).
 - **Data pipeline**: a streaming fetcher that ELO-filters replays without downloading
   Metamon's full 20+GB archive, temporally spread (30,000 replays, Dec 2023 → May
   2026) rather than clustered in one month, and a dataset builder that gets the
@@ -151,11 +151,12 @@ eval bolted onto the same shallow 2-ply search structurally can't see switching'
 multi-turn value beyond a hand-tuned patch, and that's plausibly the actual ceiling on
 this axis, not a bug still waiting to be found.
 
-**Phase 3 (RL) plumbing built and reviewed; strength verification intentionally
-deferred.** PPO self-play sidesteps Phase 2's ceiling by learning a policy directly
-rather than ranking states through a fixed-depth lookahead. Built and independently
-reviewed (twice) before any real-scale run:
+**Phase 3 (RL) built, run, and diagnosed twice — gate not yet met, several real
+fixes in place for the next run.** PPO self-play sidesteps Phase 2's ceiling by
+learning a policy directly rather than ranking states through a fixed-depth
+lookahead.
 
+Plumbing (built and independently reviewed before any real-scale run):
 - **Action-space reconciliation**: poke-env's Gymnasium environment exposes its own
   26-way action scheme; the Phase-2 imitation model was trained on a different,
   13-way one matching this project's own state-encoding conventions. A bidirectional
@@ -170,28 +171,35 @@ reviewed (twice) before any real-scale run:
   the imitation model seeds the actor — made possible by re-shaping PPO's network to
   match their architecture exactly (verified via bit-identical output reproduction,
   not just matching shapes).
-- **Self-play** against a small pool of frozen snapshots of the policy's own past
-  weights, refreshed periodically during training.
+- **Self-play** against a pool of frozen snapshots of the policy's own past weights,
+  plus a configurable fraction of training games played directly against the Phase-1
+  search bot (not just measured against it) — added after diagnosis showed pure
+  self-play never required the policy to transfer "beats recent self" into "beats
+  2-ply lookahead."
 - **Real progress tracking during training**: periodic head-to-head evaluation
   against the Phase-1 search bot via real games (not a proxy metric), checkpointing,
   and resumable runs.
 
-A planned long training run was intentionally paused partway through (proving
-checkpoint/resume works cleanly) rather than run to completion blind. Replay
-inspection during that pause — the same technique that found Phase 1's and Phase 2's
-bugs — surfaced a real, quantifiable pathology: the policy was repeatedly re-using
-Protect immediately after it had just failed, walking back into Showdown's own
-escalating-failure mechanic and taking large, predictable losses as a direct result.
-Traced to a genuine encoder gap (the risk was structurally invisible to any model
-trained on the old vector) and fixed by adding it as a feature, reconstructed
-correctly for historical replay data (no equivalent field exists there — a
-non-trivial reconstruction problem in its own right, corrected once after an
-independent review caught a real bug in the first attempt at it) and read exactly
-off poke-env for live play.
+A 1,000,000-timestep sanity run surfaced a real, quantifiable pathology via replay
+inspection (the same technique that found Phase 1's and Phase 2's bugs): the policy
+repeatedly re-used Protect immediately after it had just failed, walking back into
+Showdown's own escalating-failure mechanic. Traced to a genuine encoder gap and
+fixed. A second sanity run at the same scale, plus the real gate benchmark, gave
+**34.2% [30.2, 38.5] vs. the Phase-1 search bot — a real but modest improvement over
+the initial plateau (~28-32%), still a clear loss.** ❌ gate not met.
 
-Whether this actually moves the strength plateau is a real, open question —
-deliberately not yet re-measured; that's the next thing to do, not something to
-assume.
+Two more real fixes followed from further replay inspection and an independent
+Opus review:
+- **Reward-shaping magnitude**: the per-turn HP/faint shaping could mathematically
+  outweigh the terminal win/loss signal (±1.8 vs. ±1.0, derived from poke-env's own
+  reward formula) — rebalanced so winning/losing dominates.
+- **A second encoder gap**: the policy spammed Spikes 32 turns straight against a
+  Flying-type opponent fully immune to it — a hazard-immunity mechanic (Flying-type,
+  Levitate, Heavy-Duty Boots) with no signal anywhere in the vector. Fixed — and the
+  first version of the fix was itself caught missing Heavy-Duty Boots (the #2 most
+  common immunity source in real data) by the same review process, before it shipped.
+
+The next run (combined: all fixes above, active together) is the next real step.
 
 ## Setup
 
@@ -220,7 +228,7 @@ cd pokemon-showdown && node pokemon-showdown start --no-security
 
 # Phase 3: masked PPO self-play training, warm-started from the Phase-2 models,
 # with periodic real-game evaluation against the search bot and checkpointing
-.venv/bin/python scripts/train_ppo.py --timesteps 2000 --n-steps 256
+.venv/bin/python scripts/train_ppo.py --timesteps 500000
 
 # Tests (the harness integration test auto-skips if the server isn't running)
 .venv/bin/pytest

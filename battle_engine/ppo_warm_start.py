@@ -12,8 +12,8 @@ on a (VECTOR_LEN + ACTION_SPACE_SIZE)-dim, differently-ordered input that
 doesn't match either Phase-2 model's trunk (VECTOR_LEN alone - check the real
 current value, not a number hardcoded here, same "don't trust a stale
 dimension in a comment" rule win_prob.py's own docstring states explicitly;
-VECTOR_LEN has changed at least once already, 316->656->663 as of
-2026-08-01's protect_counter addition). But masking (rl_env.py's
+VECTOR_LEN has changed more than once already, 316->656->663->665 as of
+2026-08-09's hazard-immunity addition). But masking (rl_env.py's
 sb3_contrib_action_mask_fn, wired via sb3-contrib's MaskablePPO) now
 enforces legality at the action-distribution level, not by having the
 network learn it from a mask *input feature* - so the mask no longer needs

@@ -12,6 +12,21 @@ training via SelfPlaySnapshotCallback, one snapshot sampled per battle (not
 per turn). Seeded with the trainee's own initial (possibly warm-started)
 weights so there's a real opponent from battle 1, not an empty pool.
 
+--search-bot-fraction (default 0.2, self-play only) mixes a real
+TwoPlySearchPlayer instance into that opponent pool via
+self_play.MixedOpponentPlayer, at the given per-battle probability. Added
+after a real training run (1,000,000 timesteps, see CLAUDE.md's Phase 3
+sanity-run status) plateaued at a ~28-32% win rate against
+TwoPlySearchPlayer: pure self-play only ever tests the trainee against
+itself, so nothing in training required "beats recent snapshots" to
+transfer to "beats 2-ply lookahead" - only --eval's periodic real games
+against TwoPlySearchPlayer ever measured that, and measuring isn't
+training. 0.0 disables mixing and reproduces the old pure-self-play
+behavior exactly. DEFAULT_MAX_SNAPSHOTS also widened 5 -> 20 in the same
+pass (a second, independent plateau contributor: 5 snapshots at the default
+4096-step interval is a rolling ~2% window of a 1,000,000-timestep run) -
+see the constant's own comment for the exact reasoning.
+
 Warm-starts from the Phase-2 models by default (--no-warm-start to train
 from scratch instead): battle_engine/ppo_warm_start.py copies
 imitation.py's trained trunk+output into the policy (actor) network and
@@ -85,6 +100,7 @@ import argparse
 import asyncio
 import time
 from pathlib import Path
+from typing import Optional
 
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.player import Player, RandomPlayer
@@ -97,7 +113,7 @@ from battle_engine.ppo_eval import EvalVsOpponentCallback
 from battle_engine.ppo_warm_start import load_warm_start_weights, warm_start_policy_kwargs
 from battle_engine.rl_env import MetamonActionSinglesEnv, sb3_contrib_action_mask_fn
 from battle_engine.search import TwoPlySearchPlayer
-from battle_engine.self_play import FrozenPolicyPlayer, SelfPlaySnapshotCallback
+from battle_engine.self_play import FrozenPolicyPlayer, MixedOpponentPlayer, SelfPlaySnapshotCallback
 from battle_engine.teams import RandomTeamFromPool
 from battle_engine.win_prob import WinProbModel
 
@@ -105,7 +121,27 @@ DEFAULT_MODEL_PATH = Path("data/models/ppo.zip")
 DEFAULT_IMITATION_MODEL_PATH = Path("data/models/imitation.pt")
 DEFAULT_WIN_PROB_MODEL_PATH = Path("data/models/win_prob.pt")
 DEFAULT_SNAPSHOT_INTERVAL = 4096
-DEFAULT_MAX_SNAPSHOTS = 5
+# Was 5 (a rolling ~2% window of a 1,000,000-timestep run - snapshot_interval
+# * max_snapshots = 20,480 steps of history) - flagged by the sanity-run
+# plateau diagnosis (see CLAUDE.md's Phase 3 status) as one likely
+# contributor: a pool this narrow mostly tests the trainee against very
+# recent versions of itself, giving little protection against forgetting
+# older strategies or cycling. 20 widens the covered window to ~8.2% of that
+# same run (81,920 steps) at negligible cost - each snapshot is just one
+# ~186k-param MLP state_dict (~750KB), cheap to keep even a few dozen of.
+DEFAULT_MAX_SNAPSHOTS = 20
+# Fraction of self-play training battles played against a real
+# TwoPlySearchPlayer instance instead of a frozen self-play snapshot - the
+# sanity-run diagnosis's other likely contributor: the trainee never once
+# played the actual Phase-3 gate opponent during training, only itself, so
+# "beats recent self" wasn't required to transfer to "beats 2-ply lookahead".
+# 0.2 keeps self-play as the dominant signal (cheaper, faster-iterating
+# opponent pool) while guaranteeing real, repeated exposure to the actual
+# target throughout training, not just at periodic --eval checkpoints (which
+# measure against it but never train against it). Only used when --opponent
+# self-play; 0.0 disables mixing and reproduces the old pure-self-play
+# behavior exactly.
+DEFAULT_SEARCH_BOT_FRACTION = 0.2
 DEFAULT_EVAL_INTERVAL = 4096
 DEFAULT_EVAL_BATTLES = 20
 DEFAULT_CHECKPOINT_INTERVAL = 8192
@@ -142,10 +178,17 @@ def main() -> None:
     parser.add_argument(
         "--n-steps",
         type=int,
-        default=256,
-        help="PPO rollout length before each policy update (SB3 default is 2048; "
-        "smaller here so a laptop feasibility check doesn't have to wait for a "
-        "full 2048-step rollout just to get a first timing measurement)",
+        default=2048,
+        help="PPO rollout length before each policy update. Was 256 (an 8x-smaller-"
+        "than-SB3's-own-default dev-speed shortcut, chosen only so an early laptop "
+        "feasibility check didn't have to wait for a full rollout to get a first "
+        "timing measurement) - left at that value for every real training run since, "
+        "including the sanity runs that plateaued (see CLAUDE.md's Phase 3 status). "
+        "Restored to SB3's own default (2048) 2026-08-09: a smaller rollout means "
+        "noisier per-update gradient estimates (fewer battle-turns of real data "
+        "before each policy update), a plausible, never-actually-tested contributor "
+        "to that plateau. batch_size stays at SB3's default (64), so this is still a "
+        "clean 32 minibatches/epoch with n_envs=1.",
     )
     parser.add_argument(
         "--save",
@@ -178,6 +221,15 @@ def main() -> None:
         type=int,
         default=DEFAULT_MAX_SNAPSHOTS,
         help="frozen-snapshot pool size (--opponent self-play only)",
+    )
+    parser.add_argument(
+        "--search-bot-fraction",
+        type=float,
+        default=DEFAULT_SEARCH_BOT_FRACTION,
+        help="fraction of training battles played against a real TwoPlySearchPlayer "
+        "instead of a frozen self-play snapshot (--opponent self-play only) - trains "
+        "directly against the actual Phase-3 gate opponent, not just self-play "
+        "snapshots. 0.0 reproduces the old pure-self-play behavior.",
     )
     parser.add_argument(
         "--eval",
@@ -231,14 +283,38 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not 0.0 <= args.search_bot_fraction <= 1.0:
+        # Real footgun caught by independent review (2026-08-09): weights
+        # this far out of range don't raise (random.choices only rejects a
+        # non-positive *total*, and self-play's weight is always >= 0 here),
+        # they silently resolve to "always pick the search bot" - a typo'd
+        # fraction would read as a successful run of a different experiment,
+        # not an error.
+        parser.error("--search-bot-fraction must be between 0.0 and 1.0")
+
     if args.resume_from is not None and args.warm_start:
         print("--resume-from given: ignoring --warm-start (resumed weights take precedence)")
         args.warm_start = False
 
+    self_play_opponent: Optional[FrozenPolicyPlayer] = None
     if args.opponent == "self-play":
-        opponent: Player = FrozenPolicyPlayer(
+        self_play_opponent = FrozenPolicyPlayer(
             battle_format="gen9ou", start_listening=False, max_snapshots=args.max_snapshots
         )
+        if args.search_bot_fraction > 0.0:
+            search_bot_opponent = TwoPlySearchPlayer(
+                battle_format="gen9ou", start_listening=False
+            )
+            opponent: Player = MixedOpponentPlayer(
+                battle_format="gen9ou",
+                start_listening=False,
+                players=[
+                    (1.0 - args.search_bot_fraction, self_play_opponent),
+                    (args.search_bot_fraction, search_bot_opponent),
+                ],
+            )
+        else:
+            opponent = self_play_opponent
     else:
         opponent = RandomPlayer(battle_format="gen9ou", start_listening=False)
 
@@ -249,7 +325,17 @@ def main() -> None:
         # new underlying connection) rather than trying to restore whatever
         # env object existed at save time, which MaskablePPO.load doesn't
         # attempt to serialize in the first place.
-        model = MaskablePPO.load(args.resume_from, env=env)
+        try:
+            model = MaskablePPO.load(args.resume_from, env=env)
+        except Exception:
+            # Real leak caught by independent review (2026-08-09): build_env()
+            # above already opened real websocket connections (trainee +
+            # opponent) - a shape mismatch (e.g. resuming a checkpoint from
+            # before an encoding change) or any other load failure left both
+            # open for the rest of the process's life with no path to
+            # env.close() afterward.
+            env.close()
+            raise
         print(
             f"resumed from {args.resume_from} at {model.num_timesteps} timesteps "
             f"(n_steps={model.n_steps}, restored from the checkpoint - --n-steps is "
@@ -291,13 +377,16 @@ def main() -> None:
         )
 
     callbacks = []
-    if args.opponent == "self-play":
+    if self_play_opponent is not None:
         # Seed the pool with the trainee's own starting weights - possibly
         # warm-started, so battle 1's opponent is a reasonable player, not
-        # an empty pool FrozenPolicyPlayer would otherwise raise on.
-        opponent.add_snapshot(model.policy.state_dict())
+        # an empty pool FrozenPolicyPlayer would otherwise raise on. Always
+        # the inner FrozenPolicyPlayer, even when it's wrapped in a
+        # MixedOpponentPlayer for search-bot mixing - that's the only one of
+        # the two sub-players with a snapshot pool to seed/refresh.
+        self_play_opponent.add_snapshot(model.policy.state_dict())
         callbacks.append(
-            SelfPlaySnapshotCallback(opponent, snapshot_interval=args.snapshot_interval)
+            SelfPlaySnapshotCallback(self_play_opponent, snapshot_interval=args.snapshot_interval)
         )
 
     eval_opponent = None

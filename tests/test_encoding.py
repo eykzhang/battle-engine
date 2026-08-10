@@ -244,9 +244,10 @@ def test_favorable_type_matchup_scores_positive_matchup_dimension():
     favorable = encode(battle_view_from_poke_env(_battle([excadrill], excadrill, [pikachu], pikachu)))
     unfavorable = encode(battle_view_from_poke_env(_battle([pikachu], pikachu, [excadrill], excadrill)))
 
-    # matchup score is the last dimension of the vector.
-    assert favorable[-1] > 0.0
-    assert unfavorable[-1] < 0.0
+    # matchup score is third-from-last (my_active_hazard_immune/opp_active_hazard_immune
+    # were appended after it - see encoding.py's VECTOR_LEN).
+    assert favorable[-3] > 0.0
+    assert unfavorable[-3] < 0.0
 
 
 def test_levitate_grants_immunity_to_ground_in_matchup_score():
@@ -273,7 +274,11 @@ def test_levitate_grants_immunity_to_ground_in_matchup_score():
     # With Levitate known, Excadrill's Ground-type offense is neutralized
     # (2x -> 0x), so the matchup score should drop relative to the
     # ability-unrevealed case, where the raw type chart alone applies.
-    assert levitate_vec[-1] < unrevealed_vec[-1]
+    # matchup score is third-from-last (my_active_hazard_immune/opp_active_hazard_immune
+    # were appended after it) - [-1] would now also pick up Levitate's
+    # separate, real effect on opp_active_hazard_immune, which isn't what this
+    # test is about.
+    assert levitate_vec[-3] < unrevealed_vec[-3]
 
 
 def test_wonder_guard_blocks_non_super_effective_hits():
@@ -296,6 +301,68 @@ def test_wonder_guard_blocks_non_super_effective_hits():
     # check, an implementation that just always returned 0.0 under
     # Wonder Guard would incorrectly pass the assertions above too.
     assert _type_multiplier(PokemonType.FIRE, shedinja.types, "wonderguard") == 2.0
+
+
+def test_flying_type_is_hazard_immune():
+    # Talonflame (Fire/Flying) - immune to Spikes/Toxic Spikes/Sticky Web
+    # regardless of ability/item, since Flying itself grants the immunity.
+    talonflame = make_mon("talonflame")
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([talonflame], talonflame, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is True
+
+
+def test_levitate_ability_is_hazard_immune():
+    # Bronzong (Steel/Psychic, no innate Flying) - only immune once Levitate
+    # is actually known, same ambiguity rationale as the matchup-score test
+    # above (Bronzong's ability is genuinely ambiguous in-game).
+    bronzong = make_mon("bronzong")
+    bronzong.ability = "levitate"
+    view = battle_view_from_poke_env(
+        _battle([bronzong], bronzong, [make_mon("garchomp")], make_mon("garchomp"))
+    )
+    assert enc._is_hazard_immune(view.my_active) is True
+
+
+def test_heavy_duty_boots_is_hazard_immune():
+    # Garchomp (Dragon/Ground, no relevant ability) - would otherwise be
+    # squarely hazard-vulnerable; Heavy-Duty Boots overrides that regardless
+    # of typing/ability (also the only one of the three immunity sources
+    # that blocks Stealth Rock too, not just Spikes/Toxic Spikes/Sticky Web -
+    # see _is_hazard_immune's own docstring for why this case was added
+    # after the original Flying/Levitate-only version shipped).
+    garchomp = make_mon("garchomp")
+    garchomp.item = "heavydutyboots"
+    view = battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    )
+    assert enc._is_hazard_immune(view.my_active) is True
+
+
+def test_ordinary_grounded_type_is_not_hazard_immune():
+    garchomp = make_mon("garchomp")  # Dragon/Ground, no relevant ability/item
+    view = battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    )
+    assert enc._is_hazard_immune(view.my_active) is False
+
+
+def test_is_hazard_immune_defaults_false_when_types_unknown():
+    # An information gap (types unknown/empty) must never silently read as a
+    # false immunity signal - see _is_hazard_immune's own docstring.
+    assert enc._is_hazard_immune(PokemonView.unknown()) is False
+
+
+def test_hazard_immunity_is_encoded_for_both_active_pokemon():
+    # my_active_hazard_immune, opp_active_hazard_immune are the last two
+    # dimensions of the vector (see encoding.py's VECTOR_LEN) - Talonflame
+    # (Flying, immune) vs. Garchomp (grounded, vulnerable) makes both read
+    # distinctly on each side.
+    talonflame = make_mon("talonflame")
+    garchomp = make_mon("garchomp")
+    vec = encode(battle_view_from_poke_env(_battle([talonflame], talonflame, [garchomp], garchomp)))
+    assert vec[-2] == 1.0  # my_active_hazard_immune (Talonflame - immune)
+    assert vec[-1] == 0.0  # opp_active_hazard_immune (Garchomp - vulnerable)
 
 
 def test_replay_adapter_maps_unknown_ability_token_to_none():

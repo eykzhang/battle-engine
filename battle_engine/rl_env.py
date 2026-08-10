@@ -79,17 +79,25 @@ from battle_engine.encoding import VECTOR_LEN, battle_view_from_poke_env, encode
 
 _SENTINEL_ACTIONS = (-1, -2)  # forfeit, default - see module docstring
 
-# calc_reward weights, passed to PokeEnv.reward_computing_helper. A
-# starting point, not a tuned choice - and NOT actually small relative to
-# the terminal win/loss signal despite the original intent (an independent
-# review measured cumulative per-battle shaping spans roughly +-1.8 against
-# a +-1.0 victory term, i.e. shaping can outweigh the terminal signal in
-# magnitude). Win/loss ordering is still preserved in practice (observed
-# min-win reward > max-loss reward), so this isn't a broken reward, just an
-# inaccurate comment - worth revisiting once there's a real training run to
-# tune against, not guessed at again here.
-_FAINTED_VALUE = 0.15
-_HP_VALUE = 0.15
+# calc_reward weights, passed to PokeEnv.reward_computing_helper. Rebalanced
+# (2026-08-09) after a real training run (see CLAUDE.md's Phase 3 status)
+# confirmed the plateau this was flagged as a possible contributor to -
+# derived from reward_computing_helper's actual source (poke_env/
+# environment/env.py), not guessed: each side's 6 Pokemon contribute up to
+# +-value to the state value (hp_value while healthy, fainted_value while
+# fainted are mutually exclusive per mon - a mon is never both), so the
+# worst-case shaping-only swing across a full battle is
+# 6*value (my team) + 6*value (opponent team) = 12*value per side. At the
+# old 0.15, that's 12*0.15 = 1.8 against the terminal +-1.0 victory_value -
+# confirms the independent review's measured +-1.8 exactly, and means a
+# decisive win/loss's shaping component alone could exceed the entire
+# terminal win/loss signal. 0.05 brings the same worst-case swing to
+# 12*0.05 = 0.6 - clearly subordinate to the +-1.0 terminal term (a decisive
+# win now totals at most 1.6, and the terminal signal alone still ranges
+# +-1.0 regardless of how the battle was played) - while keeping a real,
+# nonzero per-turn dense signal rather than zeroing shaping out entirely.
+_FAINTED_VALUE = 0.05
+_HP_VALUE = 0.05
 _VICTORY_VALUE = 1.0
 
 
