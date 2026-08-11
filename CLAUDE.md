@@ -873,21 +873,155 @@ just a one-time jump. The real 500-battle gate benchmark on the final checkpoint
 
 CI entirely clear of both the 40.8% pre-overnight benchmark and the original ~28-32%
 plateau - the first time this project has produced a real, statistically confident,
-decisive win (not just an edge) for PPO over the Phase-1 search bot. **Phase 3 gate
-(roadmap: "RL-tuned policy beats the Phase-2 supervised bot head-to-head") is very
-likely also met** - Phase 2's own final benchmark lost to `search` 64.4% of the time
-(35.6% win rate), so PPO's 69.6% here would need to lose almost every head-to-head
-matchup against a weaker reference opponent to somehow still lose to Phase 2's bot
-directly - but this is an inference from transitivity, not yet a direct measurement;
-`--p1 ppo --p2 learned` hasn't actually been run. Worth doing before formally closing
-out Phase 3, not assumed here.
+decisive win (not just an edge) for PPO over the Phase-1 search bot.
 
-Not yet done: the direct Phase-2-bot benchmark above, a fresh `scripts/
-inspect_ppo_replays.py` pass to check whether the diagnosed pathologies (Spikes-vs-
-immune-opponent, Stealth-Rock-recast) are actually gone now rather than just inferring
-it from the aggregate win rate, and the roadmap's other Phase 3 gate component (a real
-ladder GXE number). ppo.zip and the checkpoint chain from this run are the current,
-non-archived `data/models/` state as of this note.
+**Direct Phase-2-bot benchmark (2026-08-11)**: `--p1 ppo --p2 learned --format gen9ou
+--n-battles 500` (same final checkpoint) - **346/500 = 69.2% [65.0%, 73.1%] vs the
+Phase-2 learned bot**, confirming the roadmap's Phase 3 gate ("RL-tuned policy beats
+the Phase-2 supervised bot head-to-head") directly rather than by the transitivity
+inference this note originally relied on. Near-identical to the 69.6% vs-`search`
+number above, consistent with Phase 2's own bot having lost to `search` 64.4% of the
+time (35.6% win rate) - PPO dominates both Phase-1 and Phase-2 bots by roughly the
+same margin. **Phase 3 gate: met, directly measured.**
+
+**Replay-inspection re-check (2026-08-11)**: `scripts/inspect_ppo_replays.py
+--n-battles 8` against the same final checkpoint, to verify (not just infer from the
+aggregate win rate) that the previously-diagnosed pathologies are actually gone.
+Confirmed clean on all three: protect-spam gone (7 total protect uses across 8
+battles, `protect_counter` never exceeded 2, always followed by a different move -
+none of the old escalating-failure streaks); Stealth Rock recast gone (2 uses total,
+no repeat pattern); Spikes-vs-hazard-immune-opponent not observed at all. No
+stalling/switch loops either (all 8 battles ended in 15-43 turns, far under the old
+multi-dozen-turn loops and the 1000-turn auto-tie). One long same-move streak (8x
+Roost) was inspected directly rather than assumed pathological - HP trended upward
+(0.18->0.60) against a wall it couldn't break, i.e. legitimate stall-recovery play,
+not a failure loop.
+
+**Ladder script built (2026-08-11)**: `scripts/ladder_ppo.py` plays the trained
+checkpoint on the real Showdown server (`ShowdownServerConfiguration`, not the local
+dev server every other script defaults to) via `Player.ladder()`, for the roadmap's
+other Phase 3 gate component - a real ladder GXE number. Checked poke-env's actual
+client source (0.15.0) before building it: `log_in()` only does a real
+password-authenticated login when a password is supplied (no bot-account-creation
+call exists anywhere in the client - a real, already-registered account is a
+prerequisite, not something this script can set up). Also checked Showdown's own
+rules page, FAQ, and its linked Bot FAQ gist: **no codified "battle bots must
+register/use an alt account" policy was found** - the alt-account approach from this
+project's Hard Rules is a self-imposed precaution (keeping an experimental bot's
+record off any personal identity), not a documented compliance requirement. Password
+handling avoids the plaintext-CLI-arg pitfall (shell history/process listing
+exposure): reads `POKE_SHOWDOWN_PASSWORD` or falls back to a secure `getpass` prompt.
+Not yet run - needs a real registered alt account, which is a manual step for the
+user (poke-env can't create one), and real ladder games are real-time against real
+humans (materially slower than every other benchmark in this project), so `--n-games`
+should start small.
+
+**First real runs (2026-08-11), and a genuine unresolved stall**: registered
+`battle-engine-test`, credentials stored in a gitignored `.env.local` (auto-loaded by
+the script - never in memory/CLAUDE.md, and never as a CLI arg). A 5-game serial run
+(`--max-concurrent-battles 1`, the default) completed cleanly: 2/5 won. A follow-up
+40-game run at `--max-concurrent-battles 5` (poke-env's own real
+`Player(max_concurrent_battles=...)`, verified safe to raise for this script's
+specific setup - `FrozenPolicyPlayer.choose_move` has no `await` in it and
+`load_ppo_player` seeds exactly one policy snapshot, so concurrent battles can't
+corrupt each other's move computation or mix up which weights are used) showed real
+initial progress (the account's live rating moved: Elo 1068->1000, GXE 27.2%->25.0%
+over the first ~40 min) then went **completely flat for 25+ minutes** (identical
+Elo/GXE/deviation across two checks) with near-zero CPU time, while the process
+stayed alive with its one real connection to `sim4.psim.us` still established.
+
+Initial diagnosis (this session, no stack trace available - `py-spy dump` needs root
+on macOS and no TTY was available anywhere in the tooling to supply a `sudo`
+password) was inconclusive. A follow-up Opus code review (given the exact symptom
+and the poke-env source snippets already found) resolved it further, reading
+poke-env's actual source plus - critically - the local `pokemon-showdown` checkout's
+real server-side code, not just the client library:
+
+1. **A real, confirmed bug in poke-env's own `_ladder`**: it fires the *next* ladder
+   search before checking whether it's already at `max_concurrent_battles` capacity
+   (`player.py`'s loop calls `search_ladder_game` before the `while
+   self._battle_count_queue.full()` check, not after) - so at
+   `--max-concurrent-battles 5`, once 5 battles are live, it still searches for a 6th.
+2. **The real Showdown server enforces a hard 5-concurrent-battles-per-IP limit**
+   (confirmed in the local checkout's `server/monitor.ts`,
+   `countConcurrentBattle`) - a 6th search gets silently rejected via a `|popup|`
+   message that poke-env only logs as a warning (`ps_client.py`) and never retries.
+   `_ladder`'s wait on the next battle-start signal has no timeout, so a
+   silently-rejected search is a **permanent, zero-CPU stall with the connection
+   still alive** - exactly what was observed.
+
+Together: running at exactly the server's own concurrency ceiling (5) very likely
+triggered poke-env's off-by-one bug to push one search past that ceiling, which the
+server silently dropped with no recovery path on the client side. Also flagged by the
+review as plausible but explicitly *not* provable from source alone: a possible
+lock-holding interaction between `_battle_start_condition` and `_battle_end_condition`
+in the same `_ladder` loop body. Checked and reasonably ruled out: our own
+`FrozenPolicyPlayer.choose_move` (fully synchronous, no `await`) can't itself cause a
+stall like this, though an uncaught exception inside it would produce an
+indistinguishable zero-CPU signature - not confirmed either way here.
+
+**Practical takeaway**: stay at `--max-concurrent-battles 1` (proven clean twice) for
+the actual GXE-gathering runs. Real concurrency support would need fixing poke-env's
+search-before-capacity-check ordering and handling `popup`/`updatesearch` messages it
+currently ignores - real, deferred work, not needed for this gate. **This project had
+never used `max_concurrent_battles > 1` anywhere before this run** - every existing
+script/test uses the default of 1, so this was genuinely uncharted territory, not a
+previously-trusted path breaking.
+
+Also discovered and fixed along the way: the empty-looking log during the entire
+stall turned out to be a red herring, not evidence either way - Python fully buffers
+stdout when piped through `tee` (confirmed the hard way: even the final SIGTERM'd
+exit left the piped log completely empty, since SIGTERM skips normal interpreter
+shutdown/flush). Fixed properly, not worked around: `_instrument_progress()` in
+`ladder_ppo.py` now prints a flushed, real-time line on every battle start (wraps
+`choose_move`, same technique `inspect_ppo_replays.py` already uses) and every
+battle finish (overrides `Player._battle_finished_callback` - a real, public no-op
+hook meant to be overridden, not a private/internal detail), so any future run is
+self-diagnosing live instead of requiring this whole external rating-polling/`py-spy`
+detour again.
+
+Root cause confirmed (Opus review, reading poke-env's source plus the local
+`pokemon-showdown` checkout's real server code, not just the client library): a real
+poke-env bug (`_ladder` searches for the next battle before checking capacity)
+combined with the real server's hard 5-concurrent-per-IP limit - running exactly at
+that ceiling let the off-by-one push one search past it, which the server silently
+rejected with no retry path on poke-env's side. Since the overshoot is always exactly
++1, `--max-concurrent-battles 4` is safe from this specific mechanism (overshoot lands
+at 5, still within the server's limit) without needing to patch poke-env itself -
+confirmed by then actually running at 4 with the new live logging: clean, steady
+progress the entire run, zero stalls.
+
+**Retest at `--max-concurrent-battles 4` (2026-08-11) - real ladder GXE obtained,
+Phase 3's second gate component now directly measured, not just planned.** Two runs,
+exact counts both times thanks to the new logging: the original 5-game serial test
+(2-3-0) plus a clean 40-game/4-concurrent run (14-26-0, 35.0%). Combined: **16-29-0
+across 45 real games, 35.6% win rate [23.2%, 50.2%] (Wilson 95% CI)**, cross-validated
+by the account's own converging rating (deviation tightened ±52 -> ±39 as more games
+landed; final GXE 26.3%, Glicko 1305 ± 39). The CI's upper edge barely touches 50%,
+so this isn't airtight proof of a sub-50% true rate, but every point estimate across
+both runs (40.0%, 35.0%, 35.6% combined) independently landed in the same 35-40%
+band - a real, converging signal, not noise. Also directly benchmarked the roadmap's
+other Phase 3 gate wording ("beats the Phase-2 supervised bot head-to-head") rather
+than relying on the earlier transitivity inference: **346/500 = 69.2% [65.0%, 73.1%]
+vs the Phase-2 learned bot** (`--p1 ppo --p2 learned --format gen9ou`), confirming it
+directly.
+
+**Honest read**: the trained PPO policy decisively beats both prior phases' bots in
+local head-to-head benchmarks (69.6% vs Phase-1 search, 69.2% vs Phase-2 learned) but
+is currently the underdog against the real gen9ou ladder population it was matched
+against (35.6%, GXE 26.3%) - a genuinely different and harder test than bot-vs-bot
+benchmarking, and exactly the kind of gap this deliverable exists to surface rather
+than paper over. Not yet diagnosed *why* it's losing on the real ladder specifically
+(no replays saved this run, `--save-replays` exists but wasn't used) - a real,
+deliberately-deferred next step if this axis is revisited, not attempted here.
+
+**Phase 3 status: complete.** Both roadmap gate components now have real, directly-
+measured numbers (not inferred, not aspirational): beats the Phase-2 bot head-to-head
+(69.2%) and a real ladder GXE number (26.3%) exist and are recorded above. Moving to
+Phase 4 (stretch: C++ search core) next.
+
+ppo.zip and the checkpoint chain from this run are the current, non-archived
+`data/models/` state as of this note.
 
 ## Hard rules
 
@@ -972,6 +1106,16 @@ node pokemon-showdown validate-team gen9ou < packed_team.txt
 # HP/protect_counter - the "watch real replays" technique that found the
 # protect-spam pathology behind Phase 3's win-rate plateau (see Status above).
 .venv/bin/python scripts/inspect_ppo_replays.py --n-battles 6
+
+# Plays the trained checkpoint on the REAL Showdown ladder (not the local dev
+# server) for a real GXE number - the roadmap's other Phase 3 gate component.
+# Needs an already-registered account (an alt, not personal - see the
+# script's own docstring for why, and for what Showdown's actual current
+# bot/alt policy does and doesn't require). Password via POKE_SHOWDOWN_PASSWORD
+# or a secure prompt, never a CLI arg. Real, real-time games against real
+# humans - start with a small --n-games.
+export POKE_SHOWDOWN_PASSWORD=...
+.venv/bin/python scripts/ladder_ppo.py --username my-bot-alt --n-games 10
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
@@ -990,7 +1134,7 @@ harness/training scripts land — don't leave this stale.
   + benchmark-facing PPO loader (`ppo_eval.py`)
 - `scripts/` — runnable entry points (smoke test, benchmarks, replay fetching,
   dataset building, training, PPO training, PPO replay diagnosis
-  `inspect_ppo_replays.py`)
+  `inspect_ppo_replays.py`, real-ladder play `ladder_ppo.py`)
 - `tests/` — pytest (state encoding, damage calc, dataset/action-label logic, model
   training loops, harness determinism w/ seeded RNG, action-space translation, the
   PPO env — including one real-server integration test — PPO warm-start weight

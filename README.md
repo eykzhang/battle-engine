@@ -50,8 +50,8 @@ intervals) before the project advances — objective strength gates, not vibes:
 | **0** | The lab: local Showdown server, poke-env harness, baseline bots (random, max-damage), benchmark script | baselines measured |
 | **1** | Classical engine: hand-crafted evaluation function + lookahead search over damage-calculated outcomes | >70% win rate vs max-damage over 500+ battles |
 | **2** | First ML: a learned win-probability evaluation and a move-prediction (imitation) model, trained on millions of parsed human replays; the learned eval replaces the hand-crafted one inside the search | beats the Phase-1 bot head-to-head |
-| **3** | Reinforcement learning: PPO self-play, initialized from the Phase-2 imitation policy | beats the Phase-2 bot head-to-head |
-| **4+** | *Stretch*: a C++ search core — fast forward model + MCTS with an embedded, NNUE-style compiled inference of the learned eval, bound to Python via pybind11; gen9 OU support with opponent-set inference | ladder GXE |
+| **3** | Reinforcement learning: PPO self-play, initialized from the Phase-2 imitation policy | beats the Phase-2 bot head-to-head + a real ladder GXE number |
+| **4+** | *Stretch*: a C++ search core — fast forward model + MCTS with an embedded, NNUE-style compiled inference of the learned eval, bound to Python via pybind11; gen9 OU support with opponent-set inference | exploratory, no fixed win-rate gate |
 
 The end-state architecture mirrors Stockfish and Leela Chess Zero exactly: **train in
 Python, search and infer in C++.**
@@ -207,9 +207,26 @@ climbing rather than flattening out, and the final real 500-battle benchmark gav
 confident win, not just an edge.
 
 The literal roadmap gate is "beats the Phase-2 supervised bot," not the Phase-1
-search bot specifically — Phase 2's own final benchmark lost to the search bot 64.4%
-of the time, so PPO's 69.6% here almost certainly clears that bar too, but that exact
-matchup hasn't been separately benchmarked.
+search bot specifically. That direct matchup was then actually run:
+
+**69.2% [65.0, 73.1] vs. the Phase-2 learned bot** — ✅ confirming the gate directly
+rather than by inference from the search-bot result.
+
+**Real ladder run — the roadmap's other Phase 3 deliverable.** The trained checkpoint
+played real, real-time games on the live Showdown ladder (`scripts/ladder_ppo.py`,
+alt account, per the "Fair play" constraint above) under `gen9ou`. First attempt at
+5-concurrent battles hit a real,
+diagnosed bug (poke-env searches for the next battle before checking capacity against
+the server's own 5-concurrent-per-IP limit, causing a silent, permanent stall once
+exceeded) — fixed operationally by staying under that ceiling, with live per-battle
+progress logging added so a repeat wouldn't require indirect diagnosis again. Across
+45 real games (two runs, exact counts both times): **16-29-0, 35.6% win rate [23.2,
+50.2]**, cross-validated by the account's own converging rating (GXE 26.3%, Glicko
+1305 ± 39). A real, evidence-backed result: the trained policy is currently the
+underdog against the live gen9ou ladder population it was matched against — a
+genuinely different and harder test than the local bot-vs-bot benchmarks above, and
+exactly the kind of gap this deliverable exists to surface. Not yet diagnosed *why*
+(no replays saved this run) — a natural next step if returned to.
 
 ## Setup
 
@@ -239,6 +256,10 @@ cd pokemon-showdown && node pokemon-showdown start --no-security
 # Phase 3: masked PPO self-play training, warm-started from the Phase-2 models,
 # with periodic real-game evaluation against the search bot and checkpointing
 .venv/bin/python scripts/train_ppo.py --timesteps 500000
+
+# Real Showdown ladder play (not the local dev server) for a real GXE number.
+# Needs an already-registered alt account; see the script's own docstring.
+.venv/bin/python scripts/ladder_ppo.py --n-games 40 --max-concurrent-battles 4
 
 # Tests (the harness integration test auto-skips if the server isn't running)
 .venv/bin/pytest

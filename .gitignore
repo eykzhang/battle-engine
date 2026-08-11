@@ -14,3 +14,6 @@ runs/
 
 # macOS
 .DS_Store
+
+# Local secrets (e.g. ladder account credentials for scripts/ladder_ppo.py)
+.env.local
