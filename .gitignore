@@ -17,3 +17,10 @@ runs/
 
 # Local secrets (e.g. ladder account credentials for scripts/ladder_ppo.py)
 .env.local
+
+# Phase 4 C++: CMake build dir (FetchContent'd pybind11/Catch2 sources +
+# compiled objects, regenerate via scripts/build_cpp.sh) and the compiled
+# extension itself (lands in battle_engine/, also regenerable)
+cpp/build/
+cpp/.cache/
+battle_engine/_native*.so

@@ -1023,6 +1023,131 @@ Phase 4 (stretch: C++ search core) next.
 ppo.zip and the checkpoint chain from this run are the current, non-archived
 `data/models/` state as of this note.
 
+### Phase 4 M0: the central bet does not hold (2026-08-12)
+
+Per the Phase 4 plan (`/Users/edward/.claude/plans/precious-crafting-bachman.md`),
+milestone M0 exists to cheaply validate the premise of the multi-week C++ MCTS/DUCT
+investment before committing to it: does a real, sampled, branching search beat
+`TwoPlySearchPlayer`'s 1-ply expected-value projection? `battle_engine/mcts_prototype.py`
+is a pure-Python open-loop DUCT/MCTS implementation (reusing `damage.py`'s formula
+pieces sampled instead of averaged, and `evaluation.py`'s `evaluate()` as the leaf
+value) built to answer exactly this, with no C++ involved.
+
+**Result: no.** Default config (200 simulations, depth 4, UCB1 c=4.0), 150 battles
+on `gen9randombattle` vs `TwoPlySearchPlayer`: **40/150 = 26.7% [20.2%, 34.3%]** - a
+clear, confident loss. Before trusting this (same "diagnose before accepting a
+number" practice as every prior phase), checked it wasn't a bug or a tuning
+artifact:
+- **Hyperparameter sweep** (c=1.4 textbook default, c=4.0 at 500 sims, c=0.7 low-
+  exploration, all 60 battles each): 28.3%, 31.7%, 23.3% - all CIs heavily overlap
+  the original 26.7% and each other. Neither the exploration constant nor a 2.5x
+  simulation-count bump moves the result.
+- **10x simulation count** (2000 sims, 30 battles): 30.0% [16.7%, 47.9%] - still the
+  same band, ruling out "the default sim count is just too thin for the branching
+  factor" as the explanation.
+- **Replay inspection** (4 full games, turn-by-turn HP/order logging): no obvious
+  pathology - no illegal-looking moves, sensible switches into favorable matchups,
+  sensible STAB attacking. The bot just loses more often than it wins, not
+  malfunctioning.
+
+**Honest read**: a real, correctly-functioning branching MCTS/DUCT search over the
+same hand-crafted `evaluate()` used by `TwoPlySearchPlayer` does not outperform that
+simpler 1-ply search in this prototype. Per the plan's own stated M0 outcomes, this
+is a legitimate result, not a failure: **Phase 4's C++ implementation proceeds as an
+explicit, deliberate C++-learning exercise (the user's stated goal for this phase)
+rather than an implied strength bet.** Not yet explored: whether a stronger leaf
+evaluator (`WinProbModel`, or the PPO actor as a PUCT prior - both already deferred
+to the plan's M6/M6b enhancement track) would change this, since M0 only tests the
+search *mechanism* over the existing hand-crafted eval, deliberately holding the
+eval fixed to isolate the variable being tested.
+
+`battle_engine/mcts_prototype.py` remains uncommitted, throwaway M0 code per the
+plan's own description of it - not wired into `scripts/benchmark.py`, no tests
+written for it (matches its documented "NOT production code" scope).
+
+### Phase 4 M1 + M4: toolchain bring-up, BattleState, and the hand-crafted eval port (2026-08-12)
+
+Per this project's Phase 4 hard rule (see below), the user writes the actual C++;
+Claude's role is architecture/scaffolding (headers, doc comments, stub `.cpp` files
+with `TODO`s, and the tests that define "done") plus code review during
+implementation - not writing the engine logic itself.
+
+**M1 (toolchain)**: `cpp/` stood up - CMake (`brew install cmake`, wasn't installed),
+pybind11 v3.1.0 and Catch2 v3.15.3 via `FetchContent` (pinned to real tags verified
+against each project's GitHub releases API, not copied from a tutorial - v3.1.0 is
+newer than the v3.0.4 the original plan named, since that had since become stale).
+A Debug preset with `-fsanitize=address,undefined` is on by default (`scripts/
+build_cpp.sh`, no `--release` flag) per the plan's own review finding: real value
+for hand-written tree/pointer code (M6's search tree ahead). `_native*.so` builds
+straight into `battle_engine/` with no reinstall step (confirmed: `pyproject.toml`
+has no `[build-system]` table, a plain PEP 660 editable install).
+
+Hit one real, undocumented toolchain gotcha during bring-up: a Debug/ASan-built
+extension **aborts on import** (`Fatal Python error: Aborted`, no useful traceback)
+if the ASan runtime isn't preloaded before the Python interpreter starts - can't be
+fixed from `conftest.py`, has to happen pre-launch. Fixed with `scripts/
+pytest_native.sh` (sets `DYLD_INSERT_LIBRARIES` to clang's ASan dylib before
+invoking pytest) - plain `.venv/bin/pytest` still works for everything that doesn't
+import `battle_engine._native`.
+
+**M4 (`BattleState` + the hand-crafted eval port)**: `cpp/include/be/types.hpp`
+(shared POD types - `Type`, `Status`, `StatBlock`), `battle_state.hpp`
+(`PokemonSlot`/`SideConditions`/`BattleState`, fixed team-preview-ordered arrays -
+the one ordering `ActionId` will reuse at M5, not to be duplicated), `eval.hpp` (the
+four functions ported from `evaluation.py`). `scripts/dump_pokedex.py` (new tooling,
+Claude-authored like the other data-generation scripts) dumps real gen-9 data
+(`poke_env.data.GenData.from_gen(9)`) into `pokedex_table.hpp/cpp`: 1,123 species'
+base stats/types (deduped by lowercased `base_species`, matching this project's
+established identity-stability convention - verified directly against real data
+that this actually matters: `'terapagosterastal'`'s own `baseSpecies` field is
+capitalized `'Terapagos'` while `'terapagos'`'s is lowercase, so naive case-sensitive
+grouping would have split one species into two) and the real 18x18 type chart (one
+non-competitive placeholder entry, `missingno`, filtered out - it carries a scrapped
+gen-1 "Bird" type that isn't in the real chart at all, caught by generating first and
+hitting a compile error, not assumed).
+
+`battle_state.cpp` (`is_valid`) and `eval.cpp` (`type_matchup_score`, `hazard_score`,
+`speed_control_score`, `evaluate`) are user-implemented, iteratively, against 32
+Claude-authored Catch2 tests (`cpp/tests/test_battle_state.cpp`,
+`test_eval.cpp` - type-chart values in the latter checked against real
+`GenData` output, not from memory). Real bugs found and fixed during review, each
+caught before being trusted:
+- A genuine compile-order bug (a helper function called before its own definition
+  earlier in the same file - C++ doesn't hoist).
+- `type_matchup_score`'s first draft indexed `kTypeChart` directly with a
+  possibly-`Type::None` second type (single-typed Pokemon) - an out-of-bounds read
+  (`None`'s underlying value, 18, is one past the table's last real column, 17), not
+  a clean crash. Also caught a deeper conceptual version of the same mistake after
+  the direct-indexing bug was fixed: computing *both* branches of `offense`/
+  `defense`'s `max()` unconditionally (rather than only including a second
+  candidate when `type2 != Type::None`) would still read out-of-bounds, and even
+  once guarded against that, would have wrongly treated a missing second type as a
+  neutral `1.0` "phantom" candidate instead of just not having one - would have
+  inflated scores for single-typed Pokemon whose one real type is resisted.
+- `speed_control_score`'s base-stat estimation formula was missing the formula's
+  trailing `+ 5` on the first draft, and (after that was fixed) used
+  `my_active.level` instead of `opp_active.level` when estimating the *opponent's*
+  unknown stat - both silently wrong, neither caught by any written test (real
+  Pokemon are almost always level 100 in practice, masking the second one).
+  Separately, an early draft re-truncated the *boosted* speed back down to `int` at
+  each step (via `std::floor` and via compound `*=` on an `int` for the paralysis
+  halving) - a real divergence from `evaluation.py`'s `_boosted_speed`, which never
+  rounds after the initial base-stat-to-real-stat conversion; close-but-unequal
+  boosted speeds could have silently collapsed into a wrong tie.
+- `evaluate()`'s first draft summed `my_team` without checking `PokemonSlot::revealed`
+  (only checked `fainted`), while the `opp_team` loop correctly checked both -
+  asymmetric and untested by construction, since a real translated battle's
+  `my_team` is always fully revealed. Every one of the 7 resulting test failures was
+  off from its expected value by *exactly* the same constant (+7.5), which is what
+  pinned down the single root cause fast: 5 phantom default-constructed slots (`hp_
+  fraction = 1.0`, `revealed = false`, still summed) contributing `5*1.0` HP-fraction
+  + `5*0.5` alive-count-weight = 7.5 to every call.
+
+Confirmed both host suites green together: `./scripts/pytest_native.sh` (162
+Python tests, including `test_native_bindings.py`) and the Catch2 suite
+(`cpp/build/tests/be_tests`, 32/32 passing) - M4's real "done" criterion, no C++
+logic left as a stub.
+
 ## Hard rules
 
 - **Laptop-first**: every training run must fit on the M4 MacBook Air (measure one
@@ -1116,6 +1241,25 @@ node pokemon-showdown validate-team gen9ou < packed_team.txt
 # humans - start with a small --n-games.
 export POKE_SHOWDOWN_PASSWORD=...
 .venv/bin/python scripts/ladder_ppo.py --username my-bot-alt --n-games 10
+
+# Phase 4: build the C++ extension (cpp/) - Debug by default (ASan/UBSan on,
+# see cpp/CMakeLists.txt's comment on why this matters for hand-written
+# tree/pointer code); --release for an optimized, sanitizer-free build.
+# Needs cmake (brew install cmake) and Xcode's clang (C++20) - both verified
+# present, see plans/precious-crafting-bachman.md. Output lands directly in
+# battle_engine/_native*.so - no reinstall step (PEP 660 editable install).
+./scripts/build_cpp.sh
+
+# Run pytest when the native extension is part of what's under test - plain
+# `.venv/bin/pytest` will crash on collection (`Fatal Python error: Aborted`,
+# no useful traceback) importing a Debug/ASan-built _native*.so without the
+# ASan runtime preloaded first. This wrapper sets DYLD_INSERT_LIBRARIES
+# before the interpreter starts (can't be done from conftest.py - has to
+# happen pre-launch). Confirmed real during M1 bring-up, not a hypothetical.
+./scripts/pytest_native.sh
+
+# Run the Catch2 C++ unit test suite once cpp/tests/ has real tests (M4+)
+ctest --test-dir cpp/build
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
@@ -1131,14 +1275,22 @@ harness/training scripts land — don't leave this stale.
   pool for gen9ou (`teams.py`); Phase 3: action-space translation (`action_space.py`),
   the PPO-facing Gymnasium env (`rl_env.py`), imitation/win-prob weight transplant
   (`ppo_warm_start.py`), self-play (`self_play.py`), periodic real-game eval callback
-  + benchmark-facing PPO loader (`ppo_eval.py`)
+  + benchmark-facing PPO loader (`ppo_eval.py`); Phase 4: pure-Python MCTS/DUCT
+  validation prototype (`mcts_prototype.py`, throwaway, see Status), compiled C++
+  extension lands here as `_native*.so` (gitignored)
+- `cpp/` — Phase 4's C++ engine (M1 toolchain + M4 `BattleState`/hand-crafted-eval
+  port done, see Status; `include/be/`, `src/`, `bindings/module.cpp`, `tests/` per
+  plans/precious-crafting-bachman.md's repo layout — user-implemented per this
+  project's Phase 4 hard rule, Claude scaffolds headers/stubs/tests only; `build/`
+  and `.cache/` gitignored)
 - `scripts/` — runnable entry points (smoke test, benchmarks, replay fetching,
   dataset building, training, PPO training, PPO replay diagnosis
-  `inspect_ppo_replays.py`, real-ladder play `ladder_ppo.py`)
+  `inspect_ppo_replays.py`, real-ladder play `ladder_ppo.py`, C++ build
+  (`build_cpp.sh`) and its ASan-aware pytest wrapper (`pytest_native.sh`))
 - `tests/` — pytest (state encoding, damage calc, dataset/action-label logic, model
   training loops, harness determinism w/ seeded RNG, action-space translation, the
   PPO env — including one real-server integration test — PPO warm-start weight
-  transplant, self-play, PPO eval/benchmark loading)
+  transplant, self-play, PPO eval/benchmark loading, native-extension bindings)
 - `pokemon-showdown/` — local simulator checkout (gitignored)
 - `data/` — gitignored: `replays_raw/` (fetched replays), `dataset/` (cached train/val
   arrays for both the win-prob and action-label datasets), `models/` (trained
