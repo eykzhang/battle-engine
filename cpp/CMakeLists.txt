@@ -43,6 +43,9 @@ add_library(be_core STATIC
   src/battle_state.cpp
   src/eval.cpp
   src/pokedex_table.cpp
+  src/action.cpp
+  src/forward_model.cpp
+  src/movedex_table.cpp
 )
 target_include_directories(be_core PUBLIC include)
 

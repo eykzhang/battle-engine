@@ -27,6 +27,14 @@ enum class Type : uint8_t {
 // None here plays that same role for an un-afflicted, non-fainted mon).
 enum class Status : uint8_t { None, Brn, Frz, Par, Psn, Tox, Slp, Fnt };
 
+// A move's damage category (M5). Physical/Special use different attack/
+// defense stat pairs (mirrors damage.py's _attack_defense_stats); Status
+// moves deal no direct damage - Tier 1's forward model treats a Status
+// move as a turn-cost-only no-op (see forward_model.hpp's module comment
+// for why the move's real field effects - stat boosts, hazard setup,
+// status infliction - are Tier 2, deferred).
+enum class MoveCategory : uint8_t { Physical, Special, Status };
+
 // Base stats in Showdown's own hp/atk/def/spa/spd/spe order (matches
 // scripts/dump_pokedex.py's _STAT_ORDER) - a species' fixed dex values, not
 // a specific Pokemon's actual computed stats (see estimate_stat's role in

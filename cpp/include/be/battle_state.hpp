@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 
 #include "be/types.hpp"
 
@@ -54,6 +55,19 @@ struct PokemonSlot {
   StatBlock base_stats{};
   int8_t boost_spe = 0;  // stat stage, real Showdown range is [-6, 6]
   int spe_stat = -1;     // -1 = unknown, estimate from base_stats.spe + level
+
+  // M5: this slot's known moveset, in reveal order, as movedex_table.hpp
+  // lookup_movedex() keys (e.g. "stealthrock") - "" (empty string) is the
+  // "not yet known" sentinel, same convention as `revealed` itself. For
+  // my_team this should always be all 4 real slots filled in by the time
+  // team preview ends (own team, no hidden information); for opp_team,
+  // only moves actually seen used so far are known - action.hpp's
+  // legal_actions() restricts Side::Opp's move actions to the non-empty
+  // entries here, the same "revealed-only" Tier 1 limitation named for
+  // opponent switches in plans/precious-crafting-bachman.md's Scope
+  // decision, applied to moves for the same reason (no ground-truth
+  // answer for what's still hidden).
+  std::array<std::string, 4> moves{};
 };
 
 // team-preview-order arrays: my_team[i] / opp_team[i] correspond to
