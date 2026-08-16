@@ -37,7 +37,7 @@ namespace be {
 // a given node's actual legal set).
 struct VisitStats {
   int visits = 0;
-  double value_sum = 0.0;
+  float value_sum = 0.0f;
 };
 
 // Sentinel used in a packed child key (see pack_action_pair below) for "this
