@@ -56,6 +56,24 @@ TEST_CASE("select_ucb1_action: with high exploration, a heavily under-visited ac
   REQUIRE(picked == 1);
 }
 
+TEST_CASE("select_ucb1_action: picks the higher (less negative) score when every candidate is losing", "[mcts]") {
+  // value_sum can legitimately be negative - evaluate() (the default
+  // leaf_eval) isn't bounded to [0, inf), it goes negative whenever a side
+  // is behind. An implementation that seeds its running best-score at 0.0f
+  // rather than the first candidate's own score (or -infinity) would never
+  // update away from action 0 here, regardless of which action's score is
+  // actually higher - this pins that down concretely.
+  std::vector<ActionId> actions = {0, 1};
+  std::vector<VisitStats> stats = {
+      {/*visits=*/100, /*value_sum=*/-500.0f},  // action 0: avg -5.0
+      {/*visits=*/100, /*value_sum=*/-100.0f},  // action 1: avg -1.0, clearly better
+  };
+
+  ActionId picked = select_ucb1_action(actions, stats, /*parent_visits=*/200, /*exploration_constant=*/0.1f);
+
+  REQUIRE(picked == 1);
+}
+
 TEST_CASE("select_ucb1_action: an empty action list returns kNoAction", "[mcts]") {
   std::vector<ActionId> actions;
   std::vector<VisitStats> stats;

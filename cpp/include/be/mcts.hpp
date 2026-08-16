@@ -83,15 +83,26 @@ enum class NodeKind : uint8_t {
 // are keyed by pack_action_pair(my_action, opp_action) for whichever pair
 // was actually selected and simulated through resolve_turn().
 //
-// kForcedSwitch: only my_actions/my_stats are populated, restricted to
-// forced_switch_side's legal switch actions (query legal_actions() with
-// Side restricted to switch-only results, since only a subset of the
-// side's actions are legal in this situation - a caller responsibility,
-// same as legal_actions()'s own "callers are responsible for restricting
-// to what's actually choosable" convention elsewhere in this codebase).
-// opp_actions/opp_stats are left empty - there is no second independent
-// table to run when only one side is choosing. Children are keyed by
-// pack_action_pair(chosen_switch, kNoAction).
+// kForcedSwitch: only ONE of (my_actions, my_stats) / (opp_actions,
+// opp_stats) is populated - WHICHEVER PAIR MATCHES forced_switch_side, not
+// always my_actions/my_stats. This is deliberate, not an arbitrary choice:
+// my_actions/my_stats must always mean "the real searching agent's own
+// data" and opp_actions/opp_stats must always mean "the real opponent's
+// own data," at EVERY node in the tree regardless of kind - see EvalFn's
+// own doc comment below for why backup depends on that invariant holding
+// uniformly. If forced_switch_side == Side::Opp, populate
+// opp_actions/opp_stats (the opponent's own legal switch options) and
+// leave my_actions/my_stats empty - not the reverse. Either way, the
+// populated list is restricted to that side's legal SWITCH actions only
+// (query legal_actions() with Side restricted to switch-only results,
+// since only a subset of the side's actions are legal in this situation -
+// a caller responsibility, same as legal_actions()'s own "callers are
+// responsible for restricting to what's actually choosable" convention
+// elsewhere in this codebase). Children are keyed by
+// pack_action_pair(chosen_switch, kNoAction) if forced_switch_side == Me,
+// or pack_action_pair(kNoAction, chosen_switch) if == Opp - so the packed
+// key's two slots keep meaning "my choice" / "opp choice" consistently
+// too, not "whichever side happened to be forced."
 //
 // TurnResolution::kBothFainted is NOT a third NodeKind. Since neither
 // side's forced replacement switch damages the other side's already-
@@ -114,9 +125,32 @@ struct SearchNode {
   std::unordered_map<uint32_t, std::unique_ptr<SearchNode>> children;
 };
 
-// Leaf value function: given a state, returns a POV-relative score from
-// THAT STATE'S "my" side's perspective (i.e. state.my_team/my_active_slot
-// is whoever's turn it conceptually is being scored for at that leaf).
+// Leaf value function: given a state, returns a score from the REAL
+// searching agent's own perspective - state.my_team/my_active_slot always
+// means the actual "me" driving this search() call, at EVERY node in the
+// tree, at every depth. This is NOT an alternating-turn game like chess,
+// where a symmetric evaluator conventionally scores "from whoever's about
+// to move" and a caller has to flip sign every ply to account for the
+// alternation. resolve_turn() resolves BOTH sides' actions simultaneously
+// every turn, and BattleState's my_team/opp_team identities never swap as
+// the open-loop tree gets deeper (my_action always applies to
+// state.my_team, opp_action always applies to state.opp_team, at every
+// resolve_turn() call along the whole path from root). So leaf_eval(state)
+// means the same, fixed thing - "how good is this for the real me" -
+// everywhere in the tree; there is no per-depth sign flip to apply during
+// backup at all.
+//
+// The ONLY place a sign flip belongs is between the tree's two independent
+// per-side DUCT tables at a given node (my_stats vs opp_stats - or, at a
+// kForcedSwitch node, whichever ONE of those pairs is actually populated,
+// per SearchNode's own doc comment above): my_stats always accumulates
+// the raw leaf value v (real me benefits when v is high), opp_stats always
+// accumulates -v (so UCB1 maximizing over opp_stats is equivalent to the
+// opponent minimizing my real value - the standard negamax trick, applied
+// once per relevant node, not depth-dependent). Get this "which TABLE,
+// not which DEPTH" distinction right - conflating the two (as this
+// header's own earlier draft briefly did) silently corrupts every backed-
+// up value.
 //
 // CRITICAL, plan-correcting note on the value-backup convention: the plan's
 // M6 section says "opponent's value is 1 - v (valid given zero-sum,
