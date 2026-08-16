@@ -46,6 +46,7 @@ add_library(be_core STATIC
   src/action.cpp
   src/forward_model.cpp
   src/movedex_table.cpp
+  src/mcts.cpp
 )
 target_include_directories(be_core PUBLIC include)
 
