@@ -182,6 +182,26 @@ def parse_args() -> argparse.Namespace:
     # full comparison and arithmetic. Override for a different
     # laptop-feasibility tradeoff.
     parser.add_argument("--n-simulations", type=int, default=200)
+    # Real progress visibility + a survivable early exit - both genuinely
+    # missing before 2026-08-25 (see notes/gotcha-benchmark-runs-need-
+    # empirical-timing-and-progress-visibility.md): an 8+ hour run with
+    # zero incremental output had to be killed blind, losing everything.
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=10,
+        help="Print a running win/loss tally every N completed battles (0 disables).",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help=(
+            "Overwrite this file with the current partial tally (JSON) after every "
+            "completed battle - survives a hard kill. Defaults to "
+            "/tmp/benchmark_checkpoint_<p1>_vs_<p2>.json."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -193,7 +213,20 @@ async def main() -> None:
     p2 = _make_player(
         args.p2, args.format, args.model_path, args.ppo_model_path, args.n_simulations, args.ppo_bin_path
     )
-    result = await run_benchmark(p1, p2, n_battles=args.n_battles)
+    checkpoint_path = args.checkpoint_path or Path(f"/tmp/benchmark_checkpoint_{args.p1}_vs_{args.p2}.json")
+    print(
+        f"Checkpointing progress to {checkpoint_path} after every battle - "
+        "Ctrl+C or `kill <pid>` (not -9) stops gracefully with a real partial result.",
+        flush=True,
+    )
+    result = await run_benchmark(
+        p1,
+        p2,
+        n_battles=args.n_battles,
+        progress_interval=args.progress_interval,
+        checkpoint_path=checkpoint_path,
+        graceful_early_exit=True,
+    )
     print(result)
 
 
