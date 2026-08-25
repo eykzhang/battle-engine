@@ -2,7 +2,7 @@
 **Created:** 2026-08-24
 **Status:** in-progress
 **Started:** 2026-08-25 00:00
-**Current Phase:** 2
+**Current Phase:** 3
 **Complexity:** complex
 **Review cadence:** 2
 
@@ -490,6 +490,17 @@ named in a Done-when item.
 ---
 
 ## Execution Log
+
+### Phase 2: M2 — Weight export tooling (Gate: Standard)
+- [x] BUILD: Discovery + design + implementation complete.
+- [x] REVIEW: DEFERRED — batch pending (tests green at commit: 6/6 new tests, full suite 175
+      passed / 3 pre-existing skips, no regressions).
+- [x] Committed
+Commit: 90434fb
+Summary: M2 done — `scripts/export_weights.py` dumps the real PPO checkpoint's actor+critic
+weights to `data/cpp_weights/ppo.bin` (magic/version/VECTOR_LEN header, 6 layers, row-major
+float32), validated shape-mismatch-before-write. Un-reviewed set: {Phase 2}. Next: Phase 3 (M3
+C++ NN forward pass), which will trip the batch-review trigger at cadence 2 once it also lands.
 
 ### Phase 1: M7 — MctsPlayer + benchmark wiring (Gate: Full)
 - [x] BUILD: Discovery + design + implementation complete, verified by a resumed BUILD pass

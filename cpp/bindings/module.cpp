@@ -24,6 +24,7 @@
 #include "be/action.hpp"
 #include "be/battle_state.hpp"
 #include "be/mcts.hpp"
+#include "be/mlp.hpp"
 
 namespace py = pybind11;
 
@@ -160,4 +161,38 @@ PYBIND11_MODULE(_native, m) {
       "for determinism) using the fixed C++-side default_eval leaf "
       "evaluator - no Python callable leaf_eval is accepted, see this "
       "binding's own comment in module.cpp for why.");
+
+  // M3: exposes mlp.hpp's forward pass + loader so
+  // tests/test_native_forward_pass.py can call the exact same C++ code
+  // path Phase 5's PUCT expansion will use, not a reimplementation of it
+  // in the binding layer. No GIL release here (unlike search() above) -
+  // one forward pass is a short, bounded computation, not the kind of
+  // long blocking call that would stall poke-env's asyncio loop for other
+  // concurrently-running battles.
+  // Exposes only in_dim/out_dim, not the raw weight/bias vectors - a
+  // caller (the parity test) needs to confirm the loaded shapes, never
+  // needs to read the weights themselves back out from Python.
+  py::class_<be::MlpLayer>(m, "MlpLayer")
+      .def_readonly("in_dim", &be::MlpLayer::in_dim)
+      .def_readonly("out_dim", &be::MlpLayer::out_dim);
+
+  py::class_<be::MlpWeights>(m, "MlpWeights")
+      .def_readonly("layer0", &be::MlpWeights::layer0)
+      .def_readonly("layer1", &be::MlpWeights::layer1)
+      .def_readonly("layer2", &be::MlpWeights::layer2)
+      .def("forward", &be::MlpWeights::forward, py::arg("input"),
+           "Runs the fixed 3-layer (in->128->64->out) forward pass, ReLU "
+           "between hidden layers, none after the final layer. "
+           "input.size() must equal this branch's declared input width - "
+           "a caller bug otherwise, not checked here.");
+
+  py::class_<be::PolicyWeights>(m, "PolicyWeights")
+      .def_readonly("actor", &be::PolicyWeights::actor)
+      .def_readonly("critic", &be::PolicyWeights::critic)
+      .def_static("load", &be::PolicyWeights::load, py::arg("path"),
+                  "Loads both branches from one ppo.bin-format file (see "
+                  "mlp.hpp's PolicyWeights::load doc comment for the exact "
+                  "byte layout and validation performed). Raises "
+                  "RuntimeError (via pybind11's automatic std::runtime_error "
+                  "translation) on a missing/truncated/malformed file.");
 }
