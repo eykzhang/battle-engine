@@ -70,4 +70,48 @@ enum class Side { Me, Opp };
 // modeled here.
 std::vector<ActionId> legal_actions(const BattleState& state, Side side);
 
+// M6b: Metamon's 13-way action scheme (battle_engine/dataset.py's
+// ACTION_SPACE_SIZE - 0-3 move, 4-8 switch, 9-12 move+terastallize) mapped
+// onto THIS scheme's fixed ActionId, ported from
+// battle_engine/action_space.py's _switch_action_to_poke_env /
+// _poke_env_switch_to_metamon species-sort logic (not re-derived - see this
+// project's own "never invent a magic number" convention). Move labels need
+// no translation function at all: Metamon move slot i (label i, i in 0-3)
+// and ActionId's move slot i (kMoveActionOffset + i) both index the SAME
+// active mon's SAME move slot directly - see action_id_to_metamon_label's
+// own move-branch for the one place this identity is actually used.
+//
+// Both directions operate on state.my_team/my_active_slot ONLY, never
+// opp_team - see battle_state.hpp's species_sorted_bench_slots() doc
+// comment (which these both build on) for why: the OPPONENT's own mapping
+// is obtained by calling these same functions on a mirror()-ed BattleState,
+// not by adding a Side parameter here.
+
+// Metamon switch label (dataset.py's _SWITCH_ACTIONS, 4-8) -> the ActionId
+// (a team-preview slot 0-5) of the Pokemon at that species-sorted bench
+// position. Returns kNoAction-shaped -1 if that position has no real
+// target - fewer than 5 real non-active team members on this side (a
+// bench<5 team; every real Showdown team has exactly 6, so this only
+// reachably fires against a hand-built test fixture, never a live battle -
+// still handled here, not asserted away, matching this codebase's
+// defensive-fallback convention for an untested/degenerate shape rather
+// than an out-of-bounds read). `metamon_label` outside [4, 8] is a caller
+// bug - not checked here, same "callers own their inputs" convention as
+// legal_actions()/select_ucb1_action elsewhere in this codebase.
+ActionId metamon_switch_label_to_action_id(const BattleState& state, int metamon_label);
+
+// The inverse direction, generalized to any of state's own ActionIds
+// (moves included, unlike metamon_switch_label_to_action_id's switch-only
+// scope - see this comment block's own top note on why moves need no
+// species-sort at all): move ActionId 6-9 maps 1:1 onto Metamon label 0-3;
+// switch ActionId 0-5 maps onto whichever Metamon switch label (4-8) that
+// team-preview slot occupies in the species-sorted bench view. Returns -1
+// if `action` doesn't correspond to any real bench position - shouldn't
+// happen for a legal switch ActionId (legal_actions()'s switch-legality
+// contract - revealed, not fainted, not active - is exactly
+// species_sorted_bench_slots()'s own inclusion set, by construction) -
+// verified by this milestone's own Catch2 tests rather than assumed.
+// `action` outside [0, 9] is a caller bug, same convention as above.
+int action_id_to_metamon_label(const BattleState& state, ActionId action);
+
 }  // namespace be

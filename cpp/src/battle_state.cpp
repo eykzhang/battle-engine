@@ -318,28 +318,55 @@ std::vector<float> encode_pokemon_slot(const PokemonSlot& slot) {
 // with an unrevealed sentinel slot. Opponent's bench is never encoded at
 // all (matches encode()'s own asymmetry - opp gets only opp_active +
 // opp_remaining_fraction), so this only ever runs over my_team.
+//
+// M6b: built FROM species_sorted_bench_slots() (battle_state.hpp, exposed
+// publicly) rather than re-sorting independently - guarantees this
+// function and action.hpp's Metamon-mapping functions agree on bench
+// position BY CONSTRUCTION, not by two hand-kept-in-sync implementations
+// of the same sort (see that function's own doc comment for why).
 std::array<const PokemonSlot*, kMaxBench> species_sorted_bench(const BattleState& state) {
-  std::vector<const PokemonSlot*> bench;
-  bench.reserve(6);
-  for (int i = 0; i < 6; ++i) {
-    if (i == state.my_active_slot) continue;
-    if (!state.my_team[static_cast<size_t>(i)].revealed) continue;
-    bench.push_back(&state.my_team[static_cast<size_t>(i)]);
-  }
-  std::sort(bench.begin(), bench.end(), [](const PokemonSlot* a, const PokemonSlot* b) {
-    return a->species < b->species;
-  });
+  std::array<int, kMaxBench> slots = species_sorted_bench_slots(state);
 
   static const PokemonSlot kUnknownSlot{};  // revealed=false -> encode_pokemon_slot's all-zero path
   std::array<const PokemonSlot*, kMaxBench> result{};
   for (int i = 0; i < kMaxBench; ++i) {
-    result[static_cast<size_t>(i)] =
-        (i < static_cast<int>(bench.size())) ? bench[static_cast<size_t>(i)] : &kUnknownSlot;
+    int idx = slots[static_cast<size_t>(i)];
+    result[static_cast<size_t>(i)] = (idx >= 0) ? &state.my_team[static_cast<size_t>(idx)] : &kUnknownSlot;
   }
   return result;
 }
 
 }  // namespace
+
+std::array<int, kMaxBench> species_sorted_bench_slots(const BattleState& state) {
+  std::vector<int> bench_indices;
+  bench_indices.reserve(6);
+  for (int i = 0; i < 6; ++i) {
+    if (i == state.my_active_slot) continue;
+    if (!state.my_team[static_cast<size_t>(i)].revealed) continue;
+    bench_indices.push_back(i);
+  }
+  std::sort(bench_indices.begin(), bench_indices.end(), [&state](int a, int b) {
+    return state.my_team[static_cast<size_t>(a)].species < state.my_team[static_cast<size_t>(b)].species;
+  });
+
+  std::array<int, kMaxBench> result;
+  result.fill(-1);
+  for (int i = 0; i < static_cast<int>(bench_indices.size()) && i < kMaxBench; ++i) {
+    result[static_cast<size_t>(i)] = bench_indices[static_cast<size_t>(i)];
+  }
+  return result;
+}
+
+BattleState mirror(const BattleState& state) {
+  BattleState result = state;
+  std::swap(result.my_team, result.opp_team);
+  std::swap(result.my_active_slot, result.opp_active_slot);
+  std::swap(result.my_hazards, result.opp_hazards);
+  // weather/terrain deliberately untouched - state-level, not per-side (see
+  // battle_state.hpp's own Weather/Terrain comment).
+  return result;
+}
 
 std::vector<float> encode_native(const BattleState& state) {
   if (state.my_active_slot < 0 || state.opp_active_slot < 0) {

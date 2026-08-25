@@ -9,18 +9,21 @@ docstring calls out as NOT covered there ("M7 scope, doesn't exist yet") -
 this file is that missing half.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
-from poke_env.player.battle_order import DefaultBattleOrder
+from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
 from conftest import make_mon
 
 _native = pytest.importorskip("battle_engine._native")
 
-from battle_engine.mcts_player import MctsPlayer, _action_id_to_order  # noqa: E402
+from battle_engine.mcts_player import MctsPlayer, MctsPuctPlayer, _action_id_to_order  # noqa: E402
+
+_PPO_BIN = "data/cpp_weights/ppo.bin"
 
 
 def _with_moves(mon, move_ids):
@@ -191,3 +194,115 @@ def test_mcts_player_does_not_crash_with_no_active_pokemon():
 
     assert isinstance(order.order, Pokemon)
     assert order.order in (bench1, bench2)
+
+
+# ---------------------------------------------------------------------------
+# MctsPuctPlayer (Phase 5 review fix, attempt 1) - mirrors MctsPlayer's own
+# coverage above: NO_ACTION fallback, PolicyWeights loaded once at
+# construction and reused (not reloaded) across choose_move() calls, and a
+# small real search_puct() call against a fixture. Previously zero coverage
+# anywhere in tests/ (the review's Issue 3), despite MctsPuctPlayer being
+# this phase's actual Python-facing entry point.
+# ---------------------------------------------------------------------------
+
+
+def test_mcts_puct_player_falls_back_to_default_order_on_no_action(monkeypatch):
+    active = _with_moves(make_mon("garchomp"), ["earthquake"])
+    opp_active = make_mon("landorustherian")
+    battle = _battle(
+        my_team=[active],
+        my_active=active,
+        opp_team=[opp_active],
+        opp_active=opp_active,
+    )
+
+    monkeypatch.setattr(_native.PolicyWeights, "load", staticmethod(lambda path: object()))
+    monkeypatch.setattr(
+        _native,
+        "search_puct",
+        lambda state, weights, n_simulations, seed: SimpleNamespace(
+            best_action=_native.NO_ACTION, root_visit_distribution=[]
+        ),
+    )
+
+    player = MctsPuctPlayer(
+        battle_format="gen9ou", start_listening=False,
+        ppo_bin_path="unused-stubbed-out.bin", n_simulations=10,
+    )
+    order = player.choose_move(battle)
+
+    assert isinstance(order, DefaultBattleOrder)
+    assert order.message == "/choose default"
+
+
+def test_mcts_puct_player_loads_weights_once_and_reuses_across_choose_move_calls(monkeypatch):
+    active = _with_moves(make_mon("garchomp"), ["earthquake"])
+    opp_active = make_mon("landorustherian")
+    battle = _battle(
+        my_team=[active],
+        my_active=active,
+        opp_team=[opp_active],
+        opp_active=opp_active,
+    )
+
+    sentinel_weights = object()
+    load_calls = []
+
+    def fake_load(path):
+        load_calls.append(path)
+        return sentinel_weights
+
+    search_calls = []
+
+    def fake_search_puct(state, weights, n_simulations, seed):
+        search_calls.append((weights, n_simulations, seed))
+        return SimpleNamespace(best_action=_native.NO_ACTION, root_visit_distribution=[])
+
+    monkeypatch.setattr(_native.PolicyWeights, "load", staticmethod(fake_load))
+    monkeypatch.setattr(_native, "search_puct", fake_search_puct)
+
+    player = MctsPuctPlayer(
+        battle_format="gen9ou", start_listening=False,
+        ppo_bin_path="a-real-looking-path.bin", n_simulations=77, seed=0,
+    )
+    player.choose_move(battle)
+    player.choose_move(battle)
+
+    # Constructed once (path passed through unchanged), never re-read per turn.
+    assert load_calls == ["a-real-looking-path.bin"]
+    # The SAME loaded weights object is reused on every choose_move() call -
+    # identity, not just equality, is what proves it wasn't reloaded.
+    assert search_calls[0][0] is sentinel_weights
+    assert search_calls[1][0] is sentinel_weights
+    assert [n for _, n, _ in search_calls] == [77, 77]
+    # A fresh seed is drawn per choose_move() call, same convention as
+    # MctsPlayer - two calls from one player instance must differ.
+    assert search_calls[0][2] != search_calls[1][2]
+
+
+@pytest.mark.skipif(
+    not Path(_PPO_BIN).exists(),
+    reason="requires data/cpp_weights/ppo.bin (scripts/export_weights.py), gitignored data/",
+)
+def test_mcts_puct_player_real_search_puct_call_returns_a_valid_order():
+    # Small n_simulations for test speed - not a benchmark, just confirming
+    # the real construction -> search_puct() -> BattleOrder path works
+    # end-to-end against the real trained weights, no crash, no invalid
+    # order propagated to poke-env.
+    active = _with_moves(make_mon("garchomp"), ["earthquake", "dragonclaw"])
+    opp_active = make_mon("landorustherian")
+    battle = _battle(
+        my_team=[active],
+        my_active=active,
+        opp_team=[opp_active],
+        opp_active=opp_active,
+    )
+
+    player = MctsPuctPlayer(
+        battle_format="gen9ou", start_listening=False,
+        ppo_bin_path=_PPO_BIN, n_simulations=20, seed=2,
+    )
+    order = player.choose_move(battle)
+
+    assert isinstance(order, BattleOrder)
+    assert not isinstance(order, DefaultBattleOrder)

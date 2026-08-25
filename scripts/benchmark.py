@@ -20,10 +20,23 @@ target has been gen9ou from the start.
 
 "mcts" (Phase 4 M7) wires battle_engine.mcts_player.MctsPlayer — the C++
 open-loop MCTS/DUCT search (cpp/src/mcts.cpp) with default_eval, plain
-UCB1, no PPO prior/value (that's a later phase's "mcts_puct", a different
-player entirely). Needs --n-simulations (no built-in default — this
-project's laptop-first hard rule requires a real measured ms/turn number
-before picking one, not a guess baked into this CLI).
+UCB1, no PPO prior/value (that's "mcts_puct" below, a different player
+entirely). Needs --n-simulations (no built-in default — this project's
+laptop-first hard rule requires a real measured ms/turn number before
+picking one, not a guess baked into this CLI).
+
+"mcts_puct" (Phase 4 M6b) wires battle_engine.mcts_player.MctsPuctPlayer —
+the same C++ open-loop search tree as "mcts", but PUCT-guided: the trained
+PPO actor supplies a per-node move prior and its critic supplies the leaf
+value (cpp/src/mcts.cpp's search_puct(), see cpp/include/be/mcts.hpp's own
+doc comment for the full design and the measured critic sign-backup
+convention). Needs --n-simulations (same laptop-first rationale as "mcts")
+and --ppo-bin-path (default data/cpp_weights/ppo.bin, scripts/
+export_weights.py's output — a distinct artifact from --ppo-model-path's
+data/models/ppo.zip, which "ppo" loads directly via PyTorch/stable-
+baselines3 rather than this C++-facing binary format). Trained on gen9ou,
+same distribution-mismatch caveat as "learned"/"ppo" — only meaningful with
+--format gen9ou.
 
 The model was trained on gen9ou human replays (constructed OU teams), but the
 default --format is gen9randombattle (Phase 0/1's format, auto-generated
@@ -74,7 +87,7 @@ PLAYERS = {
     "heuristic": SimpleHeuristicsPlayer,
     "search": TwoPlySearchPlayer,
 }
-CHOICES = sorted(PLAYERS) + ["learned", "ppo", "mcts"]
+CHOICES = sorted(PLAYERS) + ["learned", "ppo", "mcts", "mcts_puct"]
 
 
 # Formats poke-env/Showdown generate a team for server-side - no submitted
@@ -93,6 +106,7 @@ def _make_player(
     model_path: Path,
     ppo_model_path: Path,
     n_simulations: int,
+    ppo_bin_path: Path,
 ) -> Player:
     team = None if battle_format in _AUTO_TEAM_FORMATS else RandomTeamFromPool()
     # rand=True (a random 5-char suffix, not poke-env's own default per-process
@@ -132,6 +146,16 @@ def _make_player(
             n_simulations=n_simulations,
             account_configuration=account_configuration,
         )
+    if name == "mcts_puct":
+        from battle_engine.mcts_player import MctsPuctPlayer  # see the deferred-import comment above
+
+        return MctsPuctPlayer(
+            battle_format=battle_format,
+            team=team,
+            ppo_bin_path=str(ppo_bin_path),
+            n_simulations=n_simulations,
+            account_configuration=account_configuration,
+        )
     return PLAYERS[name](battle_format=battle_format, team=team, account_configuration=account_configuration)
 
 
@@ -143,11 +167,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--format", default="gen9randombattle")
     parser.add_argument("--model-path", type=Path, default=Path("data/models/win_prob.pt"))
     parser.add_argument("--ppo-model-path", type=Path, default=Path("data/models/ppo.zip"))
+    # "mcts_puct" only - scripts/export_weights.py's C++-facing binary
+    # format (Phase 2), a distinct artifact from --ppo-model-path above
+    # (the raw PyTorch/stable-baselines3 checkpoint "ppo" loads directly).
+    parser.add_argument("--ppo-bin-path", type=Path, default=Path("data/cpp_weights/ppo.bin"))
     # No principled default exists independent of measurement - this
     # project's laptop-first hard rule (CLAUDE.md) requires a real ms/turn
     # number before picking a simulation count, not a guess. 200 is this
-    # phase's own measured choice (see notes/ + this phase's Execution Log
-    # entry for the real ms/turn it produces) - override for a different
+    # phase's own measured choice: 501.9ms/turn (Debug/ASan,
+    # cpp/tests/test_mcts.cpp's [!benchmark] case), checked against Phase
+    # 3's DW-3.3 projection (6-9hr worst case for Phase 6's full sweep) and
+    # found comfortably within budget (~2.1hr) - see
+    # notes/phase-5-mcts-puct-ms-per-turn-vs-phase-3-projection.md for the
+    # full comparison and arithmetic. Override for a different
     # laptop-feasibility tradeoff.
     parser.add_argument("--n-simulations", type=int, default=200)
     return parser.parse_args()
@@ -155,8 +187,12 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
-    p1 = _make_player(args.p1, args.format, args.model_path, args.ppo_model_path, args.n_simulations)
-    p2 = _make_player(args.p2, args.format, args.model_path, args.ppo_model_path, args.n_simulations)
+    p1 = _make_player(
+        args.p1, args.format, args.model_path, args.ppo_model_path, args.n_simulations, args.ppo_bin_path
+    )
+    p2 = _make_player(
+        args.p2, args.format, args.model_path, args.ppo_model_path, args.n_simulations, args.ppo_bin_path
+    )
     result = await run_benchmark(p1, p2, n_battles=args.n_battles)
     print(result)
 

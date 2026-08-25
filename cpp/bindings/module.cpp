@@ -190,6 +190,22 @@ PYBIND11_MODULE(_native, m) {
         "Legal ActionIds (see action.hpp) for `side` in `state`, using the "
         "fixed M5 action scheme - ActionId 0-5 switch, 6-9 move slot.");
 
+  // M6b: Metamon-mapping functions - see action.hpp's own doc comments for
+  // the full contract. Exposed mainly so a Python-side sanity check can
+  // cross-check them against action_space.py's own poke-env-facing
+  // translation on a real battle, not because MctsPuctPlayer's runtime path
+  // needs them directly (search_puct() calls these internally, C++-side
+  // only).
+  m.def("metamon_switch_label_to_action_id", &be::metamon_switch_label_to_action_id, py::arg("state"),
+        py::arg("metamon_label"));
+  m.def("action_id_to_metamon_label", &be::action_id_to_metamon_label, py::arg("state"), py::arg("action"));
+
+  // M6b: swaps my_*/opp_* identity - see battle_state.hpp's own doc
+  // comment. Exposed to Python for the same sanity-check purpose as the
+  // Metamon-mapping functions above (search_puct() calls this internally,
+  // C++-side only, for its own opponent-prior computation).
+  m.def("mirror", &be::mirror, py::arg("state"));
+
   // M7: NO_ACTION mirrors mcts.hpp's kNoAction sentinel (-1) - a real
   // search() result's best_action is always >= 0, so a caller (MctsPlayer)
   // checks equality/sign against this to detect "no legal action" and fall
@@ -258,4 +274,24 @@ PYBIND11_MODULE(_native, m) {
                   "byte layout and validation performed). Raises "
                   "RuntimeError (via pybind11's automatic std::runtime_error "
                   "translation) on a missing/truncated/malformed file.");
+
+  // M6b: exposes mcts.hpp's search_puct() - PUCT search with the PPO
+  // actor/critic in place of default_eval/plain UCB1. Same GIL-release
+  // rationale as search() above (choose_move runs on poke-env's asyncio
+  // loop); `weights` is a PolicyWeights loaded ONCE by the caller
+  // (battle_engine/mcts_player.py's MctsPuctPlayer, at construction) and
+  // passed by const reference into every search_puct() call - never
+  // re-read from disk per turn.
+  m.def(
+      "search_puct",
+      [](const be::BattleState& state, const be::PolicyWeights& weights, int n_simulations, uint64_t seed) {
+        return be::search_puct(state, weights, n_simulations, seed);
+      },
+      py::arg("state"), py::arg("weights"), py::arg("n_simulations"), py::arg("seed"),
+      py::call_guard<py::gil_scoped_release>(),
+      "Runs M6b's PUCT search from `state` (n_simulations sims, seeded for "
+      "determinism) using `weights`' actor branch as the per-node prior and "
+      "critic branch as the leaf value - see mcts.hpp's own search_puct() "
+      "doc comment for the full design (prior/value availability gating, "
+      "kForcedSwitch continuation, the measured critic sign convention).");
 }

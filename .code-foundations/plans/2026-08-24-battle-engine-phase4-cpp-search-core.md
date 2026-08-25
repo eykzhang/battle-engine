@@ -2,7 +2,12 @@
 **Created:** 2026-08-24
 **Status:** in-progress
 **Started:** 2026-08-25 00:00
-**Current Phase:** 4
+**Stopped (hard cutoff):** 2026-08-25 07:45 — see Execution Log's Phase 5 entry for exact
+resume instructions. A "usage limit reset" system message arrived at 07:45:14, immediately
+during hard-stop execution; per the user's own explicit standing instruction ("cut off all work
+before 7:50 regardless of state"), it was not treated as authorization to resume — no new work
+was started after this timestamp.
+**Current Phase:** 5 (REVIEW failed once of 3 allowed — see below, not yet re-dispatched)
 **Complexity:** complex
 **Review cadence:** 2
 
@@ -490,6 +495,66 @@ named in a Done-when item.
 ---
 
 ## Execution Log
+
+### Phase 5: M6b — PUCT search with PPO prior/value (Gate: Full)
+- [x] BUILD: Discovery + design + implementation complete (fable-tier). All 6 DW items
+      implemented; `ctest` 96/96 (76 baseline + 20 new), `pytest_native.sh` 191/3 skipped.
+      Core algorithm: mirror-based opponent priors, tera-label renormalization,
+      value-scale-mixing avoidance at `kForcedSwitch` nodes, `PolicyWeights` loaded once at
+      `MctsPuctPlayer` construction. DW-5.4 (critic sign convention) measured **-v**, mean
+      -0.0659237 / stddev 1.49e-08 over 30 synthetic mirrored pairs against the real checkpoint
+      — high confidence, not the ambiguous case the plan anticipated. DW-5.3 measured 501.9ms/
+      turn at n_simulations=200.
+- [ ] REVIEW: **1st FAIL** — see
+      `.code-foundations/build/2026-08-24-battle-engine-phase4-cpp-search-core-phase-5-review.md`.
+      The reviewer independently rebuilt, reran the full suite (matched exactly), and
+      **independently reproduced both DW-5.3's and DW-5.4's numbers** — the core PUCT algorithm
+      (value-scale-mixing avoidance, mirror mechanism, tera renormalization, weights-loaded-once)
+      was traced through the actual code and confirmed correct, not just claimed. The FAIL is
+      three narrower, real gaps:
+      1. DW-5.3: the ms/turn measurement is solid but nothing documents the required comparison
+         against Phase 3's DW-3.3 projection (6-9hr worst case) — needs a written comparison.
+      2. DW-5.6: the mirror round-trip/field-swap/weather-terrain sub-claims are tested and
+         pass, but the vector-parity sub-claim ("`encode_native(mirror(s))` matches `encode()`
+         of the real opponent-POV view on a fixture") is NOT tested — the actual test only
+         checks vector length; its own comment admits the real cross-check is out of scope.
+         This is the one gap worth real attention: it's the exact seam the plan's own EXPLORE
+         stage flagged as "the phase's highest-leverage unverified seam."
+      3. `MctsPuctPlayer` and `scripts/benchmark.py`'s new `mcts_puct` branch have zero test
+         coverage anywhere in `tests/`, despite the plan's Test Coverage Level naming
+         "player/integration wiring" as in scope.
+- [ ] Commit: NOT YET MADE — Full gate, blocked on REVIEW PASS.
+
+**NEXT STEP ON RESUME (per gate-failure-protocol.md, 1st FAIL of 3 allowed):** re-dispatch the
+Phase 5 BUILD agent (fable) with a `## Review Findings to Fix` block containing the review
+file's Issues section verbatim (the three items above), instructing it to add: (a) a written
+comparison of DW-5.3's measurement against Phase 3's projection, (b) a real fixture-based test
+for `encode_native(mirror(s))` vs. the true opponent-POV `encode()` output (construct a real
+opponent-POV `BattleView`/`BattleState` pair and diff the vectors directly, not just check
+length), (c) at least a basic `tests/test_mcts_player.py`-style test for `MctsPuctPlayer` and a
+CLI-wiring test for the `mcts_puct` benchmark branch. Then re-dispatch REVIEW. Working tree
+currently has real, uncommitted Phase 5 changes (do not discard):
+`cpp/include/be/mcts.hpp`, `cpp/src/mcts.cpp`, `cpp/include/be/action.hpp`,
+`cpp/src/action.cpp`, `cpp/include/be/battle_state.hpp`, `cpp/src/battle_state.cpp`,
+`cpp/bindings/module.cpp`, `battle_engine/mcts_player.py`, `scripts/benchmark.py`,
+`cpp/tests/test_action.cpp`, `cpp/tests/test_battle_state.cpp`, `cpp/tests/test_mcts.cpp`,
+plus the new discovery/review files under `.code-foundations/build/`.
+
+### Phase 4: M4b — Full BattleState extension + encode() port (Gate: Full)
+- [x] BUILD: Discovery + design + implementation complete (fable-tier).
+- [x] REVIEW: Verification passed — see
+      `.code-foundations/build/2026-08-24-battle-engine-phase4-cpp-search-core-phase-4-review.md`.
+      Hand-traced the hazard tie-break logic and species-identity threading independently; both
+      correct. No FAILs.
+- [x] Committed
+Commit: 2fe0a54
+Summary: M4b done — `BattleState` extended (species/item/ability/protect_counter/weather/
+terrain/8-token hazards), `encode_native()` ports `encode()` bit-for-bit including the
+single-most-recent-hazard reduction and species-sorted bench view (keyed on `base_species`).
+Move-summary features computed once in Python via `encoding.py`'s own verified helper rather
+than re-derived in C++ (movedex_table.hpp lacked the needed flags, out of scope to extend) —
+divergence structurally impossible by construction. 3-way `VECTOR_LEN` cross-check confirmed.
+Next: Phase 5 (M6b — the PUCT search itself, the phase's actual strength bet).
 
 ### Phase 3: M3 — C++ NN forward pass (Gate: Standard)
 - [x] BUILD: Discovery + design + implementation complete.
