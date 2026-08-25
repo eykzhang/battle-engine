@@ -18,6 +18,13 @@ through self-play rather than ranking states with a 2-ply search. Needs
 gen9randombattle, undocumented here since this project's only real PPO training
 target has been gen9ou from the start.
 
+"mcts" (Phase 4 M7) wires battle_engine.mcts_player.MctsPlayer — the C++
+open-loop MCTS/DUCT search (cpp/src/mcts.cpp) with default_eval, plain
+UCB1, no PPO prior/value (that's a later phase's "mcts_puct", a different
+player entirely). Needs --n-simulations (no built-in default — this
+project's laptop-first hard rule requires a real measured ms/turn number
+before picking one, not a guess baked into this CLI).
+
 The model was trained on gen9ou human replays (constructed OU teams), but the
 default --format is gen9randombattle (Phase 0/1's format, auto-generated
 teams, no team-building infra needed) - a "learned" benchmark on
@@ -34,12 +41,21 @@ import asyncio
 from pathlib import Path
 
 from poke_env.player import MaxBasePowerPlayer, Player, RandomPlayer, SimpleHeuristicsPlayer
+from poke_env.ps_client import AccountConfiguration
 
 from battle_engine.benchmark import run_benchmark
 from battle_engine.ppo_eval import load_ppo_player
 from battle_engine.search import TwoPlySearchPlayer
 from battle_engine.teams import RandomTeamFromPool
 from battle_engine.win_prob import WinProbModel, make_eval_fn
+
+# battle_engine.mcts_player imports battle_engine._native (the compiled C++
+# extension) at module scope - importing MctsPlayer at THIS file's top
+# level would make every benchmark matchup depend on ./scripts/build_cpp.sh
+# having run, even a plain "random vs maxdamage" comparison that never
+# touches "mcts". Deferred into _make_player's "mcts" branch instead, same
+# "skip/fail only where actually needed" convention
+# tests/test_native_legality.py's pytest.importorskip already established.
 
 # Best point estimate from a 7-point sweep (0.0-0.2, 80 battles each, gen9ou)
 # run after diagnosing that the learned eval - with no switch-urgency
@@ -58,7 +74,7 @@ PLAYERS = {
     "heuristic": SimpleHeuristicsPlayer,
     "search": TwoPlySearchPlayer,
 }
-CHOICES = sorted(PLAYERS) + ["learned", "ppo"]
+CHOICES = sorted(PLAYERS) + ["learned", "ppo", "mcts"]
 
 
 # Formats poke-env/Showdown generate a team for server-side - no submitted
@@ -72,9 +88,25 @@ _AUTO_TEAM_FORMATS = {"gen9randombattle"}
 
 
 def _make_player(
-    name: str, battle_format: str, model_path: Path, ppo_model_path: Path
+    name: str,
+    battle_format: str,
+    model_path: Path,
+    ppo_model_path: Path,
+    n_simulations: int,
 ) -> Player:
     team = None if battle_format in _AUTO_TEAM_FORMATS else RandomTeamFromPool()
+    # rand=True (a random 5-char suffix, not poke-env's own default per-process
+    # incrementing counter) so repeated CLI invocations against the same
+    # long-lived local server never collide with a stale username. Discovered
+    # necessary during this phase's own DW-1.2 benchmark run: the local
+    # Showdown server ties outstanding challenges to a userid, not a
+    # connection, and never expires or clears them on disconnect (verified
+    # against pokemon-showdown/server/ladders.ts's makeChallenge/
+    # ladders-challenges.ts - a challenge is only cleared by acceptance,
+    # cancellation, or the user renaming) - so a prior run's abrupt exit
+    # (e.g. a killed process) left a real "already a challenge" popup
+    # blocking every subsequent run that reused the same default username.
+    account_configuration = AccountConfiguration.generate(name, rand=True)
     if name == "learned":
         model = WinProbModel.load(model_path)
         return TwoPlySearchPlayer(
@@ -82,10 +114,25 @@ def _make_player(
             team=team,
             eval_fn=make_eval_fn(model),
             switch_urgency_weight=LEARNED_SWITCH_URGENCY_WEIGHT,
+            account_configuration=account_configuration,
         )
     if name == "ppo":
-        return load_ppo_player(ppo_model_path, battle_format=battle_format, team=team)
-    return PLAYERS[name](battle_format=battle_format, team=team)
+        return load_ppo_player(
+            ppo_model_path,
+            battle_format=battle_format,
+            team=team,
+            account_configuration=account_configuration,
+        )
+    if name == "mcts":
+        from battle_engine.mcts_player import MctsPlayer  # see the deferred-import comment above
+
+        return MctsPlayer(
+            battle_format=battle_format,
+            team=team,
+            n_simulations=n_simulations,
+            account_configuration=account_configuration,
+        )
+    return PLAYERS[name](battle_format=battle_format, team=team, account_configuration=account_configuration)
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,13 +143,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--format", default="gen9randombattle")
     parser.add_argument("--model-path", type=Path, default=Path("data/models/win_prob.pt"))
     parser.add_argument("--ppo-model-path", type=Path, default=Path("data/models/ppo.zip"))
+    # No principled default exists independent of measurement - this
+    # project's laptop-first hard rule (CLAUDE.md) requires a real ms/turn
+    # number before picking a simulation count, not a guess. 200 is this
+    # phase's own measured choice (see notes/ + this phase's Execution Log
+    # entry for the real ms/turn it produces) - override for a different
+    # laptop-feasibility tradeoff.
+    parser.add_argument("--n-simulations", type=int, default=200)
     return parser.parse_args()
 
 
 async def main() -> None:
     args = parse_args()
-    p1 = _make_player(args.p1, args.format, args.model_path, args.ppo_model_path)
-    p2 = _make_player(args.p2, args.format, args.model_path, args.ppo_model_path)
+    p1 = _make_player(args.p1, args.format, args.model_path, args.ppo_model_path, args.n_simulations)
+    p2 = _make_player(args.p2, args.format, args.model_path, args.ppo_model_path, args.n_simulations)
     result = await run_benchmark(p1, p2, n_battles=args.n_battles)
     print(result)
 

@@ -13,3 +13,14 @@ ml = ["torch", "requests", "lz4", "numpy", "stable-baselines3", "sb3-contrib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Explicit, not auto-discovered: setuptools' flat-layout auto-discovery
+# errors out ("Multiple top-level packages discovered: ['cpp',
+# 'battle_engine']") once cpp/ exists at the repo root - Phase 4's own
+# addition. The project's original `pip install -e .` predates cpp/ and so
+# never hit this, but a FRESH editable install (e.g. a new git worktree's
+# own venv, which this exact ambiguity broke during Phase 4 M7 bring-up -
+# pytest was silently resolving battle_engine imports against the ORIGINAL
+# checkout's package instead of the worktree's own) fails without this.
+[tool.setuptools.packages.find]
+include = ["battle_engine*"]
