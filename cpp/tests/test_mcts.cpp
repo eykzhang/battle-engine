@@ -228,3 +228,120 @@ TEST_CASE("search: same seed and inputs produce an identical root visit distribu
   REQUIRE(result_a.best_action == result_b.best_action);
   REQUIRE(sorted_by_action(result_a.root_visit_distribution) == sorted_by_action(result_b.root_visit_distribution));
 }
+
+TEST_CASE(
+    "search: a forced-switch node with no revealed replacement (unrevealed bench, the realistic "
+    "early-battle case) is treated as a terminal leaf, not a crash",
+    "[mcts]") {
+  // Regression for an M7 integration finding, not a synthetic worry: every
+  // real early-battle state built by battle_state_from_poke_env has only
+  // the OPPONENT's lead revealed (my_team is always fully revealed by team
+  // preview's end, but opp_team grows one entry at a time as poke-env
+  // reveals it) - deliberately reproduced here with ONLY state.my_team[0]/
+  // state.opp_team[0] populated (all other slots left default/unrevealed),
+  // unlike every other search() test above, which always fills all 6
+  // slots via make_filler_bench_slot(). Before the fix, a kForcedSwitch
+  // node whose legal_switch_actions() comes back empty (found via
+  // select_ucb1_action returning kNoAction) got that -1 used as a raw
+  // std::array index a few lines later once the node was revisited on a
+  // later simulation - an ASan-caught stack-use-after-scope/UB crash, not
+  // a hypothetical. Seismic Toss's near-guaranteed 1-hit KO on the
+  // 0.01-HP-fraction opponent (see the lethal-move test above for why its
+  // damage is effectively deterministic) drives most simulations straight
+  // into exactly that forced-switch node, so this reproduces reliably
+  // rather than depending on rare UCB1 exploration.
+  BattleState state;
+
+  PokemonSlot me;
+  me.revealed = true;
+  me.hp_fraction = 1.0f;
+  me.level = 100;
+  me.base_stats = {100, 100, 100, 100, 100, 100};
+  me.spe_stat = 100;
+  me.moves = {"seismictoss", "protect", "", ""};
+  state.my_team[0] = me;
+  state.my_active_slot = 0;
+
+  PokemonSlot opp;
+  opp.revealed = true;
+  opp.hp_fraction = 0.01f;
+  opp.level = 100;
+  opp.base_stats = {100, 100, 100, 100, 100, 100};
+  opp.spe_stat = 100;
+  opp.moves = {"tackle", "protect", "", ""};
+  state.opp_team[0] = opp;
+  state.opp_active_slot = 0;
+  // my_team[1..5] and opp_team[1..5] left default (unrevealed=false, the
+  // struct's own default) - the whole point of this fixture.
+
+  SearchResult result = search(state, default_eval, /*n_simulations=*/500, /*seed=*/7);
+
+  // The root itself always has a real action (my active starts alive) -
+  // confirms search() completed all 500 simulations rather than bailing
+  // out early, and that the fix's "treat as a terminal leaf" path doesn't
+  // corrupt the root's own selection.
+  REQUIRE(result.best_action != kNoAction);
+  int total_visits = 0;
+  for (const auto& [action, visits] : result.root_visit_distribution) total_visits += visits;
+  REQUIRE(total_visits == 500);
+}
+
+TEST_CASE(
+    "search: a plain kDecision node where one side has zero legal actions (no known moves, no "
+    "switch target) is treated as a terminal leaf, not a crash",
+    "[mcts]") {
+  // Regression for the OTHER M7 integration finding (more severe than the
+  // forced-switch one above: this one is real from turn 1 of essentially
+  // every real battle, not a deep-tree edge case). Before the fix,
+  // select_ucb1_action's documented kNoAction return for an empty action
+  // list got passed straight into resolve_turn(): is_switch_action()'s
+  // "< kNumSwitchActions" check misreads kNoAction's -1 as "switch to slot
+  // -1", an out-of-bounds be::BattleState team-array index a few frames
+  // down inside apply_action/apply_switch_in_hazards - ASan-caught, not
+  // hypothetical. Reproduced here at the ROOT itself: the opponent's
+  // active has zero known moves (moves = {"", "", "", ""}, the real state
+  // of a freshly-revealed lead before it's ever acted) and no revealed
+  // bench to switch to - exactly turn 1 of a real battle from this
+  // engine's own information state.
+  BattleState state;
+
+  PokemonSlot me;
+  me.revealed = true;
+  me.hp_fraction = 1.0f;
+  me.level = 100;
+  me.base_stats = {100, 100, 100, 100, 100, 100};
+  me.spe_stat = 100;
+  me.moves = {"tackle", "protect", "", ""};
+  state.my_team[0] = me;
+  state.my_active_slot = 0;
+  for (int i = 1; i < 6; ++i) state.my_team[i] = make_filler_bench_slot();
+
+  PokemonSlot opp;
+  opp.revealed = true;
+  opp.hp_fraction = 1.0f;
+  opp.level = 100;
+  opp.base_stats = {100, 100, 100, 100, 100, 100};
+  opp.spe_stat = 100;
+  opp.moves = {"", "", "", ""};  // nothing revealed yet - turn 1's real state
+  state.opp_team[0] = opp;
+  state.opp_active_slot = 0;
+  // opp_team[1..5] deliberately left default/unrevealed - no switch target
+  // either, so opp_actions is genuinely empty at the root.
+
+  SearchResult result = search(state, default_eval, /*n_simulations=*/300, /*seed=*/11);
+
+  // Since the empty side is at the ROOT itself, every single simulation
+  // bails out at the very first node, before any pick is ever pushed onto
+  // `path` - so root_node's own my_stats never accumulate a recorded
+  // visit (nothing downstream of the root ever runs). That's correct,
+  // expected behavior for THIS degenerate "empty side is the root itself"
+  // shape specifically (not a general property of the fix - a node
+  // reached one or more levels deep would still have its ancestors'
+  // visits recorded normally, since those picks are pushed to `path`
+  // before the empty node is ever reached). best_action still resolves to
+  // a real action (the first candidate, via search()'s own "first action
+  // beats an uninitialized best_visits=-1" tie-break) rather than
+  // kNoAction - the meaningful assertion here is that this completes at
+  // all (300 simulations, no ASan abort), not a specific visit count.
+  REQUIRE(result.best_action != kNoAction);
+}

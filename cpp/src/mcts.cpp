@@ -83,6 +83,33 @@ SearchResult search(const BattleState& root, const EvalFn& leaf_eval, int n_simu
                                                kDefaultExplorationConstant);
         ActionId opp_pick = select_ucb1_action(cur->opp_actions, cur->opp_stats, total_visits(cur->opp_stats),
                                                 kDefaultExplorationConstant);
+
+        // M7 integration finding, more severe than the kForcedSwitch one
+        // below (this one is real from TURN 1 of essentially every real
+        // battle, not a deep-tree edge case): either side's action list
+        // can be genuinely empty at a plain kDecision node - most commonly
+        // the OPPONENT, whose active has 0 revealed moves yet and (early
+        // game) no revealed bench to switch to, but "my" side can hit this
+        // too if a freshly-switched-in mon's moveset isn't known and no
+        // switch target remains. resolve_turn() requires a REAL legal
+        // action from both sides (kForcedSwitch's own doc comment already
+        // establishes this - is_switch_action()'s "< kNumSwitchActions"
+        // check reads kNoAction's -1 as "switch to slot -1", an
+        // out-of-bounds be::BattleState team-array index a few frames
+        // down inside apply_action/apply_switch_in_hazards - an ASan-
+        // caught stack-use-after-scope/UB crash during M7 bring-up, not
+        // hypothetical). Treat it as a terminal leaf for this simulation
+        // instead - evaluate `state` as-is and stop descending, same
+        // "caller owns kNoAction" convention select_ucb1_action's own doc
+        // comment states, and the same shape as the kForcedSwitch fix
+        // below. Don't push to `path`: neither side made a real choice
+        // here, so there's no action to attribute credit to in cur's own
+        // stats.
+        if (my_pick == kNoAction || opp_pick == kNoAction) {
+          leaf_value = leaf_eval(state);
+          break;
+        }
+
         uint32_t picks = pack_action_pair(my_pick, opp_pick);
         path.push_back({cur, my_pick, opp_pick});
 
@@ -151,6 +178,34 @@ SearchResult search(const BattleState& root, const EvalFn& leaf_eval, int n_simu
         const std::vector<ActionId>& actions = (side == Side::Me) ? cur->my_actions : cur->opp_actions;
         const std::vector<VisitStats>& stats = (side == Side::Me) ? cur->my_stats : cur->opp_stats;
         ActionId chosen = select_ucb1_action(actions, stats, total_visits(stats), kDefaultExplorationConstant);
+
+        // M7 integration finding (not hypothetical - caught by ASan against
+        // a realistic early-battle state during M7 bring-up): `actions` can
+        // be genuinely empty here. This is NOT "every real Pokemon on
+        // side's team is fainted" (a real Showdown battle would just end
+        // instead of prompting a forced switch with nothing to switch to)
+        // - it's the Tier-1 revealed-only opponent-modeling limitation
+        // (legal_actions()'s own doc comment) surfacing at a forced-switch
+        // node: overwhelmingly this is the OPPONENT's own case early in a
+        // real battle, where only their lead is revealed (my_team is
+        // always fully revealed by team preview's end, so `side == Me`
+        // hitting this is far rarer but not structurally impossible if
+        // every other my_team slot happens to be fainted along this
+        // simulated path too). Either way, there is no real ActionId to
+        // choose - select_ucb1_action's own doc comment already names this
+        // "the caller's problem." Treat it as a terminal leaf for this
+        // simulation: evaluate `state` as-is (the fainted mon stays
+        // inactive/fainted) and stop descending, same shape as the
+        // kDecision branch's own kTerminal handling above. Do NOT push
+        // this node's own (non-)decision onto `path` - there is no real
+        // action to attribute credit to in cur's own stats, and
+        // `chosen == kNoAction` would otherwise be used as an out-of-
+        // bounds std::array index two branches below (a genuine
+        // stack-use-after-scope/UB crash, not a style nit).
+        if (chosen == kNoAction) {
+          leaf_value = leaf_eval(state);
+          break;
+        }
 
         uint32_t picks =
             (side == Side::Me) ? pack_action_pair(chosen, kNoAction) : pack_action_pair(kNoAction, chosen);

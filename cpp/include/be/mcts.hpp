@@ -188,8 +188,16 @@ float default_eval(const BattleState& state);
 // caller bug otherwise, not checked here, same "callers own their inputs"
 // convention as legal_actions()/resolve_turn(). Returns kNoAction if
 // `actions` is empty (nothing to select - the caller's problem, e.g. a
-// forced-switch side with zero legal replacements, which shouldn't happen
-// given a real is_valid() state but isn't re-verified here).
+// forced-switch side with zero legal replacements). This DOES happen for a
+// real is_valid() state, routinely, not just in theory: M7 integration
+// found it via ASan against realistic early-battle states (opponent's
+// bench mostly unrevealed - the Tier-1 limitation legal_actions() already
+// documents), not a synthetic case. search()'s own tree-walk handles a
+// kForcedSwitch node hitting this by treating it as a terminal leaf for
+// that simulation (see the kNoAction check in search()'s implementation) -
+// this function itself still just returns kNoAction and leaves the
+// decision to the caller, per the "caller owns their inputs" convention
+// above.
 //
 // Exposed as its own function (not inlined into search()'s tree walk) so
 // it's independently unit-testable against a synthetic bandit with a
@@ -236,6 +244,19 @@ struct SearchResult {
 // `root` itself is never mutated - every simulation resolves a FRESH copy
 // via resolve_turn() starting from `root`'s own values (open-loop, per this
 // header's own top-of-file note), not `root` directly.
+//
+// EMPTY-ACTION-LIST NOTE, found during M7 integration against realistic
+// battle states (not a synthetic worry - reproduces from TURN 1 of most
+// real battles): a plain kDecision node's my_actions/opp_actions can be
+// genuinely empty for a side with no known moves and no legal switch
+// target (most commonly the OPPONENT before they've revealed any move,
+// with only their lead known). select_ucb1_action() already documents
+// returning kNoAction for this ("the caller's problem") - search()'s own
+// tree-walk is that caller, and treats it as a terminal leaf for the
+// simulation (evaluate the current state as-is, stop descending) rather
+// than passing kNoAction into resolve_turn(), which requires a real action
+// from both sides. The same handling applies at a kForcedSwitch node with
+// no legal replacement (SearchNode's own doc comment).
 //
 // LATENCY NOTE for M7 (not this milestone's own concern, but real and
 // worth stating where the function that will need it is declared):

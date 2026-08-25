@@ -23,6 +23,7 @@
 
 #include "be/action.hpp"
 #include "be/battle_state.hpp"
+#include "be/mcts.hpp"
 
 namespace py = pybind11;
 
@@ -124,4 +125,39 @@ PYBIND11_MODULE(_native, m) {
   m.def("legal_actions", &be::legal_actions, py::arg("state"), py::arg("side"),
         "Legal ActionIds (see action.hpp) for `side` in `state`, using the "
         "fixed M5 action scheme - ActionId 0-5 switch, 6-9 move slot.");
+
+  // M7: NO_ACTION mirrors mcts.hpp's kNoAction sentinel (-1) - a real
+  // search() result's best_action is always >= 0, so a caller (MctsPlayer)
+  // checks equality/sign against this to detect "no legal action" and fall
+  // back to a safe default order rather than propagating an invalid one.
+  m.attr("NO_ACTION") = int(be::kNoAction);
+
+  py::class_<be::SearchResult>(m, "SearchResult")
+      .def_readonly("best_action", &be::SearchResult::best_action)
+      .def_readonly("root_visit_distribution", &be::SearchResult::root_visit_distribution);
+
+  // M7: exposes M6's search() with default_eval fixed C++-side, NOT the raw
+  // be::search signature - that takes an EvalFn (std::function<float(const
+  // BattleState&)>), and pybind11/functional.h would happily accept a
+  // Python callable there. A Python leaf_eval invoked while the GIL is
+  // released (below) would be a genuine use-of-Python-without-the-GIL
+  // crash, not a hypothetical - so this lambda's signature deliberately
+  // has no callable parameter at all; default_eval is the only leaf
+  // evaluator this binding can ever call. py::call_guard (not manual
+  // py::gil_scoped_release RAII) releases the GIL for exactly the call's
+  // duration and reacquires it before the return value is converted back
+  // to Python - per mcts.hpp's own M7 latency note: choose_move runs on
+  // poke-env's asyncio loop, so a long blocking call here must not stall
+  // every other concurrently-running battle.
+  m.def(
+      "search",
+      [](const be::BattleState& state, int n_simulations, uint64_t seed) {
+        return be::search(state, be::default_eval, n_simulations, seed);
+      },
+      py::arg("state"), py::arg("n_simulations"), py::arg("seed"),
+      py::call_guard<py::gil_scoped_release>(),
+      "Runs M6's MCTS/DUCT search from `state` (n_simulations sims, seeded "
+      "for determinism) using the fixed C++-side default_eval leaf "
+      "evaluator - no Python callable leaf_eval is accepted, see this "
+      "binding's own comment in module.cpp for why.");
 }
