@@ -28,6 +28,7 @@
 
 #include "be/action.hpp"
 #include "be/battle_state.hpp"
+#include "be/mlp.hpp"
 
 namespace be {
 
@@ -122,6 +123,21 @@ struct SearchNode {
   std::vector<VisitStats> my_stats;   // index-aligned with my_actions
   std::vector<VisitStats> opp_stats;  // index-aligned with opp_actions; empty when kind == kForcedSwitch
 
+  // M6b: PPO-actor-derived PUCT priors, index-aligned with my_actions/
+  // opp_actions respectively (same convention as my_stats/opp_stats).
+  // EMPTY (not populated) unless search_puct() could actually run the actor
+  // on this node's state - see search_puct()'s own doc comment for exactly
+  // when that is and isn't true (kForcedSwitch nodes never get a prior at
+  // all; a kDecision node whose state has a fainted-but-index-valid or -1
+  // active on either side also doesn't, since encode_native()'s output has
+  // no tested meaning there). Every action-selection call in search_puct()
+  // follows one uniform rule: `priors.empty() ? select_ucb1_action(...) :
+  // select_puct_action(...)` - this single check is what makes
+  // kForcedSwitch nodes AND the untested-active edge case both fall back to
+  // plain UCB1 without two separate special cases.
+  std::vector<float> my_priors;
+  std::vector<float> opp_priors;
+
   std::unordered_map<uint32_t, std::unique_ptr<SearchNode>> children;
 };
 
@@ -165,10 +181,14 @@ struct SearchNode {
 // opponent_value = -v, NOT 1 - v. Using 1-v here would silently corrupt
 // backpropagated values (e.g. v=2.0 -> "opponent's value" of -1.0 under
 // 1-v, vs the correct +(-2.0) under -v - these disagree by more than sign).
-// If/when a WinProbModel-based EvalFn is wired in later (M6b), switch back
-// to 1-v for THAT evaluator specifically - don't apply one convention
-// universally without checking which shape the active leaf_eval actually
-// has.
+// M6b UPDATE (measured, not assumed - see search_puct()'s own doc comment
+// for the full measurement and its result): the PPO critic is NOT the
+// WinProbModel this paragraph originally anticipated - it's a discounted-
+// return value estimate, unbounded and with no enforced mirror symmetry
+// (unlike default_eval's PROVEN antisymmetry above). search_puct() measures
+// the critic's real convention empirically on synthetic mirrored-state
+// pairs rather than assuming either "1-v" or "-v" - see that function's own
+// doc comment for the measured result and the constant it selected.
 using EvalFn = std::function<float(const BattleState&)>;
 
 // Default leaf evaluator - the C++ port of evaluation.py's hand-crafted
@@ -269,5 +289,178 @@ struct SearchResult {
 // benchmark run finishes in a reasonable window - measure this once
 // search() actually works, don't guess at a simulation count.
 SearchResult search(const BattleState& root, const EvalFn& leaf_eval, int n_simulations, uint64_t seed);
+
+// ---------------------------------------------------------------------------
+// M6b: PUCT search with a PPO actor prior and critic leaf value - Approach A
+// (per-node PUCT, confirmed at this plan's EXPLORE stage; see
+// plans/2026-08-24-battle-engine-phase4-cpp-search-core.md's Chosen
+// Approach). Distinct from select_ucb1_action/search() above rather than a
+// mode flag on them - a flag-selected branch would be logical cohesion,
+// which this project's own cohesion standard rejects (see
+// docs/code-standards.md).
+// ---------------------------------------------------------------------------
+
+// M0's own UCB1 constant precedent applies here too: not deeply tuned, a
+// reasonable starting point for this phase's single measured pass (the
+// plan's own "report honestly, don't open-end tune" scope limit).
+inline constexpr float kDefaultPuctConstant = 1.4f;
+
+// Standard PUCT selection over one node's per-side action/stats/priors
+// table:
+//   argmax_i ( Q_i + c_puct * priors_i * sqrt(parent_visits) / (1 + visits_i) )
+//   where Q_i = visits_i == 0 ? 0.0f : value_sum_i / visits_i
+// Unlike select_ucb1_action, an unvisited action does NOT automatically win
+// - the prior already biases early exploration proportionally (the actual
+// point of PUCT over plain UCB1), so Q defaults to 0 for an unvisited arm
+// rather than the exploration term going to +infinity. `actions`, `stats`,
+// and `priors` must all be the same length and index-aligned - a caller bug
+// otherwise, not checked here, same "callers own their inputs" convention
+// as select_ucb1_action. Returns kNoAction if `actions` is empty, same
+// convention as select_ucb1_action.
+//
+// Exposed as its own function (not inlined into search_puct()'s tree walk)
+// for the same reason select_ucb1_action is - independently unit-testable
+// against a synthetic bandit, see cpp/tests/test_mcts.cpp.
+ActionId select_puct_action(const std::vector<ActionId>& actions, const std::vector<VisitStats>& stats,
+                             const std::vector<float>& priors, int parent_visits, float c_puct);
+
+// Builds a PUCT prior over `actions` (output index-aligned with `actions`,
+// same length) from the PPO actor's raw 13-way Metamon logits at this node
+// - gathers each legal action's corresponding logit (via
+// action_id_to_metamon_label(), action.hpp) and softmaxes ONLY over that
+// gathered subset (numerically stable: subtract the max first).
+//
+// This reproduces sb3_contrib's real MaskableCategorical masking behavior
+// exactly - VERIFIED against distributions.py's actual source (not
+// assumed, per this project's own "never assume a library's behavior"
+// convention): MaskableCategorical.apply_masking sets an illegal label's
+// logit to -1e8 before running a normal, full 13-way softmax. That is
+// mathematically identical to softmaxing the legal subset alone - both
+// reduce to exp(x_i) / sum_{j in legal}(exp(x_j)) for i in the legal set,
+// since exp(-1e8) contributes ~0 to the normalizing sum either way.
+//
+// Metamon labels with no ActionId counterpart (tera moves, 9-12 -
+// action.hpp defers tera entirely this phase) are simply never gathered -
+// their probability mass is dropped, and the remaining distribution is
+// renormalized over what's left. This is the plan's own named
+// simplification, not a silent omission: `actor_logits` may contain
+// nonzero mass on labels 9-12, and this function's whole point is to drop
+// it deliberately, not read it.
+std::vector<float> puct_priors_from_actor_logits(const BattleState& state, const std::vector<ActionId>& actions,
+                                                   const std::vector<float>& actor_logits);
+
+// Runs n_simulations of PUCT from `root`, using `weights`' actor branch as
+// the per-node prior and critic branch as the leaf value, in place of
+// search()'s fixed UCB1 + default_eval. Same open-loop tree/backup
+// conventions as search() (see this header's top-of-file note and
+// EvalFn's own doc comment) EXCEPT for two real, deliberate departures:
+//
+// 1. PRIOR/VALUE AVAILABILITY, not every node: encode_native() (and so the
+//    actor/critic, which consume its output) only has TESTED meaning for a
+//    state where both sides' active Pokemon are chosen (active_slot >= 0)
+//    AND alive (not fainted) - PPO's own training environment never
+//    presented any other observation. A kForcedSwitch node's underlying
+//    state fails this (the fainted mon's active_slot is never reset to -1
+//    by resolve_turn/apply_action - confirmed by reading forward_model.cpp
+//    directly, not assumed - it stays pointing at the fainted slot until a
+//    replacement switch reassigns it), and so does a root called mid-team-
+//    -preview or mid-forced-switch-response (active_slot literally -1,
+//    Phase 1's own already-tested MctsPlayer edge case). Both cases are
+//    handled by ONE uniform rule at every node, not two special cases: a
+//    newly-created kDecision node only gets my_priors/opp_priors populated
+//    (and its leaf, if it turns out to be one, scored by the critic) when
+//    BOTH sides have a real, alive active; kForcedSwitch nodes never get
+//    priors at all (the plan's own explicit choice - see mcts.hpp's git
+//    history / the phase's Decision Log for why: inventing an untested
+//    sentinel for a missing/fainted active is worse than a narrower,
+//    documented UCB1-only fallback). Wherever priors are empty for a side
+//    at a node, that side's selection uses select_ucb1_action instead of
+//    select_puct_action - SearchNode's own my_priors/opp_priors doc comment
+//    states this uniform rule.
+//
+// 2. kForcedSwitch NODES NEVER STOP DESCENT: unlike search()'s kForcedSwitch
+//    handling (which evaluates default_eval on that node's own fainted-
+//    active state and stops), search_puct() applies the chosen replacement
+//    switch and CONTINUES the tree walk - through a chained second
+//    kForcedSwitch node if one is owed (the kBothFainted case), and through
+//    any further kForcedSwitch nodes that could arise - until it reaches a
+//    real, encodable kDecision state, whose critic value becomes the leaf.
+//    This keeps every backed-up value on ONE consistent (critic) scale
+//    along a path, rather than mixing default_eval's differently-scaled
+//    hand-crafted score into the same VisitStats tables PUCT compares
+//    against the critic's values everywhere else on that path (default_eval
+//    and the critic are proven/measured to share the SAME SIGN convention
+//    for the opponent-table backup - see below - but NOT the same
+//    magnitude/scale, so mixing them would still corrupt every PUCT
+//    comparison above the mixing point, exactly the failure mode this
+//    design avoids).
+//
+//    The ONE narrow exception, inherited unavoidably from search()'s own
+//    already-tested "genuinely nothing to do" terminal cases (an empty
+//    action list - select_ucb1_action/select_puct_action's own kNoAction
+//    return - at either a kDecision or a kForcedSwitch node with no legal
+//    replacement): when this fires, there is NO way to reach an encodable
+//    state (by definition - nothing legal remains to apply), so
+//    default_eval scores that leaf instead of the critic. This state is
+//    never pushed onto `path` itself (mirrors search()'s own convention -
+//    "no real choice was made here," so it doesn't corrupt that node's OWN
+//    VisitStats), but DOES still bubble a default_eval-scaled leaf_value up
+//    into whichever ancestors ARE on `path` from earlier in that same
+//    simulation. This is a real, narrow, accepted scale-mixing exception
+//    (only reachable when the acted-on side has zero legal actions left at
+//    all - an extremely rare, near-terminal shape), not a silent one -
+//    named here explicitly per this project's own convention.
+//
+// SIGN CONVENTION FOR THE CRITIC (DW-5.4, measured empirically, not
+// assumed - see cpp/tests/test_mcts.cpp's own "DW-5.4" sign-convention
+// test for the reproducible measurement): on 30 synthetic
+// mirror(state)/state pairs built with varied HP/status/boosts/species/
+// types (both actives always valid), the real trained critic
+// (data/cpp_weights/ppo.bin) measured mean(v(s) + v(mirror(s))) = -0.0659
+// (stddev 1.5e-08 across all 30 pairs - remarkably tight, not noise),
+// clearly closer to 0 (the "-v" convention, matching default_eval's own
+// PROVEN antisymmetry) than to 1 (the "1-v" convention that would be
+// correct for a bounded [0,1] win-probability evaluator like WinProbModel,
+// which the critic is NOT - see EvalFn's own doc comment). search_puct()
+// therefore backs up opponent_value = -v for the critic, the SAME formula
+// as default_eval's own opp_stats backup.
+//
+// Stated fallback (per the plan's own DW-5.4 contingency, for completeness
+// even though it was NOT triggered here): had this measurement failed to
+// separate clearly toward 0 vs. 1 within a stated tolerance, the code
+// defaults to -v regardless. Unlike default_eval's case, that default isn't
+// a guess - -v is a property of the opponent-side VisitStats table's own
+// negamax structure (each node backs up the negation of its child's value
+// by construction), not of the critic's own output range or antisymmetry,
+// so it holds even when the critic's antisymmetry is ambiguous. This
+// measurement's -0.0659 result was unambiguous (clearly nearer 0 than 1),
+// so the fallback was never exercised - but it would have chosen the same
+// -v convention already hardcoded above, so no runtime behavior hinges on
+// which path was taken.
+//
+// The small (~0.066) but highly consistent residual is itself worth
+// naming as a real, measured approximation error, not swept under "close
+// enough to 0": encode()'s own vector shape has no opponent-bench block at
+// all (encoding.py - "my active, my bench, opponent active" only), so
+// mirror(state) is NOT an information-preserving transformation of the
+// input the critic actually sees - the mirrored view reveals what was
+// previously "my" full bench detail as the opponent's, but the resulting
+// vector STILL only encodes one side's bench (whichever is now "my" side
+// post-mirror), permanently discarding the original "my" bench detail
+// rather than exposing it as a fixed pair. A small, systematic, but
+// real observation-asymmetry between the two POVs is a mechanically
+// sound explanation for a small, non-zero, highly consistent residual
+// even from a value function that IS (or is very close to) truly
+// antisymmetric over full information - this is a measured, accepted
+// approximation of THIS specific trained checkpoint's critic under THIS
+// specific (partial-information) encoding, not a guaranteed property of
+// PPO critics in general, and not re-verified automatically if the
+// checkpoint is ever retrained.
+//
+// `weights` is loaded ONCE by the caller (battle_engine/mcts_player.py's
+// PUCT player variant, at construction) and passed in by const reference -
+// this function itself never touches disk, keeping per-turn latency to
+// forward passes only (see DW-5.3's own measured ms/turn number).
+SearchResult search_puct(const BattleState& root, const PolicyWeights& weights, int n_simulations, uint64_t seed);
 
 }  // namespace be

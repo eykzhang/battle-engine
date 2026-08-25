@@ -200,6 +200,77 @@ def test_encode_native_bench_is_species_sorted_not_insertion_order():
 
 
 # ---------------------------------------------------------------------------
+# DW-5.6 (Phase 5 review fix, attempt 1): encode_native(mirror(s)) must
+# match encode() of the REAL opponent-POV view - a value-level parity
+# check, not just a length check. cpp/tests/test_battle_state.cpp's own
+# C++-side test can only confirm encode_native(mirror(s)) is well-formed
+# and length-matches encode_native(s); it explicitly cannot reach a
+# value-level comparison against the real Python encode() from C++-only
+# test scope (no Python interpreter there). This is that missing half -
+# the exact seam mcts.cpp's populate_decision_node uses (mirror(state) +
+# encode_native() + the actor/critic) to compute the opponent-side PUCT
+# prior and leaf value, so an unverified asymmetry here would silently
+# corrupt every opponent-side PUCT decision.
+# ---------------------------------------------------------------------------
+
+
+def test_encode_native_mirror_matches_python_encode_of_real_opponent_pov():
+    my_active = _with_moves(make_mon("garchomp"), ["earthquake", "swordsdance"])
+    my_active.boosts = {"atk": 2, "def": -1, "spa": 0, "spd": 1, "spe": -2, "accuracy": 0, "evasion": 0}
+    my_active.item = "leftovers"
+    my_active.ability = "roughskin"
+    my_bench = _with_moves(make_mon("dragapult"), ["dracometeor", "uturn"])
+
+    opp_active = _with_moves(make_mon("landorustherian"), ["earthquake", "stealthrock"])
+    opp_active.boosts = {"atk": 0, "def": 0, "spa": 3, "spd": 0, "spe": 1, "accuracy": 0, "evasion": -1}
+    opp_active.item = "choicescarf"
+    opp_active.ability = "intimidate"
+    opp_bench = make_mon("toxapex", current_hp_fraction=0.0, status=Status.FNT)
+
+    battle = _battle(
+        my_team=[my_active, my_bench],
+        my_active=my_active,
+        opp_team=[opp_active, opp_bench],
+        opp_active=opp_active,
+        my_hazards={SideCondition.STEALTH_ROCK: 1, SideCondition.SPIKES: 2},
+        opp_hazards={SideCondition.REFLECT: 3, SideCondition.TAILWIND: 1},
+        weather={Weather.SANDSTORM: 1},
+        fields={Field.ELECTRIC_TERRAIN: 2},
+    )
+
+    native_state = battle_state_from_poke_env(battle)
+    mirrored_vec = np.array(_native.encode_native(_native.mirror(native_state)), dtype=np.float32)
+
+    # The genuine opponent-POV view: a battle object where every role is
+    # actually swapped (not just relabeled) - my_team <-> opponent_team,
+    # active <-> opponent_active, hazards <-> opponent hazards, weather/
+    # terrain unchanged (state-level, not per-side - same as mirror()
+    # itself). encode() on THIS is the real oracle: whatever value
+    # asymmetry exists between "my"-side and "opponent"-side encoding
+    # (e.g. the opponent's bench is collapsed to opp_remaining_fraction,
+    # never encoded per-slot - see encoding.py's module docstring) must be
+    # reproduced identically by mirror() + encode_native().
+    opponent_pov_battle = _battle(
+        my_team=[opp_active, opp_bench],
+        my_active=opp_active,
+        opp_team=[my_active, my_bench],
+        opp_active=my_active,
+        my_hazards={SideCondition.REFLECT: 3, SideCondition.TAILWIND: 1},
+        opp_hazards={SideCondition.STEALTH_ROCK: 1, SideCondition.SPIKES: 2},
+        weather={Weather.SANDSTORM: 1},
+        fields={Field.ELECTRIC_TERRAIN: 2},
+    )
+    python_vec = encode(battle_view_from_poke_env(opponent_pov_battle))
+
+    assert mirrored_vec.shape == python_vec.shape == (enc.VECTOR_LEN,)
+    assert np.allclose(mirrored_vec, python_vec), (
+        f"encode_native(mirror(s)) diverges from encode() of the real "
+        f"opponent-POV view at indices "
+        f"{np.nonzero(~np.isclose(mirrored_vec, python_vec))[0].tolist()}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # DW-4.3: encode_native()'s length matches encoding.VECTOR_LEN and
 # ppo.bin's header vector_len (the 3-way cross-check Phase 3 deferred here).
 # ---------------------------------------------------------------------------

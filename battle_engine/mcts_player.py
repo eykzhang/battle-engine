@@ -370,3 +370,46 @@ class MctsPlayer(Player):
             # poke-env - the plan's own explicit requirement for this case.
             return self.choose_default_move()
         return _action_id_to_order(result.best_action, battle)
+
+
+class MctsPuctPlayer(Player):
+    """M6b: a poke-env Player driven by native.search_puct() - PUCT search
+    with the trained PPO actor as a per-node move prior and its critic as
+    the leaf value (see cpp/include/be/mcts.hpp's search_puct() doc comment
+    for the full design), in place of MctsPlayer's fixed UCB1 + default_eval.
+
+    A SEPARATE class from MctsPlayer, not a mode flag on it - same "no
+    logical-cohesion flag branch" reasoning this milestone applies to
+    select_puct_action vs. select_ucb1_action C++-side (see mcts.hpp/
+    docs/code-standards.md's cohesion standard), applied here to the two
+    Player classes for the identical reason: their choose_move bodies differ
+    in which native function they call and what they load at construction,
+    not in a shared body branching on a flag.
+
+    Loads PolicyWeights ONCE at construction (ppo_bin_path, see
+    _native.PolicyWeights.load's own doc comment for the exact binary
+    format read - scripts/export_weights.py's output) and reuses the loaded
+    handle for every choose_move() call - re-reading the weight file per
+    turn would blow the ms/turn budget this milestone measured (see
+    cpp/tests/test_mcts.cpp's own DW-5.3 microbenchmark).
+
+    Otherwise mirrors MctsPlayer exactly: same root-only ActionId ->
+    BattleOrder translation (_action_id_to_order), same NO_ACTION fallback
+    to choose_default_move(), same n_simulations-has-no-default rationale
+    (a real measured ms/turn number should drive the choice, not a guess),
+    same per-call fresh 64-bit seed convention. MctsPuctPlayer IS-A Player -
+    same LSP precedent as MctsPlayer/FrozenPolicyPlayer/TwoPlySearchPlayer.
+    """
+
+    def __init__(self, *args, ppo_bin_path: str, n_simulations: int, seed: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._weights = _native.PolicyWeights.load(ppo_bin_path)
+        self._n_simulations = n_simulations
+        self._rng = random.Random(seed)
+
+    def choose_move(self, battle: AbstractBattle) -> BattleOrder:
+        state = battle_state_from_poke_env(battle)
+        result = _native.search_puct(state, self._weights, self._n_simulations, self._rng.getrandbits(64))
+        if result.best_action == _native.NO_ACTION:
+            return self.choose_default_move()
+        return _action_id_to_order(result.best_action, battle)

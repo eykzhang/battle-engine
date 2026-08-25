@@ -269,4 +269,50 @@ inline constexpr int kEncodeVectorLen =
 // caller depends on catching it.
 std::vector<float> encode_native(const BattleState& state);
 
+// M6b: species-sorted non-active BENCH POSITIONS for state.my_team, as
+// team-preview slot INDICES (0-5), not PokemonSlot pointers -
+// encode_native()'s own file-local species_sorted_bench() (battle_state.cpp)
+// returns pointers, which is sufficient for building the observation vector
+// but can't recover which team-preview slot (== ActionId) a sorted position
+// came from. action.hpp's Metamon-mapping functions need exactly that
+// recovery, so this is exposed here rather than re-deriving the same sort a
+// second time in action.cpp - a real divergence risk this project already
+// treats as a corruption vector (see this file's own hazard/species-sort
+// commentary elsewhere), not a hypothetical concern. Same sort as
+// species_sorted_bench() by construction (that function is implemented in
+// terms of this one, in battle_state.cpp) - base_species order, active
+// excluded, fainted members still counted as a real position (they still
+// occupy a real bench "position" the PPO actor's own distribution was
+// trained against). -1 at a position means "no real bench member there"
+// (fewer than kMaxBench non-active revealed slots - a bench<5 team; every
+// real Showdown team has exactly 6, so this only reachably fires against a
+// hand-built test fixture, never a live battle).
+//
+// Always operates on state.my_team/my_active_slot, never opp_team - see
+// mcts.hpp's own doc comment on why the OPPONENT's own prior is computed by
+// passing a mirror()-ed BattleState through this exact same "my side" logic
+// rather than this function taking a Side parameter (which would also force
+// this header to depend on action.hpp's Side enum - action.hpp depends on
+// battle_state.hpp, not the reverse, and this design keeps it that way).
+std::array<int, kMaxBench> species_sorted_bench_slots(const BattleState& state);
+
+// M6b: swaps my_*/opp_* identity throughout `state` - my_team<->opp_team,
+// my_active_slot<->opp_active_slot, my_hazards<->opp_hazards. weather/
+// terrain are state-level (affect both sides equally in real Showdown, per
+// this header's own Weather/Terrain comment above) and stay unchanged.
+//
+// Used to compute the OPPONENT's own PUCT prior/value through the exact
+// same encode_native()/actor-forward-pass path used for "my" side (see
+// mcts.hpp's own doc comment on why this mirrored-state approximation is
+// the chosen, named, accepted M6b design - not a separate mechanism, and
+// not a silent one: the mirrored "my bench" is the opponent's actual
+// revealed-only bench, not full information, the same Tier-1 asymmetry
+// legal_actions() already accepts for opponent switches/moves).
+//
+// Involutive: mirror(mirror(state)) == state, field-for-field - verified by
+// cpp/tests/test_battle_state.cpp's own round-trip test. No BattleState
+// operator== exists (nor is one added here - not needed by any caller
+// outside that one test, which compares fields directly instead).
+BattleState mirror(const BattleState& state);
+
 }  // namespace be
