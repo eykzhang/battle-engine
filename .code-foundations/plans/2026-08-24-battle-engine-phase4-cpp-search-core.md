@@ -2,7 +2,7 @@
 **Created:** 2026-08-24
 **Status:** in-progress
 **Started:** 2026-08-25 00:00
-**Current Phase:** 1
+**Current Phase:** 2
 **Complexity:** complex
 **Review cadence:** 2
 
@@ -494,14 +494,22 @@ named in a Done-when item.
 ### Phase 1: M7 — MctsPlayer + benchmark wiring (Gate: Full)
 - [x] BUILD: Discovery + design + implementation complete, verified by a resumed BUILD pass
       (see `.code-foundations/build/2026-08-24-battle-engine-phase4-cpp-search-core-phase-1-discovery.md`).
-- [ ] REVIEW: NOT YET RUN — this is a Full-gate phase, blocking REVIEW required before commit.
-      **Next step on resume: dispatch § REVIEW (code-foundations:post-gate-agent) for Phase 1,
-      then commit on PASS, then proceed to Phase 2.**
-- [ ] Commit: NOT YET MADE — pending REVIEW PASS above. Working tree currently has real,
-      verified, uncommitted changes (do not discard): `battle_engine/mcts_player.py`,
-      `cpp/bindings/module.cpp`, `cpp/include/be/mcts.hpp`, `cpp/src/mcts.cpp`,
-      `cpp/tests/test_mcts.cpp`, `pyproject.toml`, `scripts/benchmark.py`,
-      `tests/test_mcts_player.py` (new file).
+- [x] REVIEW: Verification passed — see
+      `.code-foundations/build/2026-08-24-battle-engine-phase4-cpp-search-core-phase-1-review.md`.
+      No FAILs; all three DW items verified with execution evidence.
+- [x] Committed
+Commit: 69f5059
+Summary: M7 done — `search()`/`default_eval` bound (GIL-safe), `MctsPlayer` wired into the
+benchmark harness, real 500-battle sweep measured (beats random/maxdamage, loses to
+heuristic/search/ppo, ~even with learned) — this hand-crafted-eval configuration doesn't beat
+search/learned/RL, consistent with M0. `n_simulations=200` held throughout. Next: Phase 2 (M2
+weight export).
+
+**Note:** `git add .` on the first commit attempt accidentally swept in an unrelated pre-existing
+`CLAUDE.md` diff (a notes/-convention migration from before this session, unrelated to Phase 4).
+Caught before reporting, fixed via `git reset --soft HEAD~1` + `git restore --staged CLAUDE.md`
++ re-commit — no content was lost, `CLAUDE.md` is back to its pre-existing uncommitted state in
+the working tree. Stage explicitly by file scope for every phase from here on, not `git add .`.
 
 DW-1.1: `./scripts/pytest_native.sh` — 169 passed, 3 skipped (pre-existing, unrelated), includes
 6/6 `tests/test_mcts_player.py` tests. PASS.
