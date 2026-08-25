@@ -70,6 +70,22 @@ PYBIND11_MODULE(_native, m) {
       .value("ME", be::Side::Me)
       .value("OPP", be::Side::Opp);
 
+  // M4b: state-level weather/terrain - see battle_state.hpp's own comment
+  // on why these are single-valued fields, not per-side.
+  py::enum_<be::Weather>(m, "Weather")
+      .value("NONE", be::Weather::None)
+      .value("SANDSTORM", be::Weather::Sandstorm)
+      .value("RAINDANCE", be::Weather::RainDance)
+      .value("SUNNYDAY", be::Weather::SunnyDay)
+      .value("SNOW", be::Weather::Snow);
+
+  py::enum_<be::Terrain>(m, "Terrain")
+      .value("NONE", be::Terrain::None)
+      .value("ELECTRIC", be::Terrain::Electric)
+      .value("GRASSY", be::Terrain::Grassy)
+      .value("MISTY", be::Terrain::Misty)
+      .value("PSYCHIC", be::Terrain::Psychic);
+
   py::class_<be::StatBlock>(m, "StatBlock")
       .def(py::init<>())
       .def_readwrite("hp", &be::StatBlock::hp)
@@ -87,7 +103,33 @@ PYBIND11_MODULE(_native, m) {
       .def_readwrite("spikes_layers", &be::SideConditions::spikes_layers)
       .def_readwrite("toxic_spikes_layers", &be::SideConditions::toxic_spikes_layers)
       .def_readwrite("stealth_rock", &be::SideConditions::stealth_rock)
-      .def_readwrite("sticky_web", &be::SideConditions::sticky_web);
+      .def_readwrite("sticky_web", &be::SideConditions::sticky_web)
+      // M4b: real turn numbers for encode_native()'s single-most-recent-
+      // hazard derivation - -1 = not active. See battle_state.hpp's own
+      // comment on the turn-tracked vs. stack-tracked split.
+      .def_readwrite("stealth_rock_turn", &be::SideConditions::stealth_rock_turn)
+      .def_readwrite("sticky_web_turn", &be::SideConditions::sticky_web_turn)
+      .def_readwrite("reflect_turn", &be::SideConditions::reflect_turn)
+      .def_readwrite("light_screen_turn", &be::SideConditions::light_screen_turn)
+      .def_readwrite("aurora_veil_turn", &be::SideConditions::aurora_veil_turn)
+      .def_readwrite("tailwind_turn", &be::SideConditions::tailwind_turn);
+
+  // M4b: a Pokemon's movedex-derived move summary - see battle_state.hpp's
+  // own comment on why this is computed once in Python (mcts_player.py)
+  // rather than re-derived in C++. move_types is a fixed
+  // std::array<bool, 18> - same whole-container-only caveat as
+  // PokemonSlot::moves below (assign a fresh 18-bool Python list, never
+  // index into the property in place).
+  py::class_<be::MoveSummary>(m, "MoveSummary")
+      .def(py::init<>())
+      .def_readwrite("has_recovery", &be::MoveSummary::has_recovery)
+      .def_readwrite("has_hazard_setup", &be::MoveSummary::has_hazard_setup)
+      .def_readwrite("has_hazard_removal", &be::MoveSummary::has_hazard_removal)
+      .def_readwrite("has_setup_boost", &be::MoveSummary::has_setup_boost)
+      .def_readwrite("has_pivot", &be::MoveSummary::has_pivot)
+      .def_readwrite("has_priority", &be::MoveSummary::has_priority)
+      .def_readwrite("max_base_power", &be::MoveSummary::max_base_power)
+      .def_readwrite("move_types", &be::MoveSummary::move_types);
 
   py::class_<be::PokemonSlot>(m, "PokemonSlot")
       .def(py::init<>())
@@ -105,7 +147,19 @@ PYBIND11_MODULE(_native, m) {
       // of EXACTLY 4 strings (use "" for an unknown/not-yet-revealed
       // slot), never fewer/more (pybind11's array caster raises on a
       // length mismatch rather than padding or truncating).
-      .def_readwrite("moves", &be::PokemonSlot::moves);
+      .def_readwrite("moves", &be::PokemonSlot::moves)
+      // M4b additions - see battle_state.hpp's own PokemonSlot comment.
+      .def_readwrite("species", &be::PokemonSlot::species)
+      .def_readwrite("item", &be::PokemonSlot::item)
+      .def_readwrite("ability", &be::PokemonSlot::ability)
+      .def_readwrite("protect_counter", &be::PokemonSlot::protect_counter)
+      .def_readwrite("boost_atk", &be::PokemonSlot::boost_atk)
+      .def_readwrite("boost_def", &be::PokemonSlot::boost_def)
+      .def_readwrite("boost_spa", &be::PokemonSlot::boost_spa)
+      .def_readwrite("boost_spd", &be::PokemonSlot::boost_spd)
+      .def_readwrite("boost_accuracy", &be::PokemonSlot::boost_accuracy)
+      .def_readwrite("boost_evasion", &be::PokemonSlot::boost_evasion)
+      .def_readwrite("move_summary", &be::PokemonSlot::move_summary);
 
   py::class_<be::BattleState>(m, "BattleState")
       .def(py::init<>())
@@ -115,9 +169,18 @@ PYBIND11_MODULE(_native, m) {
       .def_readwrite("my_active_slot", &be::BattleState::my_active_slot)
       .def_readwrite("opp_active_slot", &be::BattleState::opp_active_slot)
       .def_readwrite("my_hazards", &be::BattleState::my_hazards)
-      .def_readwrite("opp_hazards", &be::BattleState::opp_hazards);
+      .def_readwrite("opp_hazards", &be::BattleState::opp_hazards)
+      .def_readwrite("weather", &be::BattleState::weather)
+      .def_readwrite("terrain", &be::BattleState::terrain);
 
   m.def("is_valid", &be::is_valid, py::arg("state"));
+
+  // M4b: bit-for-bit C++ port of encoding.py's encode() - see
+  // battle_state.hpp's own doc comment for the full contract, including
+  // the std::invalid_argument (-> a real Python ValueError, verified) raised when either
+  // side has no active Pokemon.
+  m.def("encode_native", &be::encode_native, py::arg("state"));
+  m.attr("ENCODE_VECTOR_LEN") = int(be::kEncodeVectorLen);
 
   m.attr("NUM_SWITCH_ACTIONS") = int(be::kNumSwitchActions);
   m.attr("MOVE_ACTION_OFFSET") = int(be::kMoveActionOffset);

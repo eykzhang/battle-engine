@@ -48,6 +48,23 @@ from poke_env.player import Player
 from poke_env.player.battle_order import BattleOrder
 
 from battle_engine import _native
+# M4b: reuses encoding.py's own already-verified adapter helpers directly
+# (move-summary derivation, item's unknown-token sentinel, weather/terrain
+# single-most-recent-value reduction) rather than re-deriving equivalent
+# logic here - see this module's own M4b design note above
+# _move_summary_to_native for why (movedex_table.hpp can't drive this: it
+# lacks the heal/sideCondition/selfSwitch/boosts/target flags these need,
+# and extending it is out of this milestone's file scope). Leading
+# underscores crossed on purpose: this translator is effectively a third
+# adapter alongside encoding.py's own poke-env/replay pair, sharing their
+# one verified derivation instead of duplicating it - matches this
+# project's own two-adapter-plus-shared-core convention.
+from battle_engine.encoding import (
+    _move_summary_features,
+    _poke_env_item,
+    _poke_env_terrain,
+    _poke_env_weather,
+)
 
 # Only the 18 real gen-9 types have a be::Type counterpart (see types.hpp's
 # own comment on why Stellar is excluded - Terastallization-only, and
@@ -60,6 +77,47 @@ _STATUS_MAP = {s.name: getattr(_native.Status, s.name) for s in PokeEnvStatus}
 
 _TEAM_SIZE = 6
 _MOVESET_SIZE = 4
+
+# M4b: matches cpp/include/be/types.hpp's Type enum declaration order
+# exactly - the index a MoveSummary.move_types bool sits at (be::Type's own
+# order), NOT poke-env's PokemonType alphabetical order (_ALL_TYPES,
+# encoding.py's concept - the permutation between the two lives entirely in
+# battle_state.cpp's encode_native(), not here).
+_BE_TYPE_NAMES = [
+    "NORMAL", "FIRE", "WATER", "ELECTRIC", "GRASS", "ICE", "FIGHTING",
+    "POISON", "GROUND", "FLYING", "PSYCHIC", "BUG", "ROCK", "GHOST",
+    "DRAGON", "DARK", "STEEL", "FAIRY",
+]
+
+# M4b: single-token weather/terrain -> be::Weather/be::Terrain. Built from
+# encoding.py's own _WEATHER_FROM_POKE_ENV/_TERRAIN_FROM_POKE_ENV string
+# vocabulary (via _poke_env_weather/_poke_env_terrain below), not a
+# separate hand-derived mapping.
+_WEATHER_TO_NATIVE = {
+    "sandstorm": _native.Weather.SANDSTORM,
+    "raindance": _native.Weather.RAINDANCE,
+    "sunnyday": _native.Weather.SUNNYDAY,
+    "snow": _native.Weather.SNOW,
+}
+_TERRAIN_TO_NATIVE = {
+    "electricterrain": _native.Terrain.ELECTRIC,
+    "grassyterrain": _native.Terrain.GRASSY,
+    "mistyterrain": _native.Terrain.MISTY,
+    "psychicterrain": _native.Terrain.PSYCHIC,
+}
+
+# M4b: the 6 turn-tracked hazard/screen SideConditions - see
+# battle_state.hpp's own comment on the turn-tracked vs. stack-tracked
+# split (spikes/toxic_spikes, handled separately below, are the only
+# stack-tracked pair).
+_HAZARD_TURN_FIELDS = {
+    "stealth_rock_turn": SideCondition.STEALTH_ROCK,
+    "sticky_web_turn": SideCondition.STICKY_WEB,
+    "reflect_turn": SideCondition.REFLECT,
+    "light_screen_turn": SideCondition.LIGHT_SCREEN,
+    "aurora_veil_turn": SideCondition.AURORA_VEIL,
+    "tailwind_turn": SideCondition.TAILWIND,
+}
 
 
 def _type_to_native(poke_env_type: Optional[PokemonType]) -> Any:
@@ -85,6 +143,30 @@ def _stat_block(base_stats: dict) -> Any:
     return block
 
 
+def _move_summary_to_native(move_ids) -> Any:
+    """M4b: builds a be::MoveSummary by calling encoding.py's own
+    _move_summary_features directly - the exact function encode()'s live
+    adapter already uses - rather than re-deriving the same dex-flag logic
+    against movedex_table.hpp (which doesn't carry the heal/sideCondition/
+    selfSwitch/boosts/target flags this needs, and is out of this
+    milestone's file scope to extend - see this module's own top-of-file
+    note). This is what makes encode_native()'s output correct by
+    construction rather than by porting-then-hoping-it-agrees.
+    """
+    summary = _move_summary_features(move_ids)
+    native = _native.MoveSummary()
+    native.has_recovery = summary.has_recovery
+    native.has_hazard_setup = summary.has_hazard_setup
+    native.has_hazard_removal = summary.has_hazard_removal
+    native.has_setup_boost = summary.has_setup_boost
+    native.has_pivot = summary.has_pivot
+    native.has_priority = summary.has_priority
+    native.max_base_power = summary.max_base_power
+    move_type_names = {t.name for t in summary.move_types}
+    native.move_types = [name in move_type_names for name in _BE_TYPE_NAMES]
+    return native
+
+
 def _pokemon_slot(mon: Pokemon) -> Any:
     slot = _native.PokemonSlot()
     slot.revealed = True
@@ -101,6 +183,26 @@ def _pokemon_slot(mon: Pokemon) -> Any:
 
     move_ids = list(mon.moves.keys())[:_MOVESET_SIZE]
     slot.moves = move_ids + [""] * (_MOVESET_SIZE - len(move_ids))
+
+    # M4b: everything encode_native() needs beyond default_eval's fields.
+    # species is base_species (NOT species/name) per the plan's own
+    # constraint - a real bug precedent in encoding.py's history (form
+    # changes like Terapagos rename `name` but not `base_species`).
+    slot.species = mon.base_species
+    item = _poke_env_item(mon)
+    slot.item = item if item is not None else ""
+    slot.ability = mon.ability or ""
+    # poke-env already resets protect_counter to 0 on switch-out, so
+    # reading it off a bench slot needs no special-casing (matches
+    # encoding.py's own PokemonView.protect_counter docstring).
+    slot.protect_counter = mon.protect_counter
+    slot.boost_atk = mon.boosts.get("atk", 0)
+    slot.boost_def = mon.boosts.get("def", 0)
+    slot.boost_spa = mon.boosts.get("spa", 0)
+    slot.boost_spd = mon.boosts.get("spd", 0)
+    slot.boost_accuracy = mon.boosts.get("accuracy", 0)
+    slot.boost_evasion = mon.boosts.get("evasion", 0)
+    slot.move_summary = _move_summary_to_native(list(mon.moves.keys()))
     return slot
 
 
@@ -128,7 +230,21 @@ def _side_conditions(conditions: dict) -> Any:
     result.toxic_spikes_layers = conditions.get(SideCondition.TOXIC_SPIKES, 0)
     result.stealth_rock = SideCondition.STEALTH_ROCK in conditions
     result.sticky_web = SideCondition.STICKY_WEB in conditions
+    # M4b: real turn numbers for encode_native()'s single-most-recent-
+    # hazard derivation (see _HAZARD_TURN_FIELDS above) - -1 = not active.
+    for field_name, condition in _HAZARD_TURN_FIELDS.items():
+        setattr(result, field_name, conditions.get(condition, -1))
     return result
+
+
+def _weather_to_native(weather: dict) -> Any:
+    token = _poke_env_weather(weather)
+    return _WEATHER_TO_NATIVE.get(token, _native.Weather.NONE)
+
+
+def _terrain_to_native(fields: dict) -> Any:
+    token = _poke_env_terrain(fields)
+    return _TERRAIN_TO_NATIVE.get(token, _native.Terrain.NONE)
 
 
 def battle_state_from_poke_env(battle: Any) -> Any:
@@ -137,6 +253,15 @@ def battle_state_from_poke_env(battle: Any) -> Any:
     upstream, not a case this translator papers over - mirrors
     encoding.py's own team-preview ValueError precedent for an analogous
     "this shouldn't be possible" state).
+
+    M4b: `battle.weather`/`battle.fields` are read via getattr with an
+    empty-dict default, not direct attribute access - a real AbstractBattle
+    always has both (never hits the fallback), but this module's own
+    pre-existing test fixtures (tests/test_native_legality.py,
+    tests/test_mcts_player.py - both out of this milestone's file scope)
+    build a SimpleNamespace that doesn't set either, and DW-4.2 requires
+    those to keep passing unchanged. The fallback ({} = "no weather/terrain
+    info") is the exact real state those minimal fixtures represent anyway.
     """
     state = _native.BattleState()
     state.my_team = _team_slots(battle.team)
@@ -145,6 +270,8 @@ def battle_state_from_poke_env(battle: Any) -> Any:
     state.opp_active_slot = _active_slot_index(battle.opponent_team, battle.opponent_active_pokemon)
     state.my_hazards = _side_conditions(battle.side_conditions)
     state.opp_hazards = _side_conditions(battle.opponent_side_conditions)
+    state.weather = _weather_to_native(getattr(battle, "weather", {}))
+    state.terrain = _terrain_to_native(getattr(battle, "fields", {}))
     return state
 
 
