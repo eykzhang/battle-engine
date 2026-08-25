@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
+from poke_env.battle.status import Status
 from poke_env.player.battle_order import BattleOrder, DefaultBattleOrder
 
 from conftest import make_mon
@@ -172,13 +173,15 @@ def test_mcts_player_search_called_with_configured_n_simulations(monkeypatch):
 
 
 def test_mcts_player_does_not_crash_with_no_active_pokemon():
-    # The plan's own named edge case: active_pokemon is None (team preview,
-    # or between a faint and the next switch request) - battle_state_from_
-    # poke_env sets my_active_slot=-1, and legal_actions() restricts my
-    # side to switch actions only. A real search (small n_simulations for
-    # test speed) must complete and MctsPlayer must return a real switch
-    # order, not crash and not propagate a move action with no active mon
-    # to translate it against.
+    # active_pokemon is None - team preview, the only real state where
+    # poke-env's own Battle.active_pokemon actually returns None (see the
+    # fainted-active test below for the OTHER, previously-mishandled
+    # no-well-defined-active-slot case). battle_state_from_poke_env sets
+    # my_active_slot=-1, and legal_actions() restricts my side to switch
+    # actions only. A real search (small n_simulations for test speed)
+    # must complete and MctsPlayer must return a real switch order, not
+    # crash and not propagate a move action with no active mon to
+    # translate it against.
     bench1 = make_mon("garchomp")
     bench2 = make_mon("dragapult")
     opp_active = _with_moves(make_mon("landorustherian"), ["earthquake"])
@@ -194,6 +197,66 @@ def test_mcts_player_does_not_crash_with_no_active_pokemon():
 
     assert isinstance(order.order, Pokemon)
     assert order.order in (bench1, bench2)
+
+
+def test_active_slot_index_treats_a_fainted_active_pokemon_as_no_active_slot():
+    # Real bug, found 2026-08-25 by instrumenting a live benchmark run:
+    # poke-env's own Battle.active_pokemon property (battle.py) has NO
+    # fainted check - it returns whichever team member has `.active ==
+    # True`, so a just-fainted Pokemon is STILL battle.active_pokemon
+    # (not None) until the replacement switch actually lands. The
+    # `my_active=None` test above covers team preview, the only case
+    # where active_pokemon really is None - this is the other, more
+    # common case: a real fainted-but-still-"active" Pokemon handed
+    # directly to the translator, exactly as poke-env would in real
+    # play. _active_slot_index must treat this the same as None (-1),
+    # not resolve it to that Pokemon's real team index - resolving it to
+    # a real index let legal_actions() offer MOVE actions for a fainted
+    # Pokemon's still-populated moveset, which the real server always
+    # rejects, and poke-env's own retry loop only has a 1/1000 chance
+    # per retry of giving up (Player.DEFAULT_CHOICE_CHANCE) - an
+    # expected ~1000 wasted searches per faint before this fix.
+    from battle_engine.mcts_player import battle_state_from_poke_env
+
+    fainted_active = make_mon("garchomp", current_hp_fraction=0.0, status=Status.FNT)
+    bench = make_mon("dragapult")
+    opp_active = _with_moves(make_mon("landorustherian"), ["earthquake"])
+    battle = _battle(
+        my_team=[fainted_active, bench],
+        my_active=fainted_active,
+        opp_team=[opp_active],
+        opp_active=opp_active,
+    )
+
+    state = battle_state_from_poke_env(battle)
+
+    assert state.my_active_slot == -1
+    # switch-only, no move slots offered - and slot 0 (the fainted mon
+    # itself) is correctly excluded too, same as any other already-active
+    # slot would be; only the healthy bench slot (1) is a legal target.
+    assert _native.legal_actions(state, _native.Side.ME) == [1]
+
+
+def test_mcts_player_returns_a_switch_when_active_pokemon_has_fainted():
+    # End-to-end version of the test above: a real search over a state
+    # whose "active" Pokemon (per poke-env's own not-yet-switched
+    # behavior) is fainted must return a real switch order, never a
+    # move order the server would reject.
+    fainted_active = _with_moves(make_mon("garchomp", current_hp_fraction=0.0, status=Status.FNT), ["earthquake"])
+    bench = make_mon("dragapult")
+    opp_active = _with_moves(make_mon("landorustherian"), ["earthquake"])
+    battle = _battle(
+        my_team=[fainted_active, bench],
+        my_active=fainted_active,
+        opp_team=[opp_active],
+        opp_active=opp_active,
+    )
+
+    player = MctsPlayer(battle_format="gen9ou", start_listening=False, n_simulations=30, seed=1)
+    order = player.choose_move(battle)
+
+    assert isinstance(order.order, Pokemon)
+    assert order.order is bench
 
 
 # ---------------------------------------------------------------------------

@@ -218,7 +218,31 @@ def _team_slots(team: dict) -> list:
 
 
 def _active_slot_index(team: dict, active: Optional[Pokemon]) -> int:
-    if active is None:
+    """-1 means "no well-defined active slot right now" - both when poke-env
+    has no active_pokemon at all (team preview) AND when the active
+    Pokemon has just fainted. This second case is a real, previously-
+    unhandled bug, not an edge case: poke-env's own Battle.active_pokemon
+    property (battle.py) returns whichever team member has `.active ==
+    True`, with NO fainted check - a Pokemon stays "active" until the
+    replacement switch actually lands, so `active is None` alone never
+    catches "I just fainted, a forced switch is required." Without this,
+    my_active_slot pointed at a fainted mon's real index instead of -1,
+    and since that mon's known moveset is still populated,
+    legal_actions() (action.hpp) incorrectly offered MOVE actions for a
+    Pokemon that cannot move - the server always rejects them
+    ("[Invalid choice] Can't move: You need a switch response"), and
+    poke-env's own retry-until-legal loop only has a 1/1000 chance per
+    retry of giving up and using a safe default order instead (see
+    Player.DEFAULT_CHOICE_CHANCE) - an expected ~1000 wasted searches
+    (minutes to tens of minutes) per single faint. Found 2026-08-25 by
+    directly instrumenting and watching a live diagnostic run, not
+    inferred - the real invariant this restores is the one
+    BattleState/PokemonSlot already documented as required
+    ("my_active_slot is either -1, or a valid index into a slot that is
+    both revealed and not fainted") but this translator never actually
+    enforced.
+    """
+    if active is None or active.fainted:
         return -1
     mons = list(team.values())
     return mons.index(active)
