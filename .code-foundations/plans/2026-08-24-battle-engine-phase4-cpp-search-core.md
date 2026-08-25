@@ -2,7 +2,7 @@
 **Created:** 2026-08-24
 **Status:** in-progress
 **Started:** 2026-08-25 00:00
-**Current Phase:** 3
+**Current Phase:** 4
 **Complexity:** complex
 **Review cadence:** 2
 
@@ -491,10 +491,26 @@ named in a Done-when item.
 
 ## Execution Log
 
+### Phase 3: M3 — C++ NN forward pass (Gate: Standard)
+- [x] BUILD: Discovery + design + implementation complete.
+- [x] REVIEW: DEFERRED — batch pending (tests green at commit: ctest 76/76, pytest_native 182
+      passed / 3 pre-existing skips).
+- Covered by batch review 2026-08-25 (phases 2-3) — PASS, no findings. Two non-blocking notes:
+  DW-3.3's ms/turn projection was measured under Debug/ASan (likely conservative vs. release);
+  re-measure under `--release` before Phase 5 tunes `n_simulations` against it.
+- [x] Committed
+Commit: aa4c485
+Summary: M3 done — `MlpWeights`/`PolicyWeights` C++ forward pass reading M2's `ppo.bin`, verified
+vs. real PyTorch (~9e-5 divergence). DW-3.3 measured 1.51ms/node forward-pass cost and projected
+Phase 5's full sweep at 6-9 hours — **confirms Approach A (per-node PUCT) fits the laptop-first
+budget**, Approach C's fallback is not needed. Un-reviewed set: {Phase 2, Phase 3} — cadence (2)
+reached AND Phase 4 is Full gate, so a batch REVIEW fires now before Phase 4 opens.
+
 ### Phase 2: M2 — Weight export tooling (Gate: Standard)
 - [x] BUILD: Discovery + design + implementation complete.
 - [x] REVIEW: DEFERRED — batch pending (tests green at commit: 6/6 new tests, full suite 175
       passed / 3 pre-existing skips, no regressions).
+- Covered by batch review 2026-08-25 (phases 2-3) — PASS, no findings.
 - [x] Committed
 Commit: 90434fb
 Summary: M2 done — `scripts/export_weights.py` dumps the real PPO checkpoint's actor+critic
