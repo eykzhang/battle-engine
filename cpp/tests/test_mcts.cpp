@@ -193,6 +193,120 @@ TEST_CASE("search: visits concentrate on an obviously lethal move over a no-op s
   REQUIRE(result.best_action == kMoveActionOffset + 0);
 }
 
+TEST_CASE(
+    "search: my_force_switch restricts the ROOT to switch actions only, even with a real, alive active",
+    "[mcts]") {
+  // Regression for the 2026-08-25 multi-hour benchmark stall (see
+  // BattleState::my_force_switch's own doc comment, battle_state.hpp): a
+  // pivot move leaves the active Pokemon alive, but poke-env's real
+  // request only allows a switch this turn. Before this field existed,
+  // search()'s root_node.my_actions came straight from legal_actions(root,
+  // Side::Me), which offered every one of the active mon's known moves
+  // regardless - this asserts the root visit distribution never contains
+  // a single move ActionId when my_force_switch is set.
+  BattleState state;
+
+  PokemonSlot me;
+  me.revealed = true;
+  me.hp_fraction = 1.0f;
+  me.level = 100;
+  me.base_stats = {100, 100, 100, 100, 100, 100};
+  me.spe_stat = 100;
+  me.moves = {"seismictoss", "protect", "", ""};  // must never be offered
+  state.my_team[0] = me;
+  state.my_active_slot = 0;
+  state.my_force_switch = true;
+  state.my_team[1] = make_filler_bench_slot();  // the only legal action
+
+  PokemonSlot opp;
+  opp.revealed = true;
+  opp.hp_fraction = 1.0f;
+  opp.level = 100;
+  opp.base_stats = {100, 100, 100, 100, 100, 100};
+  opp.spe_stat = 100;
+  opp.moves = {"tackle", "protect", "", ""};
+  state.opp_team[0] = opp;
+  state.opp_active_slot = 0;
+  for (int i = 1; i < 6; ++i) state.opp_team[i] = make_filler_bench_slot();
+
+  SearchResult result = search(state, default_eval, /*n_simulations=*/200, /*seed=*/3);
+
+  REQUIRE(result.best_action == 1);  // the only legal switch target
+  for (const auto& [action, visits] : result.root_visit_distribution) {
+    REQUIRE(action < kMoveActionOffset);
+    if (visits > 0) REQUIRE(action == 1);
+  }
+}
+
+TEST_CASE(
+    "search: my_force_switch does not leak into a simulated DESCENDANT decision node after the root's "
+    "forced switch resolves",
+    "[mcts]") {
+  // Regression for a correctness bug found (via code review, not a live
+  // repro) while implementing the fix above: my_force_switch lives on
+  // BattleState, and search()'s per-simulation state is a COPY of root
+  // mutated in place - without an explicit reset, every node created
+  // LATER in the same simulated line would inherit root's my_force_switch
+  // = true and be incorrectly switch-restricted forever, even though the
+  // real game's force_switch only ever applies to the one real turn it
+  // was reported for (this project's forward model doesn't simulate pivot
+  // moves at all, so no internally-generated state should ever carry this
+  // true). Distinguishes the two cases empirically: bench slot 1 (A) has
+  // a guaranteed-lethal Seismic Toss it can only use on ITS OWN following
+  // turn (one level past the forced switch); bench slot 2 (B) only has a
+  // no-op Protect. If the leak were present, A's post-switch node would
+  // ALSO be wrongly switch-only, Seismic Toss would never be explored,
+  // and A/B would search as roughly equivalent - fixed, A must come out
+  // clearly ahead once enough of the tree explores past the switch.
+  BattleState state;
+
+  PokemonSlot me;
+  me.revealed = true;
+  me.hp_fraction = 1.0f;
+  me.level = 100;
+  me.base_stats = {100, 100, 100, 100, 100, 100};
+  me.spe_stat = 100;
+  me.moves = {"tackle", "protect", "", ""};  // irrelevant - force_switch blocks these at root
+  state.my_team[0] = me;
+  state.my_active_slot = 0;
+  state.my_force_switch = true;
+
+  PokemonSlot bench_a;
+  bench_a.revealed = true;
+  bench_a.hp_fraction = 1.0f;
+  bench_a.level = 100;
+  bench_a.base_stats = {100, 100, 100, 100, 100, 100};
+  bench_a.spe_stat = 100;
+  bench_a.moves = {"seismictoss", "protect", "", ""};  // only usable AFTER the switch resolves
+  state.my_team[1] = bench_a;
+
+  PokemonSlot bench_b;
+  bench_b.revealed = true;
+  bench_b.hp_fraction = 1.0f;
+  bench_b.level = 100;
+  bench_b.base_stats = {100, 100, 100, 100, 100, 100};
+  bench_b.spe_stat = 100;
+  bench_b.moves = {"protect", "", "", ""};  // no lethal option, ever
+  state.my_team[2] = bench_b;
+
+  // Opponent one hit point above 0 - Seismic Toss's ~105 flat damage is a
+  // guaranteed faint IF the search can ever reach and use it.
+  PokemonSlot opp;
+  opp.revealed = true;
+  opp.hp_fraction = 0.01f;
+  opp.level = 100;
+  opp.base_stats = {100, 100, 100, 100, 100, 100};
+  opp.spe_stat = 100;
+  opp.moves = {"tackle", "protect", "", ""};
+  state.opp_team[0] = opp;
+  state.opp_active_slot = 0;
+  for (int i = 1; i < 6; ++i) state.opp_team[i] = make_filler_bench_slot();
+
+  SearchResult result = search(state, default_eval, /*n_simulations=*/1500, /*seed=*/5);
+
+  REQUIRE(result.best_action == 1);  // switch to A (the lethal-follow-up option), not B
+}
+
 TEST_CASE("search: same seed and inputs produce an identical root visit distribution (determinism)", "[mcts]") {
   auto make_state = []() {
     BattleState state;

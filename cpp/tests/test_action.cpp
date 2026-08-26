@@ -103,6 +103,49 @@ TEST_CASE("legal_actions: Side::Opp move actions are restricted to already-revea
   REQUIRE_FALSE(contains(actions, kMoveActionOffset + 3));
 }
 
+TEST_CASE(
+    "legal_actions: my_force_switch suppresses move actions even with a real, alive active Pokemon",
+    "[action]") {
+  // Real bug (2026-08-25): a pivot move (U-turn/Volt Switch/...) leaves
+  // the active Pokemon alive and my_active_slot a real index, but
+  // poke-env's real request only allows a switch this turn - see
+  // BattleState::my_force_switch's own doc comment (battle_state.hpp)
+  // for the full incident writeup.
+  BattleState state;
+  PokemonSlot active = make_revealed_slot();
+  active.moves = {"uturn", "pyroball", "willowisp", "courtchange"};
+  state.my_team[0] = active;
+  state.my_team[1] = make_revealed_slot();  // legal switch target
+  state.my_active_slot = 0;
+  state.my_force_switch = true;
+
+  auto actions = legal_actions(state, Side::Me);
+
+  REQUIRE(contains(actions, 1));            // the only legal action
+  REQUIRE_FALSE(contains(actions, 0));      // still can't switch into yourself
+  for (ActionId a = kMoveActionOffset; a < kMoveActionOffset + kNumMoveActions; ++a) {
+    REQUIRE_FALSE(contains(actions, a));    // no moves at all this turn
+  }
+}
+
+TEST_CASE("legal_actions: my_force_switch is my-side-only - Side::Opp is unaffected", "[action]") {
+  // BattleState::my_force_switch's own doc comment: there's no
+  // opp_force_switch equivalent (poke-env gives no such visibility into
+  // the opponent), so this field must never suppress the OPPONENT's own
+  // move actions even when it happens to be set (it never legitimately
+  // is for opp_active_slot, but legal_actions() must not assume that).
+  BattleState state;
+  PokemonSlot active = make_revealed_slot();
+  active.moves = {"earthquake", "", "", ""};
+  state.opp_team[0] = active;
+  state.opp_active_slot = 0;
+  state.my_force_switch = true;
+
+  auto actions = legal_actions(state, Side::Opp);
+
+  REQUIRE(contains(actions, kMoveActionOffset + 0));
+}
+
 TEST_CASE("legal_actions: a side with nothing left to do returns an empty vector", "[action]") {
   BattleState state;  // every slot defaults to unrevealed, no active mon
   state.my_active_slot = -1;
