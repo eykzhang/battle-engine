@@ -10,7 +10,12 @@ std::vector<ActionId> legal_actions(const BattleState& state, Side side) {
   for (int i = 0; i < 6; i++) {
     if (i != active_slot_index && team[i].revealed && !team[i].fainted) ret.push_back(i);
   }
-  if (active_slot_index > -1) {
+  // BattleState::my_force_switch's own doc comment: a real, alive,
+  // non-fainted active Pokemon can still have zero legal moves this turn
+  // (a pivot move just resolved) - "my"-side-only, since there's no
+  // equivalent opp_force_switch signal available.
+  bool force_switch_only = (side == Side::Me) && state.my_force_switch;
+  if (active_slot_index > -1 && !force_switch_only) {
     for (int i = 0; i < kNumMoveActions; i++) {
       if (!team[active_slot_index].moves[i].empty()) ret.push_back(i + kMoveActionOffset);
     }

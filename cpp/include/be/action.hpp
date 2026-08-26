@@ -50,7 +50,11 @@ enum class Side { Me, Opp };
 // _require_active_pokemon pattern for the identical reason (no active mon
 // means no well-defined moveset to index into). A move slot i is legal
 // iff active.moves[i] is non-empty (a known move id) - see
-// PokemonSlot::moves's own doc comment.
+// PokemonSlot::moves's own doc comment. Additionally, for Side::Me only,
+// NO move action is ever legal when state.my_force_switch is set, even
+// though my_active_slot is a real, alive index - see that field's own
+// doc comment (battle_state.hpp) for why this is a real, separate signal
+// from "no active Pokemon," not a redundant one.
 //
 // Tier 1's opponent-modeling limitation, applied twice over (a real,
 // named limitation - see the plan's Scope decision, not a bug): for

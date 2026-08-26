@@ -179,6 +179,38 @@ struct BattleState {
   SideConditions opp_hazards{};
   Weather weather = Weather::None;
   Terrain terrain = Terrain::None;
+  // Found 2026-08-25 debugging a real multi-hour benchmark stall: "my"
+  // side's active Pokemon can be alive and healthy (a real, valid
+  // my_active_slot) while STILL having zero legal moves this turn -
+  // poke-env's own battle.force_switch fires whenever a pivot move
+  // (U-turn/Volt Switch/Baton Pass/...) just resolved and only a
+  // replacement switch is a legal response, common in real gen9ou play.
+  // Before this field existed, my_active_slot being a real (non-fainted)
+  // index was the ONLY signal legal_actions() (action.hpp) used to decide
+  // whether moves were offered - collapsing "there's a well-defined
+  // active Pokemon" and "moves are a legal action category this turn"
+  // into one bit lost the pivot case, offering real-illegal MOVE actions
+  // from a Pokemon that was mid-switch, not mid-decision. Setting
+  // my_active_slot itself to -1 for this case (the first fix attempted)
+  // is WRONG for a different reason: legal_actions()'s switch-exclusion
+  // ("can't switch into the slot that's already active") reads
+  // my_active_slot too, so wiping it also wipes that exclusion, making
+  // "switch into yourself" look like a legal target. Hence a dedicated
+  // field instead of overloading my_active_slot again.
+  //
+  // "My"-side-only (no opp_force_switch): poke-env's Battle object has no
+  // equivalent visibility into whether the OPPONENT is mid-pivot, and
+  // this project's own forward model (forward_model.cpp) doesn't
+  // simulate pivot moves at all, so no internally-generated state ever
+  // needs to set this true for either side - it is populated ONLY by
+  // battle_engine/mcts_player.py's translator, from the real root
+  // battle.force_switch, and ONLY for "my" side. mcts.cpp's search()/
+  // search_puct() explicitly clear it back to false on the per-simulation
+  // state copy right after using the root's own value once (see their own
+  // comments) - it must never leak into a simulated DESCENDANT node's own
+  // legal_actions() computation, since the forward model has no way to
+  // know whether a hypothetical future turn would also be pivot-forced.
+  bool my_force_switch = false;
 };
 
 // True iff `state` satisfies BattleState's structural invariants:

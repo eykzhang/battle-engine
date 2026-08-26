@@ -220,27 +220,22 @@ def _team_slots(team: dict) -> list:
 def _active_slot_index(team: dict, active: Optional[Pokemon]) -> int:
     """-1 means "no well-defined active slot right now" - both when poke-env
     has no active_pokemon at all (team preview) AND when the active
-    Pokemon has just fainted. This second case is a real, previously-
-    unhandled bug, not an edge case: poke-env's own Battle.active_pokemon
-    property (battle.py) returns whichever team member has `.active ==
-    True`, with NO fainted check - a Pokemon stays "active" until the
-    replacement switch actually lands, so `active is None` alone never
-    catches "I just fainted, a forced switch is required." Without this,
-    my_active_slot pointed at a fainted mon's real index instead of -1,
-    and since that mon's known moveset is still populated,
-    legal_actions() (action.hpp) incorrectly offered MOVE actions for a
-    Pokemon that cannot move - the server always rejects them
-    ("[Invalid choice] Can't move: You need a switch response"), and
-    poke-env's own retry-until-legal loop only has a 1/1000 chance per
-    retry of giving up and using a safe default order instead (see
-    Player.DEFAULT_CHOICE_CHANCE) - an expected ~1000 wasted searches
-    (minutes to tens of minutes) per single faint. Found 2026-08-25 by
-    directly instrumenting and watching a live diagnostic run, not
-    inferred - the real invariant this restores is the one
-    BattleState/PokemonSlot already documented as required
-    ("my_active_slot is either -1, or a valid index into a slot that is
-    both revealed and not fainted") but this translator never actually
-    enforced.
+    Pokemon has just fainted (see 435f6a5 for the full fainted-active
+    writeup: poke-env's own Battle.active_pokemon has no fainted check, so
+    a just-fainted Pokemon stays battle.active_pokemon until the
+    replacement switch lands).
+
+    Does NOT cover the separate "alive, healthy active Pokemon but only a
+    switch is legal this turn" case (a pivot move - U-turn/Volt Switch/...
+    - just resolved) - that's `battle.force_switch`, a real signal
+    independent of whether there's a well-defined active Pokemon at all,
+    carried on BattleState.my_force_switch instead (see that field's own
+    doc comment in battle_state.hpp for why it's a separate field rather
+    than folded into this -1 the way the fainted case first tried:
+    my_active_slot also drives legal_actions()'s switch-target EXCLUSION
+    ("can't switch into the already-active slot"), so setting it to -1
+    for a Pokemon that's still real and active would incorrectly make
+    switching into itself look legal too).
     """
     if active is None or active.fainted:
         return -1
@@ -292,6 +287,13 @@ def battle_state_from_poke_env(battle: Any) -> Any:
     state.opp_team = _team_slots(battle.opponent_team)
     state.my_active_slot = _active_slot_index(battle.team, battle.active_pokemon)
     state.opp_active_slot = _active_slot_index(battle.opponent_team, battle.opponent_active_pokemon)
+    # "My"-side-only, real, independent-of-my_active_slot signal (see
+    # BattleState.my_force_switch's own doc comment, battle_state.hpp) -
+    # getattr with a False default for the same reason weather/fields
+    # below use getattr (this module's own pre-existing test fixtures
+    # build a SimpleNamespace that doesn't set it; a real AbstractBattle
+    # always has it).
+    state.my_force_switch = getattr(battle, "force_switch", False)
     state.my_hazards = _side_conditions(battle.side_conditions)
     state.opp_hazards = _side_conditions(battle.opponent_side_conditions)
     state.weather = _weather_to_native(getattr(battle, "weather", {}))
@@ -332,6 +334,110 @@ def _action_id_to_order(action_id: int, battle: Any) -> BattleOrder:
     return Player.create_order(battle.active_pokemon.moves[move_id])
 
 
+def _real_legal_action_ids(battle: Any) -> set:
+    """The REAL set of legal root ActionIds this turn, straight from
+    poke-env's own battle.available_moves/available_switches - the ground
+    truth the server will actually accept, independent of whatever
+    legal_actions() (action.hpp) computed from the translated BattleState.
+
+    Exists as a backstop at the translation boundary (see
+    _real_legal_order_from_result's own doc comment for why this project
+    now has one at all, found 2026-08-25 debugging a THIRD real-game
+    mechanic - PP exhaustion - that produces the identical retry-storm
+    hang the fainted-active (435f6a5) and force_switch/pivot-move fixes
+    above each closed one at a time): action.hpp's legal_actions() only
+    knows what PokemonSlot tracks (fainted/revealed/known move ids), blind
+    to PP, Choice-item lock, Disable, Encore, and trapping - all real,
+    still-open gaps this module's own MctsPlayer docstring already names.
+    Cross-checking the translated root ActionId against poke-env's own
+    already-correct available_moves/available_switches here closes the
+    WHOLE class of "engine picks a real-illegal action, poke-env retries
+    ~1000 times at 1/1000 odds of giving up" failure modes at once, rather
+    than requiring a new one-off BattleState field for every mechanic
+    Tier 1 doesn't model (my_force_switch was worth its own field because
+    it's common AND the search benefits from actually exploring the right
+    action space - see that field's own doc comment; PP/choice-lock/
+    Disable/Encore/trapping are comparatively rare enough per-turn that a
+    root-only fallback, not a full search-time model, is the pragmatic
+    fix here).
+
+    A move is legal iff its id appears in battle.available_moves (already
+    poke-env's own real legality: PP, Choice-lock, Disable, Encore, and
+    empty-if-force_switch all fall out of this for free, no separate
+    check needed). A switch is legal iff the target Pokemon appears in
+    battle.available_switches (already reflects trapping/Sky Drop/etc. -
+    the same "ask poke-env, don't reconstruct" principle).
+
+    battle.available_moves/available_switches are read via getattr with a
+    fallback, same convention (and same reason) as weather/fields/
+    force_switch in battle_state_from_poke_env: a real AbstractBattle
+    always has both, but this module's own pre-existing test fixtures
+    build a SimpleNamespace that doesn't. The fallback reconstructs
+    legal_actions()'s OWN notion of legality (every revealed, non-fainted,
+    non-active teammate; every known move slot, or none if force_switch)
+    rather than "everything is legal" or "nothing is" - so a fixture that
+    never mentions these fields sees no behavior change from before this
+    backstop existed, and only a test that deliberately sets them (to
+    model PP exhaustion, Choice-lock, trapping, ...) exercises the real
+    divergence-detection path.
+    """
+    legal: set = set()
+    team_list = list(battle.team.values())
+    active = battle.active_pokemon
+    available_switches = getattr(battle, "available_switches", None)
+    if available_switches is None:
+        available_switches = [mon for mon in team_list if mon is not active and not mon.fainted]
+    for mon in available_switches:
+        if mon in team_list:
+            legal.add(team_list.index(mon))
+
+    if active is not None:
+        move_ids = list(active.moves.keys())
+        available_moves = getattr(battle, "available_moves", None)
+        if available_moves is None:
+            available_moves = [] if getattr(battle, "force_switch", False) else list(active.moves.values())
+        for move in available_moves:
+            if move.id in move_ids:
+                legal.add(move_ids.index(move.id) + _native.MOVE_ACTION_OFFSET)
+    return legal
+
+
+def _real_legal_order_from_result(result: Any, battle: Any) -> Optional[BattleOrder]:
+    """Validates search()/search_puct()'s chosen root_action against
+    poke-env's own real legality (_real_legal_action_ids) before ever
+    translating it into a submittable order - the backstop found
+    necessary 2026-08-25 (see _real_legal_action_ids's own doc comment
+    for the full incident history: two prior one-off BattleState-field
+    fixes each closed one real-game mechanic legal_actions() didn't
+    model, and a THIRD - PP exhaustion - reproduced the identical
+    multi-hour poke-env-retry-storm hang immediately after).
+
+    result.best_action is used if it's real-legal (the common case - the
+    search explored the right action space almost all the time). If not,
+    this does NOT discard the whole search and fall straight to a default
+    order: it walks result.root_visit_distribution (the search's own
+    per-action visit counts, most-visited first) for the first action
+    that IS real-legal, salvaging the second-best (or better) real choice
+    the search actually explored rather than a context-free default.
+    Returns None only if NOTHING the search looked at (including
+    best_action) is real-legal - true trivially when the search found
+    zero legal root actions (NO_ACTION, empty root_visit_distribution),
+    but also empirically possible for a search running against a
+    translated BattleState whose root legality diverged sharply from
+    poke-env's real one (e.g. every action the search entertained
+    happened to be PP-exhausted). Callers fall back to
+    choose_default_move() in that case, same as the pre-backstop
+    NO_ACTION handling both Player classes had before.
+    """
+    real_legal = _real_legal_action_ids(battle)
+    if result.best_action in real_legal:
+        return _action_id_to_order(result.best_action, battle)
+    for action_id, _visits in sorted(result.root_visit_distribution, key=lambda pair: -pair[1]):
+        if action_id in real_legal:
+            return _action_id_to_order(action_id, battle)
+    return None
+
+
 class MctsPlayer(Player):
     """M7: a poke-env Player driven by M6's native.search() (open-loop
     MCTS/DUCT, plain UCB1, the C++-fixed default_eval leaf evaluator - no
@@ -350,13 +456,32 @@ class MctsPlayer(Player):
     `Player._handle_battle_request` sends a fresh `choose_move` on every
     re-sent `|request|`) until either a legal choice lands or poke-env's
     own probabilistic DEFAULT_CHOICE_CHANCE fallback breaks the loop.
-    Measured impact: real wall-clock stayed under ~0.6s/battle even with
-    this overhead (10-battle samples vs RandomPlayer/MaxBasePowerPlayer at
-    n_simulations=200, gen9randombattle - see this phase's Execution Log
-    entry), so it doesn't block a real 500-battle benchmark run, but it's
-    a real, load-bearing gap for a future phase to close (PP/choice-lock/
-    trapping modeling), not something this phase's file scope can fix -
-    named here rather than left to be silently rediscovered.
+    Measured impact at the time this was first written: real wall-clock
+    stayed under ~0.6s/battle even with this overhead (10-battle samples
+    vs RandomPlayer/MaxBasePowerPlayer at n_simulations=200,
+    gen9randombattle - see this phase's Execution Log entry) - true for
+    THAT matchup/format, but NOT a safe generalization: a 2026-08-25
+    mcts_puct-vs-ppo/gen9ou benchmark stalled over an hour on a single
+    battle from exactly this gap (0 PP on a move the search kept
+    re-picking every retry, since the position doesn't change between
+    retries - a real live repro, not inferred), because gen9ou's constructed
+    OU teams exercise Choice items/PP exhaustion far more than
+    gen9randombattle ever did in the original sample.
+
+    This search-time gap - legal_actions() not modeling PP/choice-lock/
+    Disable/Encore/trapping - is still real and still open (a future
+    phase's job to close inside the search itself, same conclusion as
+    before). What changed 2026-08-25 is choose_move() no longer trusts
+    the search's root pick blindly: _real_legal_order_from_result cross-
+    checks it against poke-env's own real battle.available_moves/
+    available_switches before ever submitting it, and salvages the next-
+    best action the search actually explored if the top pick turns out
+    real-illegal (see that function's own doc comment for the full
+    rationale and incident history, including the SEPARATE force_switch/
+    pivot-move case BattleState.my_force_switch fixes one level deeper,
+    inside the search itself, because that case is common and structural
+    enough to be worth the search actually exploring the right action
+    space rather than only catching it at the root).
 
     MctsPlayer IS-A Player: same shape as every other Player subclass in
     this codebase (FrozenPolicyPlayer, TwoPlySearchPlayer) - choose_move is
@@ -385,15 +510,12 @@ class MctsPlayer(Player):
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         state = battle_state_from_poke_env(battle)
         result = _native.search(state, self._n_simulations, self._rng.getrandbits(64))
-        if result.best_action == _native.NO_ACTION:
-            # No legal root action at all (e.g. every non-active team member
-            # fainted/unrevealed and the active mon's every known move slot
-            # is somehow empty - action.hpp's own documented edge case for
-            # legal_actions()). Fall back to Showdown's own "first legal
-            # order" default rather than propagating an invalid order to
-            # poke-env - the plan's own explicit requirement for this case.
-            return self.choose_default_move()
-        return _action_id_to_order(result.best_action, battle)
+        # _real_legal_order_from_result covers NO_ACTION too (an empty
+        # root_visit_distribution has nothing to find) - see its own doc
+        # comment for the full "why a backstop, not just a NO_ACTION check"
+        # rationale. Falls back to Showdown's own "first legal order"
+        # default rather than ever propagating an invalid order to poke-env.
+        return _real_legal_order_from_result(result, battle) or self.choose_default_move()
 
 
 class MctsPuctPlayer(Player):
@@ -434,6 +556,4 @@ class MctsPuctPlayer(Player):
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         state = battle_state_from_poke_env(battle)
         result = _native.search_puct(state, self._weights, self._n_simulations, self._rng.getrandbits(64))
-        if result.best_action == _native.NO_ACTION:
-            return self.choose_default_move()
-        return _action_id_to_order(result.best_action, battle)
+        return _real_legal_order_from_result(result, battle) or self.choose_default_move()

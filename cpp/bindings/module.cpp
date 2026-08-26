@@ -168,6 +168,7 @@ PYBIND11_MODULE(_native, m) {
       .def_readwrite("opp_team", &be::BattleState::opp_team)
       .def_readwrite("my_active_slot", &be::BattleState::my_active_slot)
       .def_readwrite("opp_active_slot", &be::BattleState::opp_active_slot)
+      .def_readwrite("my_force_switch", &be::BattleState::my_force_switch)
       .def_readwrite("my_hazards", &be::BattleState::my_hazards)
       .def_readwrite("opp_hazards", &be::BattleState::opp_hazards)
       .def_readwrite("weather", &be::BattleState::weather)

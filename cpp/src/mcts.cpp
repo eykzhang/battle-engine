@@ -193,6 +193,14 @@ SearchResult search_puct(const BattleState& root, const PolicyWeights& weights, 
 
   for (int sim = 0; sim < n_simulations; sim++) {
     BattleState state = root;
+    // root_node's own my_actions/my_stats (populate_decision_node above)
+    // already baked in root's real my_force_switch value once, before
+    // this loop - clear it on the per-simulation copy so no DESCENDANT
+    // node populated later in this simulation (from a state the forward
+    // model produced, which never sets this field) inherits a stale
+    // "switch-only" restriction that only ever applied to the real root
+    // turn. See BattleState::my_force_switch's own doc comment.
+    state.my_force_switch = false;
     SearchNode* cur = &root_node;
     std::vector<std::tuple<SearchNode*, ActionId, ActionId>> path;
     float leaf_my_value = 0.0f;
@@ -425,6 +433,12 @@ SearchResult search(const BattleState& root, const EvalFn& leaf_eval, int n_simu
 
   for (int sim = 0; sim < n_simulations; sim++) {
     BattleState state = root;
+    // Same reset as search_puct() (see that function's own comment and
+    // BattleState::my_force_switch's own doc comment): root_node's
+    // my_actions is already populated from root's real value above, once
+    // - clear it on the per-simulation copy so it can't leak into a
+    // simulated descendant node's own legal_actions() computation.
+    state.my_force_switch = false;
     SearchNode* cur = &root_node;
     std::vector<std::tuple<SearchNode*, ActionId, ActionId>> path;
     float leaf_value = 0.0f;
