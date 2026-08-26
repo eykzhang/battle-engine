@@ -515,7 +515,7 @@ named in a Done-when item.
 - [x] VERIFY: `./scripts/pytest_native.sh` 209 passed, 3 skipped (pre-existing, unrelated);
       `ctest --test-dir cpp/build` 100/100 passed.
 - [x] Committed
-Commit: (pending — see below)
+Commit: def8680
 Summary: Phase 6 done — the plan's final phase. Real 500-battle benchmarks for both remaining
 matchups, `notes/phase-4-m7-and-enhancement-track.md` written (full asset inventory, every phase's
 measured standing in one place), linked from `notes/index.md`, `CLAUDE.md`'s Phase 4 status
