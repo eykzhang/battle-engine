@@ -18,6 +18,10 @@ runs/
 # Local secrets (e.g. ladder account credentials for scripts/ladder_ppo.py)
 .env.local
 
+# Real-ladder replay HTML saved by scripts/ladder_ppo.py --save-replays
+# (diagnostic artifacts, contain real opponents' usernames - not source)
+replays/
+
 # Phase 4 C++: CMake build dir (FetchContent'd pybind11/Catch2 sources +
 # compiled objects, regenerate via scripts/build_cpp.sh) and the compiled
 # extension itself (lands in battle_engine/, also regenerable)

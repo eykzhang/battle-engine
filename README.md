@@ -43,7 +43,8 @@ advances:
 | 1 | Classical engine: hand-crafted evaluation + lookahead search over damage-calculated outcomes | >70% win rate vs. max-damage over 500+ battles |
 | 2 | First ML: learned win-probability model + move-prediction model, trained on millions of parsed human replays | beats the Phase-1 bot head-to-head |
 | 3 | Reinforcement learning: PPO self-play, initialized from the Phase-2 policy | beats the Phase-2 bot head-to-head + a real ladder GXE |
-| 4+ | Stretch, underway: C++ search core (MCTS/DUCT + compiled inference), full gen9 OU support | exploratory |
+| 4 | Stretch, complete: C++ search core (MCTS/DUCT, PUCT with a trained PPO prior/value, compiled inference) | measured, not gated — exploratory by design |
+| 5+ | Stretch, underway: comprehensive state-encoding rewrite, closing the real-ladder gap | exploratory |
 
 The end-state architecture mirrors Stockfish and Leela Chess Zero: train in Python,
 search and infer in C++.
@@ -99,17 +100,43 @@ a 35.6% win rate, GXE 26.3%. An honest result, not a cherry-picked one: the trai
 policy currently loses more than it wins against the live gen9ou ladder population,
 a harder and more meaningful test than the local bot-vs-bot benchmarks above.
 
-**Phase 4 (stretch: C++ search core) underway.** Before committing to a multi-week
+**Phase 4 (stretch: C++ search core) complete.** Before committing to a multi-week
 C++ build, a pure-Python MCTS/DUCT prototype tested the actual premise: does a real,
 branching search beat the existing 1-ply search over the same hand-crafted
 evaluation? It didn't (26.7% vs. the Phase-1 bot, confirmed across a hyperparameter
 sweep, a 10x simulation-count increase, and replay inspection that turned up no
-bug). Taken honestly, that reframes Phase 4 as a deliberate C++-learning project
-rather than an implied strength bet, and it's proceeding as one: the C++ toolchain
-(CMake, pybind11, Catch2, ASan/UBSan-enabled debug builds) is set up, and the
-battle-state representation and hand-crafted evaluation function are ported to C++
-and passing a 32-test Catch2 suite alongside the existing 162 Python tests. Writing
-the actual MCTS/DUCT tree search is next.
+bug). Taken honestly, that reframed Phase 4 as a deliberate C++-learning project
+rather than an implied strength bet, and it followed through as one: a hand-written
+battle-state representation, forward model, and open-loop MCTS/DUCT search in C++,
+weight-export tooling for the trained PPO checkpoint, a hand-written neural-network
+forward pass (verified against PyTorch to ~9e-5), and PUCT search using that network
+as a per-node prior and leaf value — 100+ Catch2 tests, 200+ Python tests, and real
+500-battle measurements throughout:
+
+- PUCT search (PPO prior + critic value) beats the hand-crafted-eval search **60.4%**
+  [56.0, 64.6] — the neural prior genuinely helps.
+- PUCT search still loses to the raw PPO policy alone, **35.8%** [31.7, 40.1] — the
+  extra search doesn't yet beat just running the trained network directly.
+
+Read honestly: the engine and the PUCT implementation are both real and correct, but
+this configuration — a frozen policy/value net wrapped in search after the fact,
+never trained with search in the loop — doesn't close the gap to pure PPO. That
+tracks with why AlphaZero-style search needs the network trained on the search's own
+output, not handed a frozen one; not attempted here.
+
+## Current focus
+
+A real-ladder diagnostic (20 games under an alt account, losses read turn-by-turn)
+found the actual bottleneck isn't search depth or model architecture — it's the
+state representation. `battle_engine/encoding.py` only encodes a coarse per-Pokémon
+move-type aggregate, with no per-move signal for type effectiveness or the many
+other mechanically relevant interactions a battle turns on. The result is a literal,
+repeated failure mode: in one loss, Dragapult's Draco Meteor was used four turns in a
+row into Clefable, immune every time — a species the policy trained against
+directly, ruling out "never saw this matchup" as the whole story. The next phase is
+a comprehensive, prioritized rewrite of the state encoding, grounded against Foul
+Play's own open-source evaluation logic and this project's C++ movedex/pokedex data,
+followed by a full retrain once cluster compute access is set up.
 
 ## Setup
 
