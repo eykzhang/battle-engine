@@ -1,13 +1,10 @@
 # Plan: battle-engine Phase 4 — finish the C++ search core (M7 + enhancement track)
 **Created:** 2026-08-24
-**Status:** in-progress
+**Status:** complete
 **Started:** 2026-08-25 00:00
-**Stopped (hard cutoff):** 2026-08-25 07:45 — see Execution Log's Phase 5 entry for exact
-resume instructions. A "usage limit reset" system message arrived at 07:45:14, immediately
-during hard-stop execution; per the user's own explicit standing instruction ("cut off all work
-before 7:50 regardless of state"), it was not treated as authorization to resume — no new work
-was started after this timestamp.
-**Current Phase:** 5 (REVIEW failed once of 3 allowed — see below, not yet re-dispatched)
+**Resumed:** 2026-08-25 10:04 (user-directed, after the 07:45 hard cutoff)
+**Completed:** 2026-08-26 07:15
+**Current Phase:** 6 (final)
 **Complexity:** complex
 **Review cadence:** 2
 
@@ -413,11 +410,11 @@ documented the same way a winning one would be, per the confirmed outcome policy
 training-continuation decision is made from) + the updated `CLAUDE.md` summary/link.
 
 **Done when:**
-- [ ] DW-6.1: real 500-battle `mcts_puct` vs `ppo` result at `--format gen9ou`, with Wilson CI,
-      in `notes/phase-4-m7-and-enhancement-track.md`.
-- [ ] DW-6.2: real 500-battle `mcts_puct` vs `mcts` result at `--format gen9ou`, with Wilson CI,
-      in the same note.
-- [ ] DW-6.3: the note summarizes every asset's measured standing in one place, linked from
+- [x] DW-6.1: real 500-battle `mcts_puct` vs `ppo` result at `--format gen9ou`, with Wilson CI,
+      in `notes/phase-4-m7-and-enhancement-track.md`. 179-317-4, 35.8% [31.7%, 40.1%] — loses.
+- [x] DW-6.2: real 500-battle `mcts_puct` vs `mcts` result at `--format gen9ou`, with Wilson CI,
+      in the same note. 302-193-5, 60.4% [56.0%, 64.6%] — wins.
+- [x] DW-6.3: the note summarizes every asset's measured standing in one place, linked from
       `notes/index.md`; `CLAUDE.md`'s Phase 4 status carries the summary line + link, not the
       full tables.
 
@@ -451,7 +448,7 @@ named in a Done-when item.
 - [ ] critic sign-convention check on synthetic mirrored state pairs, incl. the "neither holds" fallback (Phase 5, DW-5.4)
 - [ ] `mirror(BattleState)` round-trip + field-swap + `encode_native` correctness (Phase 5, DW-5.6)
 - [ ] measured ms/turn for `mcts_puct` at its chosen `n_simulations`, checked against Phase 3's projection (Phase 5)
-- [ ] real 500-battle `mcts_puct` vs `ppo` and vs `mcts`, both at `--format gen9ou`, documented in
+- [x] real 500-battle `mcts_puct` vs `ppo` and vs `mcts`, both at `--format gen9ou`, documented in
       `notes/phase-4-m7-and-enhancement-track.md` with `CLAUDE.md` summary/link (Phase 6, DW-6.3)
 
 ## Assumptions
@@ -496,49 +493,61 @@ named in a Done-when item.
 
 ## Execution Log
 
-### Phase 5: M6b — PUCT search with PPO prior/value (Gate: Full)
-- [x] BUILD: Discovery + design + implementation complete (fable-tier). All 6 DW items
-      implemented; `ctest` 96/96 (76 baseline + 20 new), `pytest_native.sh` 191/3 skipped.
-      Core algorithm: mirror-based opponent priors, tera-label renormalization,
-      value-scale-mixing avoidance at `kForcedSwitch` nodes, `PolicyWeights` loaded once at
-      `MctsPuctPlayer` construction. DW-5.4 (critic sign convention) measured **-v**, mean
-      -0.0659237 / stddev 1.49e-08 over 30 synthetic mirrored pairs against the real checkpoint
-      — high confidence, not the ambiguous case the plan anticipated. DW-5.3 measured 501.9ms/
-      turn at n_simulations=200.
-- [ ] REVIEW: **1st FAIL** — see
-      `.code-foundations/build/2026-08-24-battle-engine-phase4-cpp-search-core-phase-5-review.md`.
-      The reviewer independently rebuilt, reran the full suite (matched exactly), and
-      **independently reproduced both DW-5.3's and DW-5.4's numbers** — the core PUCT algorithm
-      (value-scale-mixing avoidance, mirror mechanism, tera renormalization, weights-loaded-once)
-      was traced through the actual code and confirmed correct, not just claimed. The FAIL is
-      three narrower, real gaps:
-      1. DW-5.3: the ms/turn measurement is solid but nothing documents the required comparison
-         against Phase 3's DW-3.3 projection (6-9hr worst case) — needs a written comparison.
-      2. DW-5.6: the mirror round-trip/field-swap/weather-terrain sub-claims are tested and
-         pass, but the vector-parity sub-claim ("`encode_native(mirror(s))` matches `encode()`
-         of the real opponent-POV view on a fixture") is NOT tested — the actual test only
-         checks vector length; its own comment admits the real cross-check is out of scope.
-         This is the one gap worth real attention: it's the exact seam the plan's own EXPLORE
-         stage flagged as "the phase's highest-leverage unverified seam."
-      3. `MctsPuctPlayer` and `scripts/benchmark.py`'s new `mcts_puct` branch have zero test
-         coverage anywhere in `tests/`, despite the plan's Test Coverage Level naming
-         "player/integration wiring" as in scope.
-- [ ] Commit: NOT YET MADE — Full gate, blocked on REVIEW PASS.
+### Phase 6: Benchmark + inventory writeup (Gate: Minimal)
+- [x] BUILD: worked directly from the plan phase description (minimal gate, no discovery pass).
+      Before either 500-battle run, verification surfaced two more real hang triggers beyond
+      435f6a5's fainted-active fix — `force_switch` (pivot moves: U-turn/Volt Switch/Baton Pass)
+      and PP-exhausted moves offered as legal — fixed in `ac78712` (dedicated
+      `BattleState.my_force_switch` field, plus a general backstop: `MctsPlayer`/
+      `MctsPuctPlayer.choose_move` now cross-checks the search's chosen action against poke-env's
+      real `battle.available_moves`/`available_switches` before submitting, salvaging the
+      next-best real-legal action from the search's visit distribution otherwise). Verified via a
+      12-battle gen9ou timing slice that used to hang for over an hour, now completing cleanly and
+      repeatably (401.1s, 301.1s). One non-blocking loose end: an intermittent, non-fatal UBSan
+      report (addition-overflow in `<c++/v1/array>`) on one of the two verification runs, didn't
+      reproduce on the second, checked and judged unrelated to this fix — flagged for follow-up,
+      not a blocker.
+- [x] Both real 500-battle runs completed with zero hangs on the same Debug/ASan build:
+      DW-6.1 (`mcts_puct` vs `ppo`, gen9ou) 179-317-4, 35.8% [31.7%, 40.1%] — clear loss.
+      DW-6.2 (`mcts_puct` vs `mcts`, gen9ou) 302-193-5, 60.4% [56.0%, 64.6%] — clear win.
+      The PPO actor/critic prior genuinely helps the search over the hand-crafted eval, but the
+      extra search on top of the same actor/critic doesn't outperform running the policy alone.
+- [x] VERIFY: `./scripts/pytest_native.sh` 209 passed, 3 skipped (pre-existing, unrelated);
+      `ctest --test-dir cpp/build` 100/100 passed.
+- [x] Committed
+Commit: (pending — see below)
+Summary: Phase 6 done — the plan's final phase. Real 500-battle benchmarks for both remaining
+matchups, `notes/phase-4-m7-and-enhancement-track.md` written (full asset inventory, every phase's
+measured standing in one place), linked from `notes/index.md`, `CLAUDE.md`'s Phase 4 status
+trimmed to a summary line + link matching Phases 0-3. Plan complete.
 
-**NEXT STEP ON RESUME (per gate-failure-protocol.md, 1st FAIL of 3 allowed):** re-dispatch the
-Phase 5 BUILD agent (fable) with a `## Review Findings to Fix` block containing the review
-file's Issues section verbatim (the three items above), instructing it to add: (a) a written
-comparison of DW-5.3's measurement against Phase 3's projection, (b) a real fixture-based test
-for `encode_native(mirror(s))` vs. the true opponent-POV `encode()` output (construct a real
-opponent-POV `BattleView`/`BattleState` pair and diff the vectors directly, not just check
-length), (c) at least a basic `tests/test_mcts_player.py`-style test for `MctsPuctPlayer` and a
-CLI-wiring test for the `mcts_puct` benchmark branch. Then re-dispatch REVIEW. Working tree
-currently has real, uncommitted Phase 5 changes (do not discard):
-`cpp/include/be/mcts.hpp`, `cpp/src/mcts.cpp`, `cpp/include/be/action.hpp`,
-`cpp/src/action.cpp`, `cpp/include/be/battle_state.hpp`, `cpp/src/battle_state.cpp`,
-`cpp/bindings/module.cpp`, `battle_engine/mcts_player.py`, `scripts/benchmark.py`,
-`cpp/tests/test_action.cpp`, `cpp/tests/test_battle_state.cpp`, `cpp/tests/test_mcts.cpp`,
-plus the new discovery/review files under `.code-foundations/build/`.
+### Phase 5: M6b — PUCT search with PPO prior/value (Gate: Full)
+- [x] BUILD: Discovery + design + implementation complete (fable-tier), plus two fix-forward
+      passes (see below).
+- [x] REVIEW: **fail → fail → pass (3rd attempt)**. 1st FAIL (3 issues: unevidenced DW-5.3
+      comparison, untested DW-5.6 vector-parity claim, zero `MctsPuctPlayer`/`mcts_puct` CLI
+      coverage) — all fixed with new tests + a durable `notes/` record, independently
+      re-verified. 2nd FAIL (1 narrow doc gap: DW-5.4's plan-mandated fallback policy was never
+      written down, though the runtime already implemented it correctly) — fixed with one
+      doc-comment paragraph. 3rd attempt: PASS, all six DW items verified with execution
+      evidence — see
+      `.code-foundations/build/2026-08-24-battle-engine-phase4-cpp-search-core-phase-5-review-attempt3.md`.
+      Throughout all three attempts the core PUCT algorithm itself (value-scale-mixing avoidance,
+      mirror mechanism, tera renormalization, weights-loaded-once, the measured sign convention)
+      was independently traced and reproduced as correct — every FAIL was on evidence/coverage
+      gaps around already-correct logic, not on the logic itself.
+- [x] Committed
+Commit: 5979cb8
+Summary: M6b done — the phase's actual strength bet. PUCT search using the PPO actor as a
+per-node prior (via `encode_native`+forward pass, renormalized over legal `ActionId`s, tera
+labels dropped) and its critic as leaf value (measured `-v` sign convention, mean -0.0659237,
+stddev 1.49e-08). Opponent-side priors computed via a verified `mirror(BattleState)` (round-trips,
+every field swapped, vector-parity-matched against a real opponent-POV `encode()`).
+`kForcedSwitch` nodes use UCB1-only selection and continue expansion to a real decision state
+rather than mixing `default_eval`/critic value scales. Measured 501.9ms/turn at
+`n_simulations=200`; Phase 6's full sweep projects to ~2.1 hours (`notes/phase-5-mcts-puct-ms-
+per-turn-vs-phase-3-projection.md`), well inside the laptop-first overnight budget. Next: Phase 6
+— the real benchmarks and the `notes/` writeup the training-continuation decision is made from.
 
 ### Phase 4: M4b — Full BattleState extension + encode() port (Gate: Full)
 - [x] BUILD: Discovery + design + implementation complete (fable-tier).
