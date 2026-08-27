@@ -370,6 +370,121 @@ Metamon's docs), per this project's evidence-over-assumption rule:
   `battle_views_from_replay`, and `PokemonView.unknown()` alike - same
   explicit-gap convention this module already uses for opponent bench
   detail and hazard recency.
+
+Phase 3 (2026-08-26): weather/terrain-conditional move behavior - the
+subset of weather/terrain interactions that change whether a move is good
+RIGHT NOW, cross-referencing individual moves/abilities against the
+battle's actual current weather/terrain (already encoded at the side level
+via `_WEATHER_NAMES`/`_TERRAIN_NAMES`, per this phase's own scope, just not
+cross-referenced against anything before now). Every fact below was
+verified against the real local pokemon-showdown/data/moves.ts and
+data/abilities.ts checkout (poke-env's trimmed GenData strips the
+onModifyType/onBasePower/onTryMove/onModifySpe callback fields this needs,
+same reason Phase 2's semi-invulnerable-move verification needed the same
+checkout), not assumed from memory or poke-env's dex alone:
+
+- Weather Ball (`_WEATHER_BALL_TYPE_BY_WEATHER`): real dex entry
+  (`onModifyType`/`onModifyMove`) is Normal/50BP by default, switching to
+  Fire/Water/Rock/Ice and doubling base power under sun/rain/sand/snow
+  respectively (verified directly - poke-env's GenData entry only shows the
+  static Normal/50 fallback, confirming this needs a short hardcoded table,
+  same _HAZARD_REMOVAL_MOVES-style pattern). Computed in `_move_slot_vector`
+  (needs live weather, like effectiveness/STAB already need live defender
+  state) as an override of the move's effective type/power BEFORE the
+  existing type one-hot/STAB/effectiveness/base_power scalars are computed
+  from it - no new vector dimensions, this phase's weather table just
+  changes what those existing fields compute.
+- Solar Beam/Solar Blade (`_SUN_CHARGE_SKIP_MOVES`, the new
+  `MoveView.is_charge_move` static field, and the new `needs_charge_turn`
+  per-move-slot scalar): both moves' real `onTryMove` checks
+  `['sunnyday', 'desolateland'].includes(...)` and skips the charge turn
+  entirely - verified as the ONLY two charge moves with this check (grepped
+  every `desolateland` occurrence in moves.ts; the other hits are
+  Growth/Moonlight/Morning Sun/Synthesis, unrelated weather-scaled
+  effects, out of this phase's scope). `desolateland` (Primal Groudon's
+  harsh sunlight) doesn't exist in this project's real format pool, so only
+  `sunnyday` matters, matching the already-established `_WEATHER_NAMES`
+  vocabulary. `is_charge_move` is movedex-static (`flags.get("charge")`,
+  same boolean-flag-read pattern as is_contact/is_sound/etc.);
+  `needs_charge_turn` is the context-dependent scalar DW-3.1 asks for -
+  True for every charge move except when it's Solar Beam/Solar Blade AND
+  the current weather is sun.
+- Thunder/Hurricane/Blizzard (`_WEATHER_ACCURACY_OVERRIDES`): real dex
+  `accuracy` field is a flat 70 for all three (verified directly - no
+  declarative weather-conditional field exists) with the actual weather
+  logic in `onModifyMove`: Thunder/Hurricane always-hit in rain, 50% in
+  sun; Blizzard always-hits in hail/snow (gen 9 has no `hail`, only
+  `snowscape` - the existing `"snow"` weather token already covers this).
+  Applied as a direct override of the existing per-move accuracy scalar in
+  `_move_slot_vector`, not a new dimension - `MoveView.accuracy` itself
+  stays the static dex value, matching the "context-dependent numbers
+  computed at slot-vector time, not MoveView-construction time" convention
+  Phase 1 already established for effectiveness/STAB.
+- Terrain power boost (`_TERRAIN_BOOST_TYPE`, `_TERRAIN_POWER_MULTIPLIER`):
+  Electric/Grassy/Psychic Terrain each boost their own type's moves by
+  5325/4096 (~1.3x, the exact real chainModify fraction from moves.ts) for
+  a GROUNDED attacker - Misty Terrain deliberately excluded from this table
+  (verified: unlike the other three, its real condition block has no
+  onBasePower boost for Fairy-type moves at all, only a Dragon-type 0.5x
+  weakening against a grounded DEFENDER, a different mechanic out of this
+  phase's scope). Applied the same way as Weather Ball - modifies the
+  effective base_power feeding the existing scalar, using the (possibly
+  weather-ball-overridden) effective type, so the two stack coherently the
+  same way they would in a real damage calculation.
+- Terrain status immunity (`_terrain_sleep_immune`/`_terrain_status_immune`,
+  `_SLEEP_BLOCKING_TERRAINS`/`_STATUS_BLOCKING_TERRAINS`): verified against
+  each terrain's real condition block - Electric Terrain's `onSetStatus`
+  blocks sleep specifically (`status.id === 'slp'`) for a grounded, non-
+  semi-invulnerable target; Misty Terrain's `onSetStatus` blocks ANY status
+  unconditionally (no status-id check at all) plus confusion, for the same
+  grounded target. Encoded as two side-level booleans (per active Pokemon,
+  same tail placement as the ability-speed-boost boolean below) rather than
+  one collapsed flag, since Electric Terrain's real scope (sleep only) is a
+  strict subset of Misty Terrain's (all status) - collapsing them would
+  misrepresent Electric Terrain as blocking burn/poison/paralysis, which it
+  doesn't.
+- Ability weather/terrain speed-doubling (`_WEATHER_SPEED_ABILITIES`,
+  `_TERRAIN_SPEED_ABILITIES`): Swift Swim/Chlorophyll/Sand Rush/Slush Rush/
+  Surge Surfer's exact poke-env-normalized ability ids and their exact
+  matching weather/terrain verified directly against abilities.ts's
+  `onModifySpe` handlers (`raindance`/`sunnyday`/`sandstorm`/
+  `['hail','snowscape']`/`electricterrain` respectively) - no
+  groundedness requirement on any of the five (confirmed: none of their
+  onModifySpe handlers check isGrounded, unlike the terrain mechanics
+  above), so this is a pure ability+weather/terrain lookup, independent of
+  `_is_grounded`.
+
+Grounded-ness (`_is_grounded`, per this phase's own Edge Cases note):
+factored out of `_is_hazard_immune`'s inline Flying/Levitate check into its
+own function, now the shared implementation for both real call sites that
+need a groundedness predicate (`_type_multiplier`'s Air Balloon handling
+stays separate - it's a per-attack-type-immunity concern, not a
+groundedness predicate itself). Verified against the real
+`Pokemon.isGrounded` in pokemon-showdown/sim/pokemon.ts: Flying-type,
+Levitate, and Air Balloon (while held) all block groundedness; Iron
+Ball/Gravity/Magnet Rise/Ingrain/Smack Down force or restore it - all five
+of those remain deliberately unmodeled, same named-simplification
+convention as `_is_hazard_immune`'s own prior accounting (PokemonView
+tracks none of the underlying volatile/field state). A real, incidental
+behavior change from this factoring, not previously true: `_is_hazard_immune`
+now also reads an Air Balloon holder as hazard-immune (Air Balloon
+genuinely blocks groundedness in real Showdown, confirmed in the same
+isGrounded read - the prior version never checked for it at all, a real
+pre-existing gap this phase's reuse instruction happened to surface, not
+something introduced to change hazard behavior for its own sake). Defaults
+to grounded=True when types are unknown - the direction that keeps
+`_is_hazard_immune`'s already-anchored "unknown Pokemon must not read as
+hazard-immune" test passing unchanged: an information gap must never grant
+an unearned immunity, on either feature that now depends on this helper.
+
+New global (not per-Pokemon) scalars - `_ability_speed_doubled`,
+`_terrain_sleep_immune`, `_terrain_status_immune`, one pair each (my/opp
+active) - are inserted into `encode()`'s concatenation BEFORE
+`_active_matchup_score`, not after `my_active_hazard_immune`/
+`opp_active_hazard_immune`, specifically so those two already-anchored
+tail tests (`vec[-3]`/`vec[-2]`/`vec[-1]`) need no changes - same ordering
+discipline `PokemonView.protect_counter`'s "stays last" placement already
+established for the per-Pokemon block.
 """
 
 from __future__ import annotations
@@ -546,6 +661,60 @@ _SEMI_INVULNERABLE_CHARGE_MOVES = {
     "fly", "dig", "dive", "bounce", "phantomforce", "shadowforce",
 }
 
+# --- Phase 3: weather/terrain-conditional tables -----------------------------
+# See module docstring for the real pokemon-showdown/data/moves.ts and
+# data/abilities.ts reads each of these was verified against, not memory.
+
+# Weather Ball's real effective type/power under each weather - Normal/50BP
+# otherwise (the move's own static dex entry, used unmodified).
+_WEATHER_BALL_TYPE_BY_WEATHER: Dict[str, PokemonType] = {
+    "sunnyday": PokemonType.FIRE,
+    "raindance": PokemonType.WATER,
+    "sandstorm": PokemonType.ROCK,
+    "snow": PokemonType.ICE,
+}
+
+# The only two charge moves whose real onTryMove skips the charge turn in
+# sun (verified: every other desolateland/sunnyday-conditional moves.ts hit
+# is an unrelated weather-scaled healing move, see module docstring).
+_SUN_CHARGE_SKIP_MOVES = {"solarbeam", "solarblade"}
+
+# Real per-move weather-conditional accuracy override (the dex's own
+# `accuracy` field is a flat 70 for all three - see module docstring).
+_WEATHER_ACCURACY_OVERRIDES: Dict[str, Dict[str, float]] = {
+    "thunder": {"raindance": 1.0, "sunnyday": 0.5},
+    "hurricane": {"raindance": 1.0, "sunnyday": 0.5},
+    "blizzard": {"snow": 1.0},
+}
+
+# Electric/Grassy/Psychic Terrain boost their own type's moves for a
+# grounded attacker - Misty Terrain deliberately excluded (see module
+# docstring: it doesn't boost Fairy moves in the real game).
+_TERRAIN_BOOST_TYPE: Dict[str, PokemonType] = {
+    "electricterrain": PokemonType.ELECTRIC,
+    "grassyterrain": PokemonType.GRASS,
+    "psychicterrain": PokemonType.PSYCHIC,
+}
+_TERRAIN_POWER_MULTIPLIER = 5325 / 4096  # real chainModify fraction, ~1.3x
+
+# Electric Terrain blocks sleep only; Misty Terrain blocks any status -
+# real, differently-scoped mechanics, kept as separate tables/booleans
+# rather than collapsed into one (see module docstring).
+_SLEEP_BLOCKING_TERRAINS = {"electricterrain", "mistyterrain"}
+_STATUS_BLOCKING_TERRAINS = {"mistyterrain"}
+
+# Abilities that double Speed under a specific weather/terrain - exact
+# poke-env-normalized ids and exact matching condition verified directly
+# against abilities.ts's onModifySpe handlers (see module docstring). None
+# of the five require groundedness.
+_WEATHER_SPEED_ABILITIES: Dict[str, str] = {
+    "swiftswim": "raindance",
+    "chlorophyll": "sunnyday",
+    "sandrush": "sandstorm",
+    "slushrush": "snow",
+}
+_TERRAIN_SPEED_ABILITIES: Dict[str, str] = {"surgesurfer": "electricterrain"}
+
 # --- per-move-slot features (MoveView) --------------------------------------
 #
 # MAX_MOVES matches poke-env's/Metamon's own real cap (a Pokemon can't know
@@ -594,14 +763,15 @@ _ITEM_VOCAB = [
 _UNKNOWN_ITEM_TOKENS = {None, "", "noitem", "unknownitem", "unknown_item"}
 
 # Per-move-slot vector layout (see _move_slot_vector): type one-hot,
-# category one-hot, secondary-kind one-hot, plus 24 scalars (known, stab,
+# category one-hot, secondary-kind one-hot, plus 25 scalars (known, stab,
 # base_power, accuracy, priority, targets_opponent, type_effectiveness,
 # secondary_chance, self_boost_chance, self_boost_magnitude, fixed_damage,
 # multi_hit, is_contact, is_sound, is_punch, is_bite, is_pulse, is_bullet,
 # is_wind, is_protect_counter, bypasses_protect, recoil_fraction,
-# drain_fraction, is_self_ko - the last 4 are Phase 2's addition, see module
-# docstring).
-_MOVE_VEC_LEN = len(_ALL_TYPES) + len(_MOVE_CATEGORIES) + len(_SECONDARY_KINDS) + 24
+# drain_fraction, is_self_ko, needs_charge_turn - Phase 2 added the 4
+# scalars ending at is_self_ko, Phase 3 adds needs_charge_turn at the end
+# (see module docstring for both).
+_MOVE_VEC_LEN = len(_ALL_TYPES) + len(_MOVE_CATEGORIES) + len(_SECONDARY_KINDS) + 25
 
 _POKEMON_VEC_LEN = (
     1  # known
@@ -626,6 +796,7 @@ VECTOR_LEN = (
     + 2 * len(_HAZARD_TOKENS)  # hazards, both sides
     + len(_WEATHER_NAMES)
     + len(_TERRAIN_NAMES)
+    + 6  # Phase 3: my/opp_active_speed_doubled, terrain_sleep_immune, terrain_status_immune
     + 1  # active-vs-active type matchup score
     + 2  # my_active_hazard_immune, opp_active_hazard_immune
 )
@@ -745,6 +916,12 @@ class MoveView:
     recoil_fraction: float = 0.0
     drain_fraction: float = 0.0
     is_self_ko: bool = False
+    # Phase 3: movedex-static (flags.charge) - whether this move requires a
+    # charge turn at all. Combined with the CONTEXT-dependent current
+    # weather in _move_slot_vector to produce needs_charge_turn (see module
+    # docstring) - kept separate from that scalar since is_charge_move
+    # itself never changes, only whether the charge is currently skipped.
+    is_charge_move: bool = False
 
     @staticmethod
     def unknown() -> "MoveView":
@@ -823,6 +1000,7 @@ def _move_view(move_id: str) -> Optional[MoveView]:
         recoil_fraction=_fraction(entry.get("recoil")),
         drain_fraction=_fraction(entry.get("drain")),
         is_self_ko=bool(entry.get("selfdestruct")),
+        is_charge_move=bool(flags.get("charge")),
     )
 
 
@@ -1391,29 +1569,75 @@ def _move_slot_vector(
     defender_types: Tuple[PokemonType, ...],
     defender_ability: Optional[str],
     defender_item: Optional[str],
+    weather: Optional[str] = None,
+    terrain: Optional[str] = None,
+    user_grounded: bool = True,
 ) -> np.ndarray:
     """One move slot's full feature block: MoveView's static fields plus the
-    two battle-context-dependent numbers (type effectiveness against
-    `defender_types`/`defender_ability`/`defender_item`, and STAB against
-    `user_types`) - see module docstring for why those two live here and not
-    on MoveView itself. Both default to 0.0 for an unknown slot, a
-    not-opponent-directed move (Stealth Rock et al - see
-    _OPPONENT_DIRECTED_TARGETS), or a move with no resolvable type - the
-    accompanying `known`/`targets_opponent` flags tell a model whether that
-    0.0 means "computed and neutral-immune" or "not applicable," same
-    "don't let an information gap silently read as a real signal"
-    convention _is_hazard_immune's own docstring states explicitly.
+    battle-context-dependent numbers (type effectiveness against
+    `defender_types`/`defender_ability`/`defender_item`, STAB against
+    `user_types`, and - Phase 3 - the current `weather`/`terrain`'s effect on
+    this specific move) - see module docstring for why these live here and
+    not on MoveView itself. Effectiveness/STAB/base_power/accuracy default
+    to 0.0 for an unknown slot, a not-opponent-directed move (Stealth Rock
+    et al - see _OPPONENT_DIRECTED_TARGETS), or a move with no resolvable
+    type - the accompanying `known`/`targets_opponent` flags tell a model
+    whether that 0.0 means "computed and neutral-immune" or "not
+    applicable," same "don't let an information gap silently read as a real
+    signal" convention _is_hazard_immune's own docstring states explicitly.
+
+    `weather`/`terrain`/`user_grounded` default to "no weather/terrain,
+    grounded" so every pre-Phase-3 caller (including this module's own
+    tests) keeps working unchanged - a neutral default, not a real battle
+    fact assumption.
     """
     type_vec = np.zeros(len(_ALL_TYPES), dtype=np.float32)
     stab = 0.0
     effectiveness = 0.0
-    if move.known and move.type is not None:
-        type_vec[_ALL_TYPES.index(move.type)] = 1.0
-        stab = 1.0 if move.type in user_types else 0.0
-        if move.targets_opponent and defender_types:
-            effectiveness = _type_multiplier(
-                move.type, defender_types, defender_ability, defender_item
+    accuracy = move.accuracy
+    needs_charge_turn = 0.0
+    if move.known:
+        effective_type = move.type
+        effective_base_power = move.base_power
+
+        # Weather Ball: real type/power become weather-dependent (see
+        # module docstring) - override BEFORE the type one-hot/STAB/
+        # effectiveness/base_power scalars below are computed from it.
+        if move.move_id == "weatherball" and weather in _WEATHER_BALL_TYPE_BY_WEATHER:
+            effective_type = _WEATHER_BALL_TYPE_BY_WEATHER[weather]
+            effective_base_power *= 2
+
+        # Terrain power boost: applies to the (possibly weather-ball-
+        # overridden) effective type, for a grounded user - the two stack
+        # coherently the same way they would in a real damage calculation.
+        if (
+            terrain in _TERRAIN_BOOST_TYPE
+            and effective_type == _TERRAIN_BOOST_TYPE[terrain]
+            and user_grounded
+        ):
+            effective_base_power *= _TERRAIN_POWER_MULTIPLIER
+
+        # Thunder/Hurricane/Blizzard: real per-move weather-conditional
+        # accuracy override (see module docstring) - MoveView.accuracy
+        # itself stays the static dex value.
+        overrides = _WEATHER_ACCURACY_OVERRIDES.get(move.move_id)
+        if overrides is not None and weather in overrides:
+            accuracy = overrides[weather]
+
+        # Solar Beam/Solar Blade skip their charge turn in sun; every other
+        # charge move always needs one (see module docstring).
+        if move.is_charge_move:
+            needs_charge_turn = (
+                0.0 if (move.move_id in _SUN_CHARGE_SKIP_MOVES and weather == "sunnyday") else 1.0
             )
+
+        if effective_type is not None:
+            type_vec[_ALL_TYPES.index(effective_type)] = 1.0
+            stab = 1.0 if effective_type in user_types else 0.0
+            if move.targets_opponent and defender_types:
+                effectiveness = _type_multiplier(
+                    effective_type, defender_types, defender_ability, defender_item
+                )
     category_vec = _one_hot(move.category, _MOVE_CATEGORIES)
     secondary_kind_vec = _one_hot(move.secondary_kind, _SECONDARY_KINDS)
     priority_scaled = max(min(move.priority, _PRIORITY_SCALE), -_PRIORITY_SCALE) / _PRIORITY_SCALE
@@ -1421,8 +1645,8 @@ def _move_slot_vector(
         [
             1.0 if move.known else 0.0,
             stab,
-            move.base_power / _MAX_BASE_POWER_SCALE,
-            move.accuracy if move.known else 0.0,
+            effective_base_power / _MAX_BASE_POWER_SCALE if move.known else 0.0,
+            accuracy if move.known else 0.0,
             priority_scaled if move.known else 0.0,
             1.0 if move.targets_opponent else 0.0,
             effectiveness,
@@ -1443,6 +1667,7 @@ def _move_slot_vector(
             move.recoil_fraction,
             move.drain_fraction,
             1.0 if move.is_self_ko else 0.0,
+            needs_charge_turn,
         ],
         dtype=np.float32,
     )
@@ -1457,16 +1682,27 @@ def _move_slots_vector(
     defender_types: Tuple[PokemonType, ...],
     defender_ability: Optional[str],
     defender_item: Optional[str],
+    weather: Optional[str] = None,
+    terrain: Optional[str] = None,
+    user_grounded: bool = True,
 ) -> np.ndarray:
     return np.concatenate(
         [
-            _move_slot_vector(m, user_types, defender_types, defender_ability, defender_item)
+            _move_slot_vector(
+                m, user_types, defender_types, defender_ability, defender_item,
+                weather=weather, terrain=terrain, user_grounded=user_grounded,
+            )
             for m in move_slots
         ]
     )
 
 
-def _encode_pokemon(view: PokemonView, defender: PokemonView) -> np.ndarray:
+def _encode_pokemon(
+    view: PokemonView,
+    defender: PokemonView,
+    weather: Optional[str] = None,
+    terrain: Optional[str] = None,
+) -> np.ndarray:
     """defender is the Pokemon `view`'s own moves are scored against for
     per-move type effectiveness/STAB (see module docstring: this needs both
     mons' state, unlike the rest of a single Pokemon's block) - always the
@@ -1474,7 +1710,15 @@ def _encode_pokemon(view: PokemonView, defender: PokemonView) -> np.ndarray:
     active Pokemon for the opponent's active view (see encode()'s call
     sites) - the real defending target a switched-in move would actually
     face right now, not a hypothetical future matchup.
+
+    weather/terrain (Phase 3) are the battle's own current values, threaded
+    down to every one of `view`'s move slots - including bench slots, same
+    "hypothetical if this mon were on the field" projection the existing
+    per-move effectiveness/STAB already applies to a bench Pokemon's moves
+    (see module docstring). Both default to None so pre-Phase-3 callers
+    (including this module's own already-anchored tests) are unaffected.
     """
+    user_grounded = _is_grounded(view)
     return np.concatenate(
         [
             np.array([1.0 if view.known else 0.0], dtype=np.float32),
@@ -1487,7 +1731,8 @@ def _encode_pokemon(view: PokemonView, defender: PokemonView) -> np.ndarray:
             _item_vector(view.item),
             _move_summary_vector(view.moves),
             _move_slots_vector(
-                view.move_slots, view.types, defender.types, defender.ability, defender.item
+                view.move_slots, view.types, defender.types, defender.ability, defender.item,
+                weather=weather, terrain=terrain, user_grounded=user_grounded,
             ),
             # Phase 2 runtime state (preparing, semi_invulnerable,
             # must_recharge) - placed BEFORE protect_counter so
@@ -1580,6 +1825,70 @@ def _type_multiplier(
     return m1 * m2
 
 
+def _is_grounded(mon: PokemonView) -> bool:
+    """Whether mon is grounded - the real Showdown predicate that governs
+    both entry-hazard immunity (_is_hazard_immune below) and this phase's
+    terrain power-boost/status-immunity checks (see module docstring for
+    the factoring rationale: this used to be duplicated inline inside
+    _is_hazard_immune, this phase's own Edge Cases note asked for a shared
+    helper once a third call site appeared).
+
+    Verified against the real Pokemon.isGrounded in
+    pokemon-showdown/sim/pokemon.ts: Flying-type, Levitate, and Air Balloon
+    (while held) all block groundedness. Iron Ball/Gravity/Magnet
+    Rise/Ingrain/Smack Down (force or restore groundedness the other
+    direction) remain deliberately unmodeled - same named-simplification
+    convention as _is_hazard_immune's own accounting; PokemonView tracks
+    none of that volatile/field state.
+
+    Defaults to True (grounded) when types are unknown/empty - the
+    direction that keeps an information gap from ever granting an unearned
+    immunity on either downstream feature (_is_hazard_immune's own
+    already-anchored "unknown Pokemon must not read as hazard-immune" test
+    depends on this).
+    """
+    if not mon.types:
+        return True
+    if PokemonType.FLYING in mon.types:
+        return False
+    if mon.ability == "levitate":
+        return False
+    if mon.item == "airballoon":
+        return False
+    return True
+
+
+def _ability_speed_doubled(
+    mon: PokemonView, weather: Optional[str], terrain: Optional[str]
+) -> bool:
+    """Whether mon's known ability doubles its Speed under the battle's
+    current weather/terrain (Swift Swim/Chlorophyll/Sand Rush/Slush Rush +
+    weather, Surge Surfer + Electric Terrain) - see module docstring for
+    the exact abilities.ts onModifySpe verification. None of these five
+    require groundedness, unlike the terrain checks below.
+    """
+    ability = mon.ability or ""
+    if weather is not None and _WEATHER_SPEED_ABILITIES.get(ability) == weather:
+        return True
+    return terrain is not None and _TERRAIN_SPEED_ABILITIES.get(ability) == terrain
+
+
+def _terrain_sleep_immune(mon: PokemonView, terrain: Optional[str]) -> bool:
+    """Electric Terrain and Misty Terrain both block sleep for a grounded
+    Pokemon (see module docstring for the real onSetStatus verification).
+    """
+    return terrain in _SLEEP_BLOCKING_TERRAINS and _is_grounded(mon)
+
+
+def _terrain_status_immune(mon: PokemonView, terrain: Optional[str]) -> bool:
+    """Misty Terrain blocks ANY status (not just sleep) for a grounded
+    Pokemon - a strictly broader real mechanic than _terrain_sleep_immune,
+    kept as its own boolean rather than derived, since a caller may care
+    about either scope independently (see module docstring).
+    """
+    return terrain in _STATUS_BLOCKING_TERRAINS and _is_grounded(mon)
+
+
 def _is_hazard_immune(mon: PokemonView) -> bool:
     """Whether mon is immune to ground-based entry hazards (Spikes, Toxic
     Spikes, Sticky Web - and, via Heavy-Duty Boots specifically, Stealth
@@ -1618,14 +1927,28 @@ def _is_hazard_immune(mon: PokemonView) -> bool:
     this only guards the same team-preview-style edge case
     _active_matchup_score itself guards below) so an information gap never
     silently reads as a false immunity signal.
+
+    Phase 3 (2026-08-26): the inline Flying/Levitate check here was
+    factored out into the shared _is_grounded helper above (a third real
+    call site - this phase's own terrain power-boost/status-immunity
+    checks - appeared, matching this function's own docstring note above
+    about when a shared helper becomes worth it). _is_grounded additionally
+    checks Air Balloon, which this function's Flying/Levitate-only version
+    never did - a real, incidental correctness fix (Air Balloon genuinely
+    blocks groundedness in real Showdown, verified against sim/pokemon.ts's
+    isGrounded - see _is_grounded's own docstring), not a deliberate
+    hazard-behavior change made for its own sake. Verified this refactor
+    changes no existing test's result: heavydutyboots stays its own
+    additional-immunity check layered on top (Boots doesn't affect
+    groundedness itself, it's a separate hazard-specific exception), and
+    _is_grounded's own "unknown types -> True (grounded)" default means
+    `not _is_grounded(mon)` is False for an unknown Pokemon, same as this
+    function's prior direct `return False` - the "unknown must not read as
+    hazard-immune" contract is unchanged.
     """
     if mon.item == "heavydutyboots":
         return True
-    if not mon.types:
-        return False
-    if PokemonType.FLYING in mon.types:
-        return True
-    return mon.ability == "levitate"
+    return not _is_grounded(mon)
 
 
 def _active_matchup_score(view: BattleView) -> float:
@@ -1652,14 +1975,34 @@ def _active_matchup_score(view: BattleView) -> float:
 def encode(view: BattleView) -> np.ndarray:
     vec = np.concatenate(
         [
-            _encode_pokemon(view.my_active, defender=view.opp_active),
-            *[_encode_pokemon(p, defender=view.opp_active) for p in view.my_bench],
-            _encode_pokemon(view.opp_active, defender=view.my_active),
+            _encode_pokemon(view.my_active, defender=view.opp_active,
+                             weather=view.weather, terrain=view.terrain),
+            *[_encode_pokemon(p, defender=view.opp_active,
+                               weather=view.weather, terrain=view.terrain)
+              for p in view.my_bench],
+            _encode_pokemon(view.opp_active, defender=view.my_active,
+                             weather=view.weather, terrain=view.terrain),
             np.array([view.opp_remaining_fraction], dtype=np.float32),
             _hazard_vector(view.my_hazards),
             _hazard_vector(view.opp_hazards),
             _one_hot(view.weather, _WEATHER_NAMES),
             _one_hot(view.terrain, _TERRAIN_NAMES),
+            # Phase 3: global (not per-Pokemon) side-level booleans, mirroring
+            # my_active_hazard_immune/opp_active_hazard_immune's own tail
+            # placement - inserted BEFORE _active_matchup_score, not after
+            # the hazard-immunity pair, so those two already-anchored tests
+            # (vec[-3]/-2/-1) need no changes (see module docstring).
+            np.array(
+                [
+                    1.0 if _ability_speed_doubled(view.my_active, view.weather, view.terrain) else 0.0,
+                    1.0 if _ability_speed_doubled(view.opp_active, view.weather, view.terrain) else 0.0,
+                    1.0 if _terrain_sleep_immune(view.my_active, view.terrain) else 0.0,
+                    1.0 if _terrain_sleep_immune(view.opp_active, view.terrain) else 0.0,
+                    1.0 if _terrain_status_immune(view.my_active, view.terrain) else 0.0,
+                    1.0 if _terrain_status_immune(view.opp_active, view.terrain) else 0.0,
+                ],
+                dtype=np.float32,
+            ),
             np.array([_active_matchup_score(view)], dtype=np.float32),
             np.array(
                 [

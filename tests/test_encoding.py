@@ -849,10 +849,16 @@ _STAB_IDX = _SCALARS_OFFSET + 1
 _EFFECTIVENESS_IDX = _SCALARS_OFFSET + 6
 
 
-def _move_slot(move_id, user_types, defender_types, defending_ability=None, defending_item=None):
+def _move_slot(
+    move_id, user_types, defender_types, defending_ability=None, defending_item=None,
+    weather=None, terrain=None, user_grounded=True,
+):
     move = enc._move_view(move_id)
     assert move is not None, f"{move_id!r} not found in _MOVES_DEX - fix the test fixture"
-    return enc._move_slot_vector(move, user_types, defender_types, defending_ability, defending_item)
+    return enc._move_slot_vector(
+        move, user_types, defender_types, defending_ability, defending_item,
+        weather=weather, terrain=terrain, user_grounded=user_grounded,
+    )
 
 
 def test_DW_1_1_fighting_move_is_immune_against_pure_ghost_type():
@@ -985,8 +991,14 @@ def test_DW_1_4_vector_len_is_the_exact_expected_value():
     # bypasses_protect, recoil_fraction, drain_fraction, is_self_ko), plus
     # 3 new per-Pokemon-slot scalars (preparing, semi_invulnerable,
     # must_recharge) across all 7 Pokemon-slots - 1953 + 7*(4*4 + 3) = 2086.
-    assert enc._MOVE_VEC_LEN == 50
-    assert VECTOR_LEN == 2086
+    #
+    # Phase 3 (DW-3.3): _MOVE_VEC_LEN 50 -> 51 (1 new per-move scalar,
+    # needs_charge_turn), 7 Pokemon-slots * 4 moves * 1 = 28, plus 6 new
+    # GLOBAL (not per-Pokemon-slot) scalars - my/opp_active_speed_doubled,
+    # my/opp_terrain_sleep_immune, my/opp_terrain_status_immune - added once,
+    # not per-slot: 2086 + 7*4*1 + 6 = 2120.
+    assert enc._MOVE_VEC_LEN == 51
+    assert VECTOR_LEN == 2120
 
 
 def test_move_view_reads_secondary_effect_chance_and_kind():
@@ -1244,3 +1256,306 @@ def test_poke_env_semi_invulnerable_is_false_when_not_preparing_any_move():
     replay_view = battle_view_from_replay_state(state)
     known_ids = sorted(m.move_id for m in replay_view.my_active.move_slots if m.known)
     assert known_ids == sorted(["earthquake", "dragonclaw"])
+
+
+# --- Phase 3 (2026-08-26): weather/terrain-conditional move behavior -------
+#
+# The real diagnosed gap this phase exists to fix (see module docstring):
+# nothing in the vector cross-referenced individual moves/abilities against
+# the battle's actual current weather/terrain - Solar Beam always looked
+# like a charge move even in sun, Swift Swim's speed doubling was invisible,
+# etc. Every hardcoded table below was verified against the real local
+# pokemon-showdown/data/moves.ts and data/abilities.ts checkout (see module
+# docstring for the exact reads), not assumed.
+
+_NEEDS_CHARGE_TURN_IDX = _SCALARS_OFFSET + 24
+_ACCURACY_IDX = _SCALARS_OFFSET + 3
+_BASE_POWER_IDX = _SCALARS_OFFSET + 2
+
+
+def test_DW_3_1_solar_beam_skips_charge_turn_in_sun_not_otherwise():
+    dusclops = make_mon("dusclops")
+    sun_vec = _move_slot("solarbeam", (PokemonType.GRASS,), dusclops.types, weather="sunnyday")
+    no_weather_vec = _move_slot("solarbeam", (PokemonType.GRASS,), dusclops.types)
+    rain_vec = _move_slot("solarbeam", (PokemonType.GRASS,), dusclops.types, weather="raindance")
+
+    assert sun_vec[_NEEDS_CHARGE_TURN_IDX] == 0.0  # skips the charge turn in sun
+    assert no_weather_vec[_NEEDS_CHARGE_TURN_IDX] == 1.0
+    assert rain_vec[_NEEDS_CHARGE_TURN_IDX] == 1.0  # only sun exempts it, not every weather
+
+    # Solar Blade shares the exact same real onTryMove sun-skip logic.
+    solar_blade_sun = _move_slot("solarblade", (PokemonType.GRASS,), dusclops.types, weather="sunnyday")
+    assert solar_blade_sun[_NEEDS_CHARGE_TURN_IDX] == 0.0
+
+
+def test_needs_charge_turn_has_no_sun_exemption_for_other_charge_moves():
+    # Sky Attack is a real charge move but was never verified to skip in
+    # sun (see module docstring's desolateland grep) - it must always still
+    # need its charge turn, distinguishing it from Solar Beam/Solar Blade.
+    dusclops = make_mon("dusclops")
+    vec = _move_slot("skyattack", (PokemonType.FLYING,), dusclops.types, weather="sunnyday")
+    assert vec[_NEEDS_CHARGE_TURN_IDX] == 1.0
+
+
+def test_needs_charge_turn_is_zero_for_a_non_charge_move():
+    dusclops = make_mon("dusclops")
+    vec = _move_slot("tackle", (PokemonType.NORMAL,), dusclops.types, weather="sunnyday")
+    assert vec[_NEEDS_CHARGE_TURN_IDX] == 0.0
+
+
+def test_weather_ball_type_and_power_change_with_real_weather():
+    dusclops = make_mon("dusclops")
+    normal_idx = enc._ALL_TYPES.index(PokemonType.NORMAL)
+    fire_idx = enc._ALL_TYPES.index(PokemonType.FIRE)
+    water_idx = enc._ALL_TYPES.index(PokemonType.WATER)
+    rock_idx = enc._ALL_TYPES.index(PokemonType.ROCK)
+    ice_idx = enc._ALL_TYPES.index(PokemonType.ICE)
+
+    base_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types)
+    assert base_vec[normal_idx] == 1.0  # no weather - stays its real dex type, Normal
+    assert base_vec[_BASE_POWER_IDX] == pytest.approx(50 / enc._MAX_BASE_POWER_SCALE)
+
+    sun_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types, weather="sunnyday")
+    assert sun_vec[fire_idx] == 1.0 and sun_vec[normal_idx] == 0.0
+    assert sun_vec[_BASE_POWER_IDX] == pytest.approx(100 / enc._MAX_BASE_POWER_SCALE)  # doubled
+
+    rain_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types, weather="raindance")
+    assert rain_vec[water_idx] == 1.0
+    assert rain_vec[_BASE_POWER_IDX] == pytest.approx(100 / enc._MAX_BASE_POWER_SCALE)
+
+    sand_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types, weather="sandstorm")
+    assert sand_vec[rock_idx] == 1.0
+
+    snow_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types, weather="snow")
+    assert snow_vec[ice_idx] == 1.0
+
+
+def test_weather_ball_effectiveness_uses_its_weather_dependent_type_not_its_dex_type():
+    torkoal = make_mon("torkoal")  # pure Fire - resists Fire (0.5x), weak to Water (2x)
+    sun_vec = _move_slot("weatherball", (PokemonType.NORMAL,), torkoal.types, weather="sunnyday")
+    rain_vec = _move_slot("weatherball", (PokemonType.NORMAL,), torkoal.types, weather="raindance")
+    assert sun_vec[_EFFECTIVENESS_IDX] == pytest.approx(0.5)  # Fire vs Fire
+    assert rain_vec[_EFFECTIVENESS_IDX] == pytest.approx(2.0)  # Water vs Fire
+
+
+def test_thunder_and_hurricane_accuracy_change_with_weather():
+    dusclops = make_mon("dusclops")
+    for move_id, move_type in (("thunder", PokemonType.ELECTRIC), ("hurricane", PokemonType.FLYING)):
+        base_vec = _move_slot(move_id, (move_type,), dusclops.types)
+        rain_vec = _move_slot(move_id, (move_type,), dusclops.types, weather="raindance")
+        sun_vec = _move_slot(move_id, (move_type,), dusclops.types, weather="sunnyday")
+        assert base_vec[_ACCURACY_IDX] == pytest.approx(0.70), move_id
+        assert rain_vec[_ACCURACY_IDX] == pytest.approx(1.0), move_id  # always hits in rain
+        assert sun_vec[_ACCURACY_IDX] == pytest.approx(0.5), move_id  # halved in sun
+
+    # MoveView.accuracy itself stays the static dex value - the override is
+    # only applied at _move_slot_vector time (see module docstring).
+    assert enc._move_view("thunder").accuracy == pytest.approx(0.70)
+
+
+def test_blizzard_accuracy_is_perfect_in_snow_not_other_weather():
+    dusclops = make_mon("dusclops")
+    base_vec = _move_slot("blizzard", (PokemonType.ICE,), dusclops.types)
+    snow_vec = _move_slot("blizzard", (PokemonType.ICE,), dusclops.types, weather="snow")
+    sand_vec = _move_slot("blizzard", (PokemonType.ICE,), dusclops.types, weather="sandstorm")
+    assert base_vec[_ACCURACY_IDX] == pytest.approx(0.70)
+    assert snow_vec[_ACCURACY_IDX] == pytest.approx(1.0)
+    assert sand_vec[_ACCURACY_IDX] == pytest.approx(0.70)  # only snow, not every weather
+
+
+def test_terrain_power_boost_applies_only_to_a_grounded_matching_type_attacker():
+    dusclops = make_mon("dusclops")
+    boosted = _move_slot(
+        "thunderbolt", (PokemonType.ELECTRIC,), dusclops.types,
+        terrain="electricterrain", user_grounded=True,
+    )
+    airborne = _move_slot(
+        "thunderbolt", (PokemonType.ELECTRIC,), dusclops.types,
+        terrain="electricterrain", user_grounded=False,
+    )
+    no_terrain = _move_slot("thunderbolt", (PokemonType.ELECTRIC,), dusclops.types)
+
+    assert boosted[_BASE_POWER_IDX] == pytest.approx(
+        90 * enc._TERRAIN_POWER_MULTIPLIER / enc._MAX_BASE_POWER_SCALE
+    )
+    assert airborne[_BASE_POWER_IDX] == pytest.approx(90 / enc._MAX_BASE_POWER_SCALE)
+    assert no_terrain[_BASE_POWER_IDX] == pytest.approx(90 / enc._MAX_BASE_POWER_SCALE)
+
+
+def test_misty_terrain_does_not_boost_fairy_type_moves():
+    # Real mechanic verified against moves.ts (see module docstring): unlike
+    # Electric/Grassy/Psychic Terrain, Misty Terrain's condition block has
+    # no onBasePower boost for Fairy-type moves at all.
+    dusclops = make_mon("dusclops")
+    boosted_attempt = _move_slot(
+        "moonblast", (PokemonType.FAIRY,), dusclops.types,
+        terrain="mistyterrain", user_grounded=True,
+    )
+    no_terrain = _move_slot("moonblast", (PokemonType.FAIRY,), dusclops.types)
+    assert boosted_attempt[_BASE_POWER_IDX] == pytest.approx(no_terrain[_BASE_POWER_IDX])
+
+
+def test_terrain_sleep_immune_true_under_electric_or_misty_terrain_for_a_grounded_mon():
+    garchomp = make_mon("garchomp")  # Dragon/Ground - ordinarily grounded
+    view = battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active
+    assert enc._terrain_sleep_immune(view, "electricterrain") is True
+    assert enc._terrain_sleep_immune(view, "mistyterrain") is True
+    assert enc._terrain_sleep_immune(view, "grassyterrain") is False  # doesn't block sleep
+    assert enc._terrain_sleep_immune(view, None) is False
+
+
+def test_terrain_status_immune_true_only_under_misty_terrain():
+    garchomp = make_mon("garchomp")
+    view = battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active
+    assert enc._terrain_status_immune(view, "mistyterrain") is True
+    # Electric Terrain's real scope is sleep-only, not full status immunity.
+    assert enc._terrain_status_immune(view, "electricterrain") is False
+
+
+def test_terrain_status_immunity_requires_groundedness():
+    talonflame = make_mon("talonflame")  # Fire/Flying - not grounded
+    view = battle_view_from_poke_env(
+        _battle([talonflame], talonflame, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active
+    assert enc._terrain_sleep_immune(view, "electricterrain") is False
+    assert enc._terrain_status_immune(view, "mistyterrain") is False
+
+
+def test_DW_3_2_swift_swim_speed_doubling_flag_true_in_rain_false_otherwise():
+    kingdra = make_mon("kingdra")
+    kingdra.ability = "swiftswim"
+    opp = make_mon("dragapult")
+
+    rain_view = battle_view_from_poke_env(
+        _battle([kingdra], kingdra, [opp], opp, weather={Weather.RAINDANCE: 1})
+    )
+    no_weather_view = battle_view_from_poke_env(_battle([kingdra], kingdra, [opp], opp))
+
+    assert enc._ability_speed_doubled(
+        rain_view.my_active, rain_view.weather, rain_view.terrain
+    ) is True
+    assert enc._ability_speed_doubled(
+        no_weather_view.my_active, no_weather_view.weather, no_weather_view.terrain
+    ) is False
+
+    # Distinguishable in the ENCODED vector too - the new Phase 3 global
+    # tail block places my/opp_active_speed_doubled at [-9]/[-8] (matchup
+    # score stays [-3], hazard-immunity stays [-2]/[-1] - both already-
+    # anchored tests, unaffected - see module docstring).
+    rain_vec = encode(rain_view)
+    no_weather_vec = encode(no_weather_view)
+    assert rain_vec[-9] == 1.0
+    assert no_weather_vec[-9] == 0.0
+    assert rain_vec[-3] == no_weather_vec[-3]  # matchup score untouched by this feature
+
+
+def test_ability_speed_doubled_requires_the_exact_matching_weather_or_terrain():
+    kingdra = make_mon("kingdra")
+    kingdra.ability = "swiftswim"
+    sun_view = battle_view_from_poke_env(
+        _battle([kingdra], kingdra, [make_mon("dragapult")], make_mon("dragapult"),
+                weather={Weather.SUNNYDAY: 1})
+    )
+    assert enc._ability_speed_doubled(sun_view.my_active, sun_view.weather, sun_view.terrain) is False
+
+    raichu = make_mon("raichualola")  # Alolan Raichu - Surge Surfer is real for this form
+    raichu.ability = "surgesurfer"
+    terrain_view = battle_view_from_poke_env(
+        _battle([raichu], raichu, [make_mon("dragapult")], make_mon("dragapult"),
+                fields={Field.ELECTRIC_TERRAIN: 1})
+    )
+    assert enc._ability_speed_doubled(
+        terrain_view.my_active, terrain_view.weather, terrain_view.terrain
+    ) is True
+
+
+def test_is_grounded_flying_levitate_and_air_balloon_all_block_groundedness():
+    talonflame = make_mon("talonflame")  # Flying-type
+    assert enc._is_grounded(battle_view_from_poke_env(
+        _battle([talonflame], talonflame, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is False
+
+    bronzong = make_mon("bronzong")
+    bronzong.ability = "levitate"
+    assert enc._is_grounded(battle_view_from_poke_env(
+        _battle([bronzong], bronzong, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is False
+
+    garchomp = make_mon("garchomp")
+    garchomp.item = "airballoon"
+    assert enc._is_grounded(battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active) is False
+
+    # An ordinary grounded Pokemon reads True.
+    plain_garchomp = make_mon("garchomp")
+    assert enc._is_grounded(battle_view_from_poke_env(
+        _battle([plain_garchomp], plain_garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active) is True
+
+    # Unknown types default to True (grounded) - see _is_grounded's own
+    # docstring for why this direction matters for _is_hazard_immune below.
+    assert enc._is_grounded(PokemonView.unknown()) is True
+
+
+def test_air_balloon_holder_is_now_hazard_immune_via_the_shared_grounded_helper():
+    # A real, incidental correctness fix from factoring _is_grounded out of
+    # _is_hazard_immune (see both functions' docstrings): Air Balloon
+    # genuinely blocks groundedness in real Showdown (sim/pokemon.ts's
+    # isGrounded), previously unmodeled by _is_hazard_immune's old inline
+    # Flying/Levitate-only check.
+    garchomp = make_mon("garchomp")
+    garchomp.item = "airballoon"
+    view = battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    )
+    assert enc._is_hazard_immune(view.my_active) is True
+
+
+def test_is_hazard_immune_existing_behavior_is_unchanged_by_the_refactor():
+    # Every pre-Phase-3 _is_hazard_immune case must still hold exactly -
+    # re-asserted here directly against the refactored implementation
+    # (see _is_hazard_immune's own Phase 3 docstring note for the by-hand
+    # trace this test backs up).
+    talonflame = make_mon("talonflame")
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([talonflame], talonflame, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is True
+
+    bronzong = make_mon("bronzong")
+    bronzong.ability = "levitate"
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([bronzong], bronzong, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is True
+
+    garchomp_boots = make_mon("garchomp")
+    garchomp_boots.item = "heavydutyboots"
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([garchomp_boots], garchomp_boots, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active) is True
+
+    plain_garchomp = make_mon("garchomp")
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([plain_garchomp], plain_garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active) is False
+
+    assert enc._is_hazard_immune(PokemonView.unknown()) is False
+
+
+def test_weather_terrain_context_defaults_are_backward_compatible():
+    # Every pre-Phase-3 caller of _move_slot_vector/_move_slots_vector/
+    # _encode_pokemon (including this module's own Phase 1/2 tests, which
+    # never pass weather/terrain/user_grounded) must see identical output
+    # to an explicit "no weather, no terrain, grounded" call.
+    dusclops = make_mon("dusclops")
+    move = enc._move_view("solarbeam")
+    implicit = enc._move_slot_vector(move, (PokemonType.GRASS,), dusclops.types, None, None)
+    explicit = enc._move_slot_vector(
+        move, (PokemonType.GRASS,), dusclops.types, None, None,
+        weather=None, terrain=None, user_grounded=True,
+    )
+    assert np.array_equal(implicit, explicit)
