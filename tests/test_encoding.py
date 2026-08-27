@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
 from poke_env.battle.move import Move
 from poke_env.battle.pokemon_type import PokemonType
@@ -44,7 +45,7 @@ def _battle(
 def _replay_pokemon(
     name="garchomp", hp_pct=1.0, status="nostatus", types="dragon ground",
     boosts=None, base_stats=None, ability="unknownability", base_species=None,
-    item="unknownitem", moves=None,
+    item="unknownitem", moves=None, effect="noeffect",
 ):
     boosts = boosts or {}
     base_stats = base_stats or {
@@ -59,6 +60,7 @@ def _replay_pokemon(
         "ability": ability,
         "item": item,
         "moves": moves or [],
+        "effect": effect,
         **{f"{stat}_boost": boosts.get(stat, 0) for stat in
            ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")},
         **{f"base_{stat}": base_stats[stat] for stat in
@@ -84,7 +86,7 @@ def _replay_state(
     player_active, opponent_active, available_switches=None,
     opponents_remaining=6, player_conditions="noconditions",
     opponent_conditions="noconditions", weather="noweather", battle_field="nofield",
-    player_prev_move=None, opponent_prev_move=None,
+    player_prev_move=None, opponent_prev_move=None, can_tera=True,
 ):
     return {
         "player_active_pokemon": player_active,
@@ -97,6 +99,7 @@ def _replay_state(
         "battle_field": battle_field,
         "player_prev_move": player_prev_move or _replay_move(),
         "opponent_prev_move": opponent_prev_move or _replay_move(),
+        "can_tera": can_tera,
     }
 
 
@@ -997,8 +1000,17 @@ def test_DW_1_4_vector_len_is_the_exact_expected_value():
     # GLOBAL (not per-Pokemon-slot) scalars - my/opp_active_speed_doubled,
     # my/opp_terrain_sleep_immune, my/opp_terrain_status_immune - added once,
     # not per-slot: 2086 + 7*4*1 + 6 = 2120.
+    #
+    # Phase 4 (DW-4.3): _MOVE_VEC_LEN unchanged at 51 (no new per-move
+    # field this phase) - +4 new per-Pokemon-slot scalars (toxic_counter,
+    # has_leech_seed, has_substitute, is_confused) across all 7
+    # Pokemon-slots = +28, +1 new hazard token (safeguard) across both sides
+    # = +2, +6 new GLOBAL scalars (my/opp_spikes_layers,
+    # my/opp_toxic_spikes_layers, my/opp_used_tera) added once, not per-slot:
+    # 2120 + 7*4 + 2 + 6 = 2156.
     assert enc._MOVE_VEC_LEN == 51
-    assert VECTOR_LEN == 2120
+    assert len(enc._HAZARD_TOKENS) == 9
+    assert VECTOR_LEN == 2156
 
 
 def test_move_view_reads_secondary_effect_chance_and_kind():
@@ -1559,3 +1571,316 @@ def test_weather_terrain_context_defaults_are_backward_compatible():
         weather=None, terrain=None, user_grounded=True,
     )
     assert np.array_equal(implicit, explicit)
+
+
+# --- Phase 4 (2026-08-27): side-condition completeness, hazard stacking,
+# status severity, tera-used ---------------------------------------------
+#
+# The real gaps this phase closes (see module docstring): Safeguard was
+# absent from the hazard-token vocabulary, hazard stacking (Spikes/Toxic
+# Spikes layer count) was presence-only, badly-poisoned severity had no
+# magnitude, Leech Seed/Substitute/Confusion were invisible, and whether a
+# side had spent its one-time Tera resource wasn't encoded at all.
+#
+# Per-Pokemon-block tail indices (see _encode_pokemon's docstring - these
+# sit BEFORE the already-anchored preparing/semi_invulnerable/
+# must_recharge/protect_counter quartet at [-4]/[-3]/[-2]/[-1]), verified
+# directly against the real implementation, not just derived by hand:
+_TOXIC_COUNTER_IDX = -8
+_HAS_LEECH_SEED_IDX = -7
+_HAS_SUBSTITUTE_IDX = -6
+_IS_CONFUSED_IDX = -5
+
+# Full-vector (encode()) global tail indices - sit BEFORE the already-
+# anchored Phase 3 6-scalar block at [-9]..[-4], matchup score at [-3], and
+# hazard-immunity pair at [-2]/[-1] - also verified directly:
+_MY_SPIKES_LAYERS_IDX = -15
+_MY_TOXIC_SPIKES_LAYERS_IDX = -14
+_OPP_SPIKES_LAYERS_IDX = -13
+_OPP_TOXIC_SPIKES_LAYERS_IDX = -12
+_MY_USED_TERA_IDX = -11
+_OPP_USED_TERA_IDX = -10
+
+
+def test_safeguard_is_now_a_tracked_hazard_token():
+    # Real gap #1 (see module docstring): Safeguard was entirely absent
+    # from _HAZARD_TOKENS - folded in with identical shape to Reflect/Light
+    # Screen (turn-tracked, not stackable).
+    mine = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    live_view = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.SAFEGUARD: 3})
+    )
+    assert live_view.my_hazards == {"safeguard"}
+
+    mon = _replay_pokemon("garchomp")
+    opp_mon = _replay_pokemon("dragapult")
+    replay_view = battle_view_from_replay_state(
+        _replay_state(mon, opp_mon, player_conditions="safeguard")
+    )
+    assert replay_view.my_hazards == {"safeguard"}
+
+
+def test_DW_4_2_spikes_layer_count_encodes_the_real_stack_not_just_presence():
+    mine = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    one_layer = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.SPIKES: 1})
+    )
+    two_layer = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.SPIKES: 2})
+    )
+    assert one_layer.my_spikes_layers == 1
+    assert two_layer.my_spikes_layers == 2
+    # Presence alone (my_hazards) can't distinguish these - the whole point
+    # of this new field.
+    assert one_layer.my_hazards == two_layer.my_hazards == {"spikes"}
+
+    one_vec = encode(one_layer)
+    two_vec = encode(two_layer)
+    assert one_vec[_MY_SPIKES_LAYERS_IDX] == pytest.approx(1.0 / enc._SPIKES_MAX_LAYERS)
+    assert two_vec[_MY_SPIKES_LAYERS_IDX] == pytest.approx(2.0 / enc._SPIKES_MAX_LAYERS)
+    assert not np.array_equal(one_vec, two_vec)
+
+
+def test_toxic_spikes_and_opponent_side_hazard_layers_also_encode_the_real_stack():
+    mine = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    my_toxic_spikes = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.TOXIC_SPIKES: 2})
+    )
+    opp_spikes = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, opp_hazards={SideCondition.SPIKES: 1})
+    )
+    opp_toxic_spikes = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, opp_hazards={SideCondition.TOXIC_SPIKES: 1})
+    )
+    assert my_toxic_spikes.my_toxic_spikes_layers == 2
+    assert opp_spikes.opp_spikes_layers == 1
+    assert opp_toxic_spikes.opp_toxic_spikes_layers == 1
+
+    assert encode(my_toxic_spikes)[_MY_TOXIC_SPIKES_LAYERS_IDX] == pytest.approx(
+        2.0 / enc._TOXIC_SPIKES_MAX_LAYERS
+    )
+    assert encode(opp_spikes)[_OPP_SPIKES_LAYERS_IDX] == pytest.approx(1.0 / enc._SPIKES_MAX_LAYERS)
+    assert encode(opp_toxic_spikes)[_OPP_TOXIC_SPIKES_LAYERS_IDX] == pytest.approx(
+        1.0 / enc._TOXIC_SPIKES_MAX_LAYERS
+    )
+
+
+def test_hazard_stack_layers_clamp_beyond_the_real_showdown_cap():
+    mine = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    over_capped = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.SPIKES: 99})
+    )
+    assert encode(over_capped)[_MY_SPIKES_LAYERS_IDX] == pytest.approx(1.0)  # clamped, not > 1.0
+
+
+def test_DW_4_2_hazard_stack_layers_default_zero_on_replay_adapter_documented_gap():
+    # Structural gap (see module docstring): no "spikes2"/"spikes3"-style
+    # token exists anywhere in the real replay vocabulary - the field only
+    # ever holds the bare condition name, so this can't be reconstructed
+    # even with the whole turn sequence.
+    mon = _replay_pokemon("garchomp")
+    opp = _replay_pokemon("dragapult")
+    state = _replay_state(mon, opp, player_conditions="spikes", opponent_conditions="toxicspikes")
+
+    single_view = battle_view_from_replay_state(state)
+    multi_view = battle_views_from_replay([state])[0]
+
+    for view in (single_view, multi_view):
+        assert view.my_spikes_layers == 0
+        assert view.my_toxic_spikes_layers == 0
+        assert view.opp_spikes_layers == 0
+        assert view.opp_toxic_spikes_layers == 0
+
+
+def test_toxic_counter_is_read_from_the_live_adapter_only_while_badly_poisoned():
+    toxic = make_mon("garchomp", status=Status.TOX)
+    toxic._status_counter = 3
+    opp = make_mon("dragapult")
+    view = battle_view_from_poke_env(_battle([toxic], toxic, [opp], opp)).my_active
+    assert view.toxic_counter == 3
+
+    # Sanity: status_counter is dual-purpose (also tracks sleep turns) - a
+    # Pokemon with a DIFFERENT status must read 0 even if the underlying
+    # poke-env field happens to be nonzero, isolating that the TOX gate
+    # itself is doing the work, not just a pass-through.
+    paralyzed = make_mon("garchomp", status=Status.PAR)
+    paralyzed._status_counter = 3
+    par_view = battle_view_from_poke_env(_battle([paralyzed], paralyzed, [opp], opp)).my_active
+    assert par_view.toxic_counter == 0
+
+
+def test_toxic_counter_encodes_as_a_normalized_scalar_and_clamps():
+    view = PokemonView.unknown()
+    view.known = True  # unknown() zeroes toxic_counter too; only care about that field here
+    defender = PokemonView.unknown()
+
+    vec_at_0 = enc._encode_pokemon(replace(view, toxic_counter=0), defender)
+    vec_at_8 = enc._encode_pokemon(replace(view, toxic_counter=8), defender)
+    vec_at_999 = enc._encode_pokemon(replace(view, toxic_counter=999), defender)
+
+    assert vec_at_0[_TOXIC_COUNTER_IDX] == pytest.approx(0.0)
+    assert vec_at_8[_TOXIC_COUNTER_IDX] == pytest.approx(8.0 / enc._TOXIC_COUNTER_SCALE)
+    assert vec_at_999[_TOXIC_COUNTER_IDX] == pytest.approx(1.0)  # far beyond any real streak - must clamp
+
+
+def test_toxic_counter_defaults_zero_on_replay_adapter_documented_gap():
+    # No equivalent field exists anywhere in Metamon's per-state schema
+    # (only the current status token, no turn count) - see module docstring.
+    mon = _replay_pokemon("garchomp", status="tox")
+    state = _replay_state(mon, _replay_pokemon("dragapult"))
+    single_view = battle_view_from_replay_state(state)
+    multi_view = battle_views_from_replay([state])[0]
+    assert single_view.my_active.toxic_counter == 0
+    assert multi_view.my_active.toxic_counter == 0
+
+
+def test_DW_4_1_leech_seed_substitute_confusion_encode_on_live_adapter():
+    seeded = make_mon("garchomp")
+    seeded.effects[Effect.LEECH_SEED] = 0
+    substituted = make_mon("garchomp")
+    substituted.effects[Effect.SUBSTITUTE] = 0
+    confused = make_mon("garchomp")
+    confused.effects[Effect.CONFUSION] = 0
+    plain = make_mon("garchomp")
+    opp = make_mon("dragapult")
+
+    seeded_view = battle_view_from_poke_env(_battle([seeded], seeded, [opp], opp)).my_active
+    substituted_view = battle_view_from_poke_env(_battle([substituted], substituted, [opp], opp)).my_active
+    confused_view = battle_view_from_poke_env(_battle([confused], confused, [opp], opp)).my_active
+    plain_view = battle_view_from_poke_env(_battle([plain], plain, [opp], opp)).my_active
+
+    assert seeded_view.has_leech_seed is True
+    assert seeded_view.has_substitute is False
+    assert seeded_view.is_confused is False
+    assert substituted_view.has_substitute is True
+    assert confused_view.is_confused is True
+    assert plain_view.has_leech_seed is False
+    assert plain_view.has_substitute is False
+    assert plain_view.is_confused is False
+
+    # Distinguishable in the encoded per-Pokemon block, not just the view.
+    seeded_vec = enc._encode_pokemon(seeded_view, defender=plain_view)
+    assert seeded_vec[_HAS_LEECH_SEED_IDX] == 1.0
+    assert seeded_vec[_HAS_SUBSTITUTE_IDX] == 0.0
+    assert seeded_vec[_IS_CONFUSED_IDX] == 0.0
+
+    substituted_vec = enc._encode_pokemon(substituted_view, defender=plain_view)
+    assert substituted_vec[_HAS_SUBSTITUTE_IDX] == 1.0
+
+    confused_vec = enc._encode_pokemon(confused_view, defender=plain_view)
+    assert confused_vec[_IS_CONFUSED_IDX] == 1.0
+
+
+def test_DW_4_1_leech_seed_substitute_confusion_encode_on_replay_adapter():
+    seeded = _replay_pokemon("garchomp", effect="leechseed")
+    substituted = _replay_pokemon("dragapult", effect="substitute")
+    confused = _replay_pokemon("blissey", effect="confusion")
+    plain = _replay_pokemon("tinkaton", effect="noeffect")
+
+    seeded_view = battle_view_from_replay_state(_replay_state(seeded, plain)).my_active
+    substituted_view = battle_view_from_replay_state(_replay_state(substituted, plain)).my_active
+    confused_view = battle_view_from_replay_state(_replay_state(confused, plain)).my_active
+    plain_view = battle_view_from_replay_state(_replay_state(plain, plain)).my_active
+
+    assert seeded_view.has_leech_seed is True
+    assert seeded_view.has_substitute is False
+    assert substituted_view.has_substitute is True
+    assert confused_view.is_confused is True
+    assert plain_view.has_leech_seed is False
+    assert plain_view.has_substitute is False
+    assert plain_view.is_confused is False
+
+    seeded_vec = enc._encode_pokemon(seeded_view, defender=plain_view)
+    assert seeded_vec[_HAS_LEECH_SEED_IDX] == 1.0
+
+    # battle_views_from_replay (the multi-state adapter) must agree.
+    multi_view = battle_views_from_replay([_replay_state(seeded, plain)])[0].my_active
+    assert multi_view.has_leech_seed is True
+
+
+def test_fainted_teammate_leech_seed_substitute_confusion_flags_are_explicitly_cleared():
+    # A fainted teammate's last-seen snapshot may still show a stale
+    # "effect" from when it was alive - must NOT be trusted (see
+    # _replay_pokemon_view_fainted's docstring: these don't survive a faint
+    # any more than boosts do).
+    seeded_then_fainted = _replay_pokemon("zapdos", effect="leechseed")
+    states = [
+        _replay_state(
+            _replay_pokemon("garchomp"), _replay_pokemon("dragapult"),
+            available_switches=[seeded_then_fainted],
+        ),
+        # zapdos no longer appears anywhere (fainted) - reconstructed as a
+        # known-but-fainted bench slot.
+        _replay_state(_replay_pokemon("garchomp"), _replay_pokemon("dragapult")),
+    ]
+    views = battle_views_from_replay(states)
+    fainted_zapdos = next(p for p in views[1].my_bench if p.known)
+    assert fainted_zapdos.fainted is True
+    assert fainted_zapdos.has_leech_seed is False
+
+
+def test_DW_4_1_my_used_tera_encodes_correctly_on_both_adapters():
+    active = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    not_used = battle_view_from_poke_env(_battle([active], active, [opp], opp))
+    assert not_used.my_used_tera is False
+
+    tera_active = make_mon("garchomp")
+    tera_active._terastallized = True
+    used = battle_view_from_poke_env(_battle([tera_active], tera_active, [opp], opp))
+    assert used.my_used_tera is True
+
+    # Replay: can_tera is verified monotonic (see module docstring) - False
+    # means tera has already been used this battle, exact from one state.
+    mon = _replay_pokemon("garchomp")
+    replay_not_used = battle_view_from_replay_state(
+        _replay_state(mon, _replay_pokemon("dragapult"), can_tera=True)
+    )
+    replay_used = battle_view_from_replay_state(
+        _replay_state(mon, _replay_pokemon("dragapult"), can_tera=False)
+    )
+    assert replay_not_used.my_used_tera is False
+    assert replay_used.my_used_tera is True
+
+    # battle_views_from_replay (multi-state adapter) must agree.
+    multi_used = battle_views_from_replay(
+        [_replay_state(mon, _replay_pokemon("dragapult"), can_tera=False)]
+    )[0]
+    assert multi_used.my_used_tera is True
+
+    # Distinguishable in the encoded vector too.
+    assert encode(used)[_MY_USED_TERA_IDX] == 1.0
+    assert encode(not_used)[_MY_USED_TERA_IDX] == 0.0
+
+
+def test_DW_4_1_used_tera_checks_the_whole_team_not_just_the_active_mon():
+    active = make_mon("garchomp")  # currently active, NOT terastallized
+    benched_tera = make_mon("blissey")
+    benched_tera._terastallized = True  # terastallized earlier, now benched
+    opp = make_mon("dragapult")
+
+    view = battle_view_from_poke_env(_battle([active, benched_tera], active, [opp], opp))
+    assert view.my_used_tera is True  # a benched mon's past tera use still counts
+
+
+def test_DW_4_1_opp_used_tera_is_live_adapter_only_documented_gap():
+    mine = make_mon("garchomp")
+    opp_tera = make_mon("dragapult")
+    opp_tera._terastallized = True
+    live_view = battle_view_from_poke_env(_battle([mine], mine, [opp_tera], opp_tera))
+    assert live_view.opp_used_tera is True  # live-exact
+    assert encode(live_view)[_OPP_USED_TERA_IDX] == 1.0
+
+    mon = _replay_pokemon("garchomp")
+    opp_mon = _replay_pokemon("dragapult")
+    replay_state = _replay_state(mon, opp_mon, can_tera=True)
+    single_view = battle_view_from_replay_state(replay_state)
+    multi_view = battle_views_from_replay([replay_state])[0]
+    # Documented gap - always False, no opponent_can_tera field exists in
+    # the real replay schema (see module docstring).
+    assert single_view.opp_used_tera is False
+    assert multi_view.opp_used_tera is False

@@ -485,6 +485,94 @@ active) - are inserted into `encode()`'s concatenation BEFORE
 tail tests (`vec[-3]`/`vec[-2]`/`vec[-1]`) need no changes - same ordering
 discipline `PokemonView.protect_counter`'s "stays last" placement already
 established for the per-Pokemon block.
+
+Phase 4 (2026-08-27): side-condition completeness, hazard stacking, status
+severity, tera-used - the last phase of this rewrite that changes
+`VECTOR_LEN`. Every fact below was verified against real poke-env source
+(`inspect`-read, not memory) and a 30,000-replay real-data vocabulary scan
+before coding - see `.code-foundations/build/2026-08-26-battle-engine-
+encoding-rewrite-phase-4-discovery.md` for the full verification trail.
+
+- **Safeguard**: folded straight into the existing `_HAZARD_TOKENS`/
+  `_HAZARD_SIDE_CONDITIONS` mechanism (8 -> 9 tokens) - identical shape to
+  Reflect/Light Screen (turn-tracked, not in poke-env's own
+  `STACKABLE_CONDITIONS`), so both adapters get it for free with no new
+  code path. Confirmed real in the replay vocabulary (17 occurrences/30,000
+  replays) - rare but real.
+- **Hazard stack count** (`BattleView.my_spikes_layers`/
+  `my_toxic_spikes_layers`/`opp_spikes_layers`/`opp_toxic_spikes_layers`):
+  additive alongside the existing presence-based `my_hazards`/`opp_hazards`
+  sets, not a replacement. Live-exact via
+  `side_conditions.get(SideCondition.SPIKES, 0)` (poke-env's own
+  `STACKABLE_CONDITIONS` stores the real incrementing layer count there,
+  verified via `_side_start`'s source). Replay: **live-adapter-only**,
+  always 0 - the real replay vocabulary was scanned for a
+  `"spikes2"`/`"spikes3"`-style token and found none; the field
+  structurally only ever holds the bare condition name, not a count.
+  Normalized/clamped by the real Showdown stack caps (Spikes 3, Toxic
+  Spikes 2), same `min(x, scale) / scale` convention as
+  `_PROTECT_COUNTER_SCALE`.
+- **Toxic-counter severity** (`PokemonView.toxic_counter`): live-exact via
+  `mon.status_counter if mon.status == Status.TOX else 0` (poke-env's own
+  tracked value, correct for a benched Pokemon too - it resets to 0 on
+  switch-out on its own, no special-casing needed, same convention as
+  `protect_counter`). Replay: **live-adapter-only**, always 0 - the real
+  per-mon replay dict's field set has no turn-count equivalent (only a
+  current `status` token), and unlike `protect_counter` there's no cheap
+  "did this really happen" signal to hang a streak-style reconstruction
+  on, so none was attempted. Normalized/clamped against
+  `_TOXIC_COUNTER_SCALE` (16 - the real turn count at which badly-poisoned
+  damage itself stops growing, even though the raw counter can keep
+  climbing past it).
+- **Leech Seed/Substitute/Confusion** (`PokemonView.has_leech_seed`/
+  `has_substitute`/`is_confused`): both adapters compute these **exactly**,
+  no reconstruction needed. Live via `Effect.X in mon.effects`
+  (independently - deliberately NOT narrowed to "at most one," unlike the
+  hazards/terrain precedent below). Replay via `mon["effect"] ==
+  "leechseed"`/`"substitute"`/`"confusion"` (the field itself is
+  single-valued, so at most one is ever true on that side already).
+  A deliberate departure from the hazards/terrain "narrow live to match
+  replay" precedent: true three-way simultaneity is rare here (Leech Seed
+  can't even be applied to a Substitute-protected target), and there's no
+  local Metamon parser source to verify what it would report if more than
+  one were genuinely active - inventing an unverified tie-break rule to
+  force live-side narrowing would violate evidence-over-assumption harder
+  than leaving the live side with its real, richer information. False for
+  an off-field (bench/fainted/unknown) Pokemon on both adapters - poke-env
+  itself clears `effects` on switch-out (`Pokemon.switch_out`, verified via
+  source), matching real Showdown rules, and a fainted replay slot's stale
+  `"effect"` snapshot is explicitly overridden to False rather than trusted
+  (see `_replay_pokemon_view_fainted`).
+- **`used_tera`** (`BattleView.my_used_tera`/`opp_used_tera`, side-level
+  like weather/terrain): live-exact both sides via
+  `any(mon.is_terastallized for mon in battle.team.values())` /
+  `.opponent_team.values()` - whole team, not just the active mon (a mon
+  that terastallized then fainted or got switched out still counts).
+  Replay: `my_used_tera` is **exact** via `not state["can_tera"]`
+  (`can_tera` verified monotonic across a real replay - `True` until the
+  turn tera is used, `False` for every state after, never reverts - so a
+  single state is sufficient, no history needed). `opp_used_tera` is
+  **live-adapter-only**, always False on replay - no `opponent_can_tera`
+  field exists, and a type-divergence heuristic (comparing the opponent's
+  current `types` against first-seen) was considered and rejected: real
+  non-Tera mechanics (Soak, Trick-or-Treat, Forest's Curse, Reflect Type)
+  also change `types` mid-battle and would produce false positives, and a
+  same-type Tera would produce a false negative - simpler and more honest
+  to document the gap than ship an unverified heuristic.
+
+New per-Pokemon fields (`toxic_counter`, `has_leech_seed`, `has_substitute`,
+`is_confused`) are inserted into `_encode_pokemon`'s concatenation BEFORE
+the Phase 2 `[preparing, semi_invulnerable, must_recharge]` block, not just
+before `protect_counter` in isolation - `preparing` is the EARLIEST
+already-anchored tail scalar in that concatenation (`vec[-4]` per
+`test_DW_2_1`), so this ordering keeps `vec[-4]`/`vec[-3]`/`vec[-2]`/
+`vec[-1]` all unchanged. Likewise, the new global scalars (hazard-layer
+counts, `used_tera`) are inserted into `encode()`'s concatenation BEFORE
+the Phase 3 6-scalar block, not just before `_active_matchup_score` -
+`_ability_speed_doubled`'s pair is the earliest already-anchored tail
+scalar there (`vec[-9]` per `test_DW_3_2`), so `vec[-9]` through `vec[-1]`
+all stay unchanged too. Same ordering discipline this module has used at
+every prior phase.
 """
 
 from __future__ import annotations
@@ -494,6 +582,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from poke_env.battle.abstract_battle import AbstractBattle
+from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.pokemon_type import PokemonType
@@ -518,9 +607,14 @@ MAX_BENCH = 5
 # of this list was missing auroraveil/tailwind entirely, a real gap (not a
 # documented tradeoff) - they were silently invisible to the live adapter
 # too, since _poke_env_hazards only ever looked at the other 6.
+#
+# Phase 4 (2026-08-27) added a 9th: "safeguard" - verified real in a
+# 30,000-replay vocabulary scan (17 occurrences, rare but real) and
+# identical in shape to Reflect/Light Screen (turn-tracked, not in
+# poke-env's own STACKABLE_CONDITIONS) - see module docstring.
 _HAZARD_TOKENS = [
     "stealthrock", "spikes", "toxicspikes", "stickyweb",
-    "reflect", "lightscreen", "auroraveil", "tailwind",
+    "reflect", "lightscreen", "auroraveil", "tailwind", "safeguard",
 ]
 _HAZARD_SIDE_CONDITIONS: Dict[str, SideCondition] = {
     "stealthrock": SideCondition.STEALTH_ROCK,
@@ -531,7 +625,20 @@ _HAZARD_SIDE_CONDITIONS: Dict[str, SideCondition] = {
     "lightscreen": SideCondition.LIGHT_SCREEN,
     "auroraveil": SideCondition.AURORA_VEIL,
     "tailwind": SideCondition.TAILWIND,
+    "safeguard": SideCondition.SAFEGUARD,
 }
+
+# Real Showdown stack caps (Spikes: 3 layers, Toxic Spikes: 2) - used to
+# normalize/clamp BattleView.*_spikes_layers/*_toxic_spikes_layers, same
+# min(x, scale) / scale convention as _PROTECT_COUNTER_SCALE below.
+_SPIKES_MAX_LAYERS = 3.0
+_TOXIC_SPIKES_MAX_LAYERS = 2.0
+
+# Real badly-poisoned damage caps at 1/16 max HP by the 16th consecutive
+# turn - Pokemon.status_counter itself can keep incrementing past that, but
+# the damage stops growing, so 16 is the meaningful normalization/clamp
+# scale for PokemonView.toxic_counter (see module docstring).
+_TOXIC_COUNTER_SCALE = 16.0
 
 _WEATHER_NAMES = ["sandstorm", "raindance", "sunnyday", "snow"]
 _WEATHER_FROM_POKE_ENV: Dict[Weather, str] = {
@@ -787,15 +894,18 @@ _POKEMON_VEC_LEN = (
     + 1  # max_base_power (normalized)
     + len(_ALL_TYPES)  # move type coverage (distinct from the mon's own types above)
     + MAX_MOVES * _MOVE_VEC_LEN  # per-move-slot block (MoveView) - see module docstring
+    + 4  # Phase 4: toxic_counter, has_leech_seed, has_substitute, is_confused - see module docstring
     + 3  # Phase 2: preparing, semi_invulnerable, must_recharge - see module docstring
     + 1  # protect_counter (normalized) - stays LAST, see module docstring
 )
 VECTOR_LEN = (
     _POKEMON_VEC_LEN * (1 + MAX_BENCH + 1)  # my active, my bench, opponent active
     + 1  # opponent fraction remaining
-    + 2 * len(_HAZARD_TOKENS)  # hazards, both sides
+    + 2 * len(_HAZARD_TOKENS)  # hazards, both sides (9 tokens as of Phase 4 - includes safeguard)
     + len(_WEATHER_NAMES)
     + len(_TERRAIN_NAMES)
+    + 4  # Phase 4: my/opp_spikes_layers, my/opp_toxic_spikes_layers
+    + 2  # Phase 4: my/opp_used_tera
     + 6  # Phase 3: my/opp_active_speed_doubled, terrain_sleep_immune, terrain_status_immune
     + 1  # active-vs-active type matchup score
     + 2  # my_active_hazard_immune, opp_active_hazard_immune
@@ -1065,6 +1175,20 @@ class PokemonView:
     # no move-list cross-reference needed (unlike semi_invulnerable above).
     # Same live-adapter-only status as preparing/semi_invulnerable.
     must_recharge: bool = False
+    # Phase 4 (2026-08-27): real badly-poisoned severity - see module
+    # docstring for the live-exact/replay-gap accounting. 0 is correct for
+    # a non-toxic'd Pokemon, an off-field Pokemon, AND (always) the replay
+    # side - no equivalent field exists in Metamon's schema.
+    toxic_counter: int = 0
+    # Phase 4: Leech Seed/Substitute/Confusion - both adapters compute these
+    # EXACTLY, no reconstruction needed (see module docstring for why these
+    # three don't need the hazards/terrain-style "narrow live to match
+    # replay" precedent). False/False/False is correct for an off-field
+    # (bench/fainted/unknown) Pokemon on both adapters - poke-env itself
+    # clears these on switch-out, matching real Showdown rules.
+    has_leech_seed: bool = False
+    has_substitute: bool = False
+    is_confused: bool = False
     # How many consecutive turns this Pokemon has just used a protect-
     # counter move (Protect, Endure, ...) - see module docstring for why
     # this is a real feature, not a nice-to-have, and how each adapter
@@ -1095,6 +1219,10 @@ class PokemonView:
             preparing=False,
             semi_invulnerable=False,
             must_recharge=False,
+            toxic_counter=0,
+            has_leech_seed=False,
+            has_substitute=False,
+            is_confused=False,
             protect_counter=0,
         )
 
@@ -1109,6 +1237,22 @@ class BattleView:
     opp_hazards: set
     weather: Optional[str]
     terrain: Optional[str]
+    # Phase 4 (2026-08-27): real hazard STACK count (Spikes up to 3, Toxic
+    # Spikes up to 2) - additive alongside my_hazards/opp_hazards above, not
+    # a replacement (see module docstring). Live-exact; always 0 on the
+    # replay adapter (documented gap - the real replay schema structurally
+    # can't carry this, see module docstring).
+    my_spikes_layers: int = 0
+    my_toxic_spikes_layers: int = 0
+    opp_spikes_layers: int = 0
+    opp_toxic_spikes_layers: int = 0
+    # Phase 4: whether this side has used its one-time Tera resource at all
+    # this battle (whole team, not just the current active mon - see module
+    # docstring). Live-exact both sides. Replay: my_used_tera is exact
+    # (derived from can_tera); opp_used_tera is always False (documented
+    # live-adapter-only gap - no opponent_can_tera field exists).
+    my_used_tera: bool = False
+    opp_used_tera: bool = False
 
 
 def _pad_bench(bench: list) -> list:
@@ -1154,6 +1298,14 @@ def _poke_env_pokemon_view(mon: Optional[Pokemon]) -> PokemonView:
         preparing=mon.preparing,
         semi_invulnerable=_poke_env_semi_invulnerable(mon),
         must_recharge=mon.must_recharge,
+        # Phase 4: exact live reads (see module docstring) - status_counter
+        # is only meaningful while actually badly poisoned; Effect
+        # membership is checked independently per effect, not narrowed to
+        # "at most one" (see module docstring for why, unlike hazards).
+        toxic_counter=mon.status_counter if mon.status == Status.TOX else 0,
+        has_leech_seed=Effect.LEECH_SEED in mon.effects,
+        has_substitute=Effect.SUBSTITUTE in mon.effects,
+        is_confused=Effect.CONFUSION in mon.effects,
         protect_counter=mon.protect_counter,
     )
 
@@ -1255,6 +1407,16 @@ def battle_view_from_poke_env(battle: AbstractBattle) -> BattleView:
         opp_hazards=_poke_env_hazards(battle.opponent_side_conditions),
         weather=_poke_env_weather(battle.weather),
         terrain=_poke_env_terrain(battle.fields),
+        # Phase 4: exact live reads (see module docstring). STACKABLE_CONDITIONS
+        # (Spikes, Toxic Spikes) store the real layer count directly.
+        my_spikes_layers=battle.side_conditions.get(SideCondition.SPIKES, 0),
+        my_toxic_spikes_layers=battle.side_conditions.get(SideCondition.TOXIC_SPIKES, 0),
+        opp_spikes_layers=battle.opponent_side_conditions.get(SideCondition.SPIKES, 0),
+        opp_toxic_spikes_layers=battle.opponent_side_conditions.get(SideCondition.TOXIC_SPIKES, 0),
+        # Whole team, not just the active mon - a mon that terastallized
+        # then fainted/switched out still counts (see module docstring).
+        my_used_tera=any(mon.is_terastallized for mon in battle.team.values()),
+        opp_used_tera=any(mon.is_terastallized for mon in battle.opponent_team.values()),
     )
 
 
@@ -1283,6 +1445,15 @@ def _replay_item(mon: dict) -> Optional[str]:
     return None if mon["item"] in _UNKNOWN_ITEM_TOKENS else mon["item"]
 
 
+def _replay_effect_flags(mon: dict) -> Tuple[bool, bool, bool]:
+    """Phase 4: mon["effect"] is single-valued (verified against real replay
+    data - see module docstring), so at most one of these three is ever
+    true here already, unlike the live adapter's independent Effect checks.
+    """
+    effect = mon.get("effect")
+    return effect == "leechseed", effect == "substitute", effect == "confusion"
+
+
 def _replay_move_ids(mon: dict) -> list:
     # mon["moves"] entries are already Showdown id-form ("stealthrock", not
     # "Stealth Rock") - verified against a real downloaded replay - so each
@@ -1307,6 +1478,7 @@ def _replay_pokemon_view(mon: Optional[dict], protect_counter: int = 0) -> Pokem
     if status_token not in ("nostatus", "fnt"):
         status = Status[status_token.upper()]
     move_ids = _replay_move_ids(mon)
+    has_leech_seed, has_substitute, is_confused = _replay_effect_flags(mon)
     return PokemonView(
         known=True,
         hp_fraction=mon["hp_pct"],
@@ -1319,6 +1491,12 @@ def _replay_pokemon_view(mon: Optional[dict], protect_counter: int = 0) -> Pokem
         item=_replay_item(mon),
         moves=_move_summary_features(move_ids),
         move_slots=_move_views(move_ids),
+        # Phase 4: exact on this adapter (see module docstring) -
+        # toxic_counter stays 0 (documented live-adapter-only gap, no
+        # equivalent field exists in the replay schema).
+        has_leech_seed=has_leech_seed,
+        has_substitute=has_substitute,
+        is_confused=is_confused,
         protect_counter=protect_counter,
     )
 
@@ -1349,6 +1527,13 @@ def _replay_pokemon_view_fainted(mon: dict) -> PokemonView:
         item=_replay_item(mon),
         moves=_move_summary_features(move_ids),
         move_slots=_move_views(move_ids),
+        # Phase 4: explicitly False, NOT read from mon["effect"] - that
+        # field is a stale snapshot from when this mon was last seen alive,
+        # and Leech Seed/Substitute/Confusion don't survive a faint any more
+        # than boosts do (see module docstring).
+        has_leech_seed=False,
+        has_substitute=False,
+        is_confused=False,
     )
 
 
@@ -1451,6 +1636,12 @@ def battle_view_from_replay_state(state: dict) -> BattleView:
         opp_hazards=_replay_hazards(state["opponent_conditions"]),
         weather=_replay_weather(state["weather"]),
         terrain=_replay_terrain(state["battle_field"]),
+        # Phase 4: my_used_tera is exact from a single state (can_tera is
+        # verified monotonic - see module docstring); opp_used_tera stays
+        # the documented-False default (live-adapter-only, no
+        # opponent_can_tera field exists). Hazard-stack-layer fields also
+        # stay their documented-0 defaults - no equivalent in this schema.
+        my_used_tera=not state["can_tera"],
     )
 
 
@@ -1502,6 +1693,10 @@ def battle_views_from_replay(states: list) -> list:
             opp_hazards=_replay_hazards(state["opponent_conditions"]),
             weather=_replay_weather(state["weather"]),
             terrain=_replay_terrain(state["battle_field"]),
+            # Phase 4: same exact/documented-gap accounting as
+            # battle_view_from_replay_state (see module docstring) - a
+            # single state is sufficient for my_used_tera, no history needed.
+            my_used_tera=not state["can_tera"],
         ))
     return views
 
@@ -1733,6 +1928,20 @@ def _encode_pokemon(
             _move_slots_vector(
                 view.move_slots, view.types, defender.types, defender.ability, defender.item,
                 weather=weather, terrain=terrain, user_grounded=user_grounded,
+            ),
+            # Phase 4: toxic_counter, has_leech_seed, has_substitute,
+            # is_confused - placed BEFORE the Phase 2 runtime-state block
+            # below (preparing is the earliest already-anchored tail scalar
+            # in this concatenation, vec[-4] - see module docstring) so
+            # vec[-4]/-3/-2/-1 stay unchanged.
+            np.array(
+                [
+                    min(view.toxic_counter, _TOXIC_COUNTER_SCALE) / _TOXIC_COUNTER_SCALE,
+                    1.0 if view.has_leech_seed else 0.0,
+                    1.0 if view.has_substitute else 0.0,
+                    1.0 if view.is_confused else 0.0,
+                ],
+                dtype=np.float32,
             ),
             # Phase 2 runtime state (preparing, semi_invulnerable,
             # must_recharge) - placed BEFORE protect_counter so
@@ -1987,6 +2196,23 @@ def encode(view: BattleView) -> np.ndarray:
             _hazard_vector(view.opp_hazards),
             _one_hot(view.weather, _WEATHER_NAMES),
             _one_hot(view.terrain, _TERRAIN_NAMES),
+            # Phase 4: global (not per-Pokemon) hazard-stack-layer counts and
+            # used_tera booleans - inserted BEFORE the Phase 3 6-scalar block
+            # below, not just before _active_matchup_score in isolation -
+            # _ability_speed_doubled's pair is the earliest already-anchored
+            # tail scalar in this concatenation (vec[-9] - see module
+            # docstring), so this keeps vec[-9] through vec[-1] unchanged.
+            np.array(
+                [
+                    min(view.my_spikes_layers, _SPIKES_MAX_LAYERS) / _SPIKES_MAX_LAYERS,
+                    min(view.my_toxic_spikes_layers, _TOXIC_SPIKES_MAX_LAYERS) / _TOXIC_SPIKES_MAX_LAYERS,
+                    min(view.opp_spikes_layers, _SPIKES_MAX_LAYERS) / _SPIKES_MAX_LAYERS,
+                    min(view.opp_toxic_spikes_layers, _TOXIC_SPIKES_MAX_LAYERS) / _TOXIC_SPIKES_MAX_LAYERS,
+                    1.0 if view.my_used_tera else 0.0,
+                    1.0 if view.opp_used_tera else 0.0,
+                ],
+                dtype=np.float32,
+            ),
             # Phase 3: global (not per-Pokemon) side-level booleans, mirroring
             # my_active_hazard_immune/opp_active_hazard_immune's own tail
             # placement - inserted BEFORE _active_matchup_score, not after
