@@ -273,6 +273,103 @@ no currently-passing test exercises Ring Target/Air Balloon there, so this
 changes no existing test's result, and leaving the older call site on a
 stale, less-correct version of the same shared function while the new one
 uses the fixed version would be an inconsistency with no upside.
+
+Phase 2: `MoveView` gains four more movedex-static fields (`bypasses_protect`,
+`recoil_fraction`, `drain_fraction`, `is_self_ko`), and `PokemonView` gains
+three runtime-state fields (`preparing`, `semi_invulnerable`,
+`must_recharge`) - the move-mechanical properties that change whether using
+a move right now is a good idea, beyond raw damage/type effectiveness (the
+same axis Phase 1's per-move type-effectiveness gap was on, just a
+different failure mode - a Pokemon dodging behind Fly/Dig invulnerability,
+or one that's about to be stuck recharging, is exactly as invisible to a
+2026-08-26-diagnosed model as an immune move target was).
+
+Each new `MoveView` field was verified against `GenData.from_gen(9).moves`
+before coding, not assumed:
+- `bypasses_protect = not bool(entry["flags"].get("protect"))` - Feint's
+  real flags dict (`{'failcopycat': 1, 'mirror': 1, 'noassist': 1}`) lacks
+  the `protect` key entirely; Tackle's has it. A self/side-targeted move
+  (Agility, Baton Pass, ...) also lacks the key - correctly reads as
+  bypasses_protect=True too (Protect genuinely can't block a move that
+  never targets the opponent), not a bug, same "real static signal even for
+  a non-opponent-directed move" tier as `is_contact` etc.
+- `recoil_fraction`/`drain_fraction`: real dex shape confirmed as
+  `[numerator, denominator]` - `flareblitz.recoil == [33, 100]`,
+  `gigadrain.drain == [1, 2]`, `tackle` has both `None`. Stored as
+  `num/denom`, already a natural ~0..1 fraction, no extra scaling needed.
+- `is_self_ko`: the plan flagged this as possibly needing a hardcoded list
+  (same pattern as `_HAZARD_REMOVAL_MOVES`) - it doesn't. Real dex entries
+  carry a declarative `selfdestruct` field (`"always"` for
+  Explosion/Self-Destruct, `"ifHit"` for Memento/Final Gambit/Healing
+  Wish/Lunar Dance), verified directly - `is_self_ko =
+  bool(entry.get("selfdestruct"))`.
+
+Semi-invulnerable-vs-merely-charging classification, verified against the
+real local `pokemon-showdown/data/moves.ts` checkout (not poke-env's
+trimmed `GenData`, which strips the `condition`/`onTryMove`
+simulator-logic fields this needs): Fly/Dig/Dive/Bounce/Phantom
+Force/Shadow Force each carry a `condition: { duration: 2,
+onInvulnerability: ... }` block; Solar Beam/Sky Attack/Skull Bash/Freeze
+Shock/Ice Burn/Meteor Beam/Electro Shot/Geomancy/Razor Wind carry no
+`condition` key at all. Phantom Force/Shadow Force's `onInvulnerability:
+false` is a literal boolean, not a callback like the other four's (which
+have named exceptions - Earthquake still hits Dig, Surf still hits Dive,
+Gust/Twister/Thunder/Hurricane/Smack Down/Thousand Arrows still hit
+Fly/Bounce) - traced `sim/battle.ts`'s `runEvent`: a non-function handler
+value is used as the event's return value directly (`else { returnVal =
+handler.callback; }`), so `onInvulnerability: false` unconditionally
+returns `false` (invulnerable, no exceptions) against every incoming move -
+confirming Phantom Force/Shadow Force genuinely are semi-invulnerable, in
+fact stricter than the other four. Confirms the plan's exact six-move list
+with no exceptions found; hardcoded as `_SEMI_INVULNERABLE_CHARGE_MOVES`,
+same short-verified-list pattern as `_HAZARD_REMOVAL_MOVES`/
+`_ONHIT_SETUP_MOVES`.
+
+`PokemonView.preparing`/`semi_invulnerable`/`must_recharge` are runtime
+state, not movedex-static, so they live on `PokemonView` (not `MoveView`)
+per this phase's own scope. Placed in `_encode_pokemon`'s concatenation
+BEFORE `protect_counter`, not after, specifically so `protect_counter`
+stays the LAST field of a Pokemon's block -
+`test_protect_counter_encodes_as_a_normalized_scalar_and_clamps` asserts
+`vec[-1]` directly (a documented layout contract from Phase 0, not
+incidental), and this ordering choice means that already-passing test
+needs no changes. Live adapter reads `mon.preparing` (poke-env's own public
+property, already correctly `bool(preparing_target) or
+bool(preparing_move)` - used directly rather than hand-rolling the same OR
+from the two private-backed properties), `mon.preparing_move.id in
+_SEMI_INVULNERABLE_CHARGE_MOVES` (guarded on `preparing_move is not None`),
+`mon.must_recharge` directly - all three exact, no reconstruction needed,
+unlike `protect_counter`.
+
+Replay-adapter parity was an open plan uncertainty - resolved, not left
+open. Checked a real downloaded replay sample directly (not assumed from
+Metamon's docs), per this project's evidence-over-assumption rule:
+- No top-level replay-state field resembles `preparing_move`/
+  `must_recharge` (the real field set is `available_switches,
+  battle_field, battle_lost, battle_won, can_tera, forced_switch, format,
+  opponent_active_pokemon, opponent_conditions, opponent_prev_move,
+  opponent_teampreview, opponents_remaining, player_active_pokemon,
+  player_conditions, player_prev_move, weather`).
+- Each side's `*_active_pokemon` dict does carry an `effect` field
+  (single-valued, same single-valued-masking convention as the existing
+  hazards/terrain fields) - its full vocabulary was scanned across a
+  400-replay/~20,000-sample pass (real volatile statuses like
+  `quarkdrivespe`/`protect`/`fallen`/`saltcure`/`substitute`, nothing
+  charge/invulnerability/recharge-shaped) and again across 3,000 replays
+  hunting specifically for `recharge`/`fly`/`dig`/`dive`/`bounce`/
+  `shadowforce`/`phantomforce`/`solarbeam`/`twoturn`/`invuln`/etc.
+  substrings - zero matches either time.
+- Went one step further than a vocabulary scan: found real replay states
+  where `player_prev_move`/`opponent_prev_move` shows a genuine charge-move
+  use (`meteorbeam`, `phantomforce`, `dig`) and inspected `effect` on that
+  exact state and the following one - `noeffect` in every case. The gap
+  isn't "rare enough to miss in a sample," it's structural: Metamon's
+  replay schema does not track this mechanic at all.
+- Documented as a live-adapter-only feature, defaulting to
+  `False`/`False`/`False` on `battle_view_from_replay_state`,
+  `battle_views_from_replay`, and `PokemonView.unknown()` alike - same
+  explicit-gap convention this module already uses for opponent bench
+  detail and hazard recency.
 """
 
 from __future__ import annotations
@@ -430,6 +527,25 @@ _HAZARD_REMOVAL_MOVES = {"rapidspin", "defog", "courtchange", "tidyup", "mortals
 _ONHIT_SETUP_MOVES = {"bellydrum", "acupressure"}
 _MAX_BASE_POWER_SCALE = 250.0  # Explosion/Self-Destruct-class outliers, a loose ceiling
 
+# Phase 2: charge moves that ALSO grant semi-invulnerability during their
+# charge turn, distinct from a charge move that merely skips an action
+# (Solar Beam et al) - Showdown has no data-level flag for this split (it's
+# simulator condition/onInvulnerability logic, not declared data), so this
+# is a short, verified hardcoded list, same pattern as _HAZARD_REMOVAL_MOVES/
+# _ONHIT_SETUP_MOVES. Verified against the real local pokemon-showdown/
+# data/moves.ts checkout (poke-env's own GenData strips the condition/
+# onTryMove fields this needs): all six carry a real
+# `condition: { onInvulnerability: ... }` block; every other charge move
+# (Solar Beam, Sky Attack, Skull Bash, Freeze Shock, Ice Burn, Meteor Beam,
+# Electro Shot, Geomancy, Razor Wind) carries no `condition` key at all -
+# see module docstring for the full verification, including tracing
+# Phantom Force/Shadow Force's literal `onInvulnerability: false` through
+# sim/battle.ts's runEvent to confirm it means "always invulnerable, no
+# exceptions" rather than "not invulnerable."
+_SEMI_INVULNERABLE_CHARGE_MOVES = {
+    "fly", "dig", "dive", "bounce", "phantomforce", "shadowforce",
+}
+
 # --- per-move-slot features (MoveView) --------------------------------------
 #
 # MAX_MOVES matches poke-env's/Metamon's own real cap (a Pokemon can't know
@@ -478,12 +594,14 @@ _ITEM_VOCAB = [
 _UNKNOWN_ITEM_TOKENS = {None, "", "noitem", "unknownitem", "unknown_item"}
 
 # Per-move-slot vector layout (see _move_slot_vector): type one-hot,
-# category one-hot, secondary-kind one-hot, plus 20 scalars (known, stab,
+# category one-hot, secondary-kind one-hot, plus 24 scalars (known, stab,
 # base_power, accuracy, priority, targets_opponent, type_effectiveness,
 # secondary_chance, self_boost_chance, self_boost_magnitude, fixed_damage,
 # multi_hit, is_contact, is_sound, is_punch, is_bite, is_pulse, is_bullet,
-# is_wind, is_protect_counter).
-_MOVE_VEC_LEN = len(_ALL_TYPES) + len(_MOVE_CATEGORIES) + len(_SECONDARY_KINDS) + 20
+# is_wind, is_protect_counter, bypasses_protect, recoil_fraction,
+# drain_fraction, is_self_ko - the last 4 are Phase 2's addition, see module
+# docstring).
+_MOVE_VEC_LEN = len(_ALL_TYPES) + len(_MOVE_CATEGORIES) + len(_SECONDARY_KINDS) + 24
 
 _POKEMON_VEC_LEN = (
     1  # known
@@ -499,7 +617,8 @@ _POKEMON_VEC_LEN = (
     + 1  # max_base_power (normalized)
     + len(_ALL_TYPES)  # move type coverage (distinct from the mon's own types above)
     + MAX_MOVES * _MOVE_VEC_LEN  # per-move-slot block (MoveView) - see module docstring
-    + 1  # protect_counter (normalized)
+    + 3  # Phase 2: preparing, semi_invulnerable, must_recharge - see module docstring
+    + 1  # protect_counter (normalized) - stays LAST, see module docstring
 )
 VECTOR_LEN = (
     _POKEMON_VEC_LEN * (1 + MAX_BENCH + 1)  # my active, my bench, opponent active
@@ -590,6 +709,15 @@ class MoveView:
     `secondary.self.boosts` (Steel Wing/Ancient Power/Flame Charge - rarer,
     deliberately out of scope, same "not attempted, revisit if it matters"
     standard as this module's other named simplifications).
+
+    Phase 2 additions - bypasses_protect, recoil_fraction, drain_fraction,
+    is_self_ko - are also movedex-static (see module docstring for the real
+    dex fields each reads and how each was verified). The charge/semi-
+    invulnerable/recharge signals from the same phase are deliberately NOT
+    here - they're per-Pokemon RUNTIME state (which move a mon is currently
+    mid-charge on, if any), not a property of a move's dex entry, so they
+    live on PokemonView instead (see PokemonView.preparing/
+    semi_invulnerable/must_recharge).
     """
     move_id: str
     known: bool = True
@@ -613,6 +741,10 @@ class MoveView:
     is_bullet: bool = False
     is_wind: bool = False
     is_protect_counter: bool = False
+    bypasses_protect: bool = False
+    recoil_fraction: float = 0.0
+    drain_fraction: float = 0.0
+    is_self_ko: bool = False
 
     @staticmethod
     def unknown() -> "MoveView":
@@ -643,6 +775,16 @@ def _self_boost(entry: dict) -> Tuple[float, float]:
         return 0.0, 0.0
     values = list(self_effect["boosts"].values())
     return 1.0, (sum(values) / len(values)) / 6.0  # unconditional on hit -> chance 1.0
+
+
+def _fraction(pair: Optional[Sequence[int]]) -> float:
+    # Real dex shape verified against flareblitz.recoil == [33, 100] and
+    # gigadrain.drain == [1, 2] (see module docstring) - [numerator,
+    # denominator], None when the move has no such effect.
+    if not pair:
+        return 0.0
+    numerator, denominator = pair
+    return numerator / denominator
 
 
 def _move_view(move_id: str) -> Optional[MoveView]:
@@ -677,6 +819,10 @@ def _move_view(move_id: str) -> Optional[MoveView]:
         is_bullet=bool(flags.get("bullet")),
         is_wind=bool(flags.get("wind")),
         is_protect_counter=move_id in _PROTECT_COUNTER_MOVES,
+        bypasses_protect=not bool(flags.get("protect")),
+        recoil_fraction=_fraction(entry.get("recoil")),
+        drain_fraction=_fraction(entry.get("drain")),
+        is_self_ko=bool(entry.get("selfdestruct")),
     )
 
 
@@ -725,6 +871,22 @@ class PokemonView:
     move_slots: Tuple[MoveView, ...] = field(
         default_factory=lambda: tuple(MoveView.unknown() for _ in range(MAX_MOVES))
     )
+    # Phase 2 runtime state (see module docstring for full verification):
+    # whether this Pokemon is mid-charge on a two-turn move
+    # (Pokemon.preparing), and if so whether that specific move also grants
+    # semi-invulnerability (_SEMI_INVULNERABLE_CHARGE_MOVES) versus merely
+    # skipping this turn's action (Solar Beam et al). Live-adapter-only -
+    # verified no equivalent exists in Metamon's replay schema - so both
+    # default False on the replay side and for any off-field (bench/
+    # unknown) Pokemon, same "known-false-is-correct, not just a
+    # placeholder" status protect_counter already has for the bench case.
+    preparing: bool = False
+    semi_invulnerable: bool = False
+    # Whether this Pokemon must recharge this turn after a recharge move
+    # (Hyper Beam, Giga Impact, ...) - Pokemon.must_recharge, direct read,
+    # no move-list cross-reference needed (unlike semi_invulnerable above).
+    # Same live-adapter-only status as preparing/semi_invulnerable.
+    must_recharge: bool = False
     # How many consecutive turns this Pokemon has just used a protect-
     # counter move (Protect, Endure, ...) - see module docstring for why
     # this is a real feature, not a nice-to-have, and how each adapter
@@ -732,7 +894,10 @@ class PokemonView:
     # a verified approximation reconstructed from replay history on the
     # other). 0 for an off-field (bench/unknown) Pokemon, which is always
     # correct, not just a placeholder - poke-env itself resets the real
-    # counter to 0 on switch-out.
+    # counter to 0 on switch-out. Kept as the LAST field (both here and in
+    # _encode_pokemon's concatenation - see module docstring) so its
+    # already-anchored vec[-1] test needs no changes as this phase's new
+    # fields are added.
     protect_counter: int = 0
 
     @staticmethod
@@ -749,6 +914,9 @@ class PokemonView:
             item=None,
             moves=MoveSummary(),
             move_slots=tuple(MoveView.unknown() for _ in range(MAX_MOVES)),
+            preparing=False,
+            semi_invulnerable=False,
+            must_recharge=False,
             protect_counter=0,
         )
 
@@ -780,6 +948,11 @@ def _poke_env_item(mon: Pokemon) -> Optional[str]:
     return None if mon.item in _UNKNOWN_ITEM_TOKENS else mon.item
 
 
+def _poke_env_semi_invulnerable(mon: Pokemon) -> bool:
+    preparing_move = mon.preparing_move
+    return preparing_move is not None and preparing_move.id in _SEMI_INVULNERABLE_CHARGE_MOVES
+
+
 def _poke_env_pokemon_view(mon: Optional[Pokemon]) -> PokemonView:
     if mon is None:
         return PokemonView.unknown()
@@ -796,6 +969,13 @@ def _poke_env_pokemon_view(mon: Optional[Pokemon]) -> PokemonView:
         item=_poke_env_item(mon),
         moves=_move_summary_features(move_ids),
         move_slots=_move_views(move_ids),
+        # mon.preparing is poke-env's own public property
+        # (bool(preparing_target) or bool(preparing_move)) - used directly
+        # rather than re-deriving the same OR from the two private-backed
+        # properties (see module docstring).
+        preparing=mon.preparing,
+        semi_invulnerable=_poke_env_semi_invulnerable(mon),
+        must_recharge=mon.must_recharge,
         protect_counter=mon.protect_counter,
     )
 
@@ -1259,6 +1439,10 @@ def _move_slot_vector(
             1.0 if move.is_bullet else 0.0,
             1.0 if move.is_wind else 0.0,
             1.0 if move.is_protect_counter else 0.0,
+            1.0 if move.bypasses_protect else 0.0,
+            move.recoil_fraction,
+            move.drain_fraction,
+            1.0 if move.is_self_ko else 0.0,
         ],
         dtype=np.float32,
     )
@@ -1304,6 +1488,18 @@ def _encode_pokemon(view: PokemonView, defender: PokemonView) -> np.ndarray:
             _move_summary_vector(view.moves),
             _move_slots_vector(
                 view.move_slots, view.types, defender.types, defender.ability, defender.item
+            ),
+            # Phase 2 runtime state (preparing, semi_invulnerable,
+            # must_recharge) - placed BEFORE protect_counter so
+            # protect_counter stays the last field of this block (see
+            # PokemonView's own docstring for why that ordering matters).
+            np.array(
+                [
+                    1.0 if view.preparing else 0.0,
+                    1.0 if view.semi_invulnerable else 0.0,
+                    1.0 if view.must_recharge else 0.0,
+                ],
+                dtype=np.float32,
             ),
             np.array(
                 [min(view.protect_counter, _PROTECT_COUNTER_SCALE) / _PROTECT_COUNTER_SCALE],

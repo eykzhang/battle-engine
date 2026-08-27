@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from poke_env.battle.field import Field
+from poke_env.battle.move import Move
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
@@ -979,8 +980,13 @@ def test_DW_1_4_vector_len_is_the_exact_expected_value():
     # check - MAX_MOVES(4) * _MOVE_VEC_LEN(46) per Pokemon-slot, 7
     # Pokemon-slots (1 my_active + 5 bench + 1 opp_active) added on top of
     # the pre-Phase-1 665.
-    assert enc._MOVE_VEC_LEN == 46
-    assert VECTOR_LEN == 1953
+    #
+    # Phase 2 (DW-2.3): _MOVE_VEC_LEN 46 -> 50 (4 new per-move scalars:
+    # bypasses_protect, recoil_fraction, drain_fraction, is_self_ko), plus
+    # 3 new per-Pokemon-slot scalars (preparing, semi_invulnerable,
+    # must_recharge) across all 7 Pokemon-slots - 1953 + 7*(4*4 + 3) = 2086.
+    assert enc._MOVE_VEC_LEN == 50
+    assert VECTOR_LEN == 2086
 
 
 def test_move_view_reads_secondary_effect_chance_and_kind():
@@ -1069,6 +1075,169 @@ def test_move_slots_present_on_both_live_and_replay_adapters():
         _battle([make_mon("garchomp")], make_mon("garchomp"), [make_mon("dragapult")], make_mon("dragapult"))
     )
     assert any(m.known for m in live_view.my_active.move_slots) is False  # make_mon has no real moveset
+
+
+# --- Phase 2: protect-family, charge/semi-invulnerable, recharge/recoil/
+# drain/self-KO ---------------------------------------------------------
+#
+# Real gap this phase exists to fix (see module docstring): nothing in the
+# vector said whether a specific move can even be blocked by Protect,
+# whether an active Pokemon is untouchable this turn behind a charge move's
+# invulnerability, or whether it's locked into recharging - all real,
+# common reasons a move that looks good on paper is actually a bad choice
+# right now.
+
+# _move_slot_vector's scalar block gained 4 new fields at the end this
+# phase (bypasses_protect, recoil_fraction, drain_fraction, is_self_ko) -
+# same _SCALARS_OFFSET-relative-index pattern Phase 1 established for
+# _STAB_IDX/_EFFECTIVENESS_IDX, so these track any future layout change
+# automatically rather than hardcoding an absolute position.
+_BYPASSES_PROTECT_IDX = _SCALARS_OFFSET + 20
+_RECOIL_FRACTION_IDX = _SCALARS_OFFSET + 21
+_DRAIN_FRACTION_IDX = _SCALARS_OFFSET + 22
+_IS_SELF_KO_IDX = _SCALARS_OFFSET + 23
+
+
+def test_move_view_reads_bypasses_protect():
+    feint = enc._move_view("feint")  # real dex flags lack "protect" entirely
+    assert feint.bypasses_protect is True
+
+    tackle = enc._move_view("tackle")  # real dex flags include protect: 1
+    assert tackle.bypasses_protect is False
+
+
+def test_move_view_reads_recoil_and_drain_fraction():
+    flare_blitz = enc._move_view("flareblitz")  # real dex recoil: [33, 100]
+    assert flare_blitz.recoil_fraction == pytest.approx(0.33)
+    assert flare_blitz.drain_fraction == 0.0
+
+    giga_drain = enc._move_view("gigadrain")  # real dex drain: [1, 2]
+    assert giga_drain.drain_fraction == pytest.approx(0.5)
+    assert giga_drain.recoil_fraction == 0.0
+
+    tackle = enc._move_view("tackle")  # neither field present
+    assert tackle.recoil_fraction == 0.0
+    assert tackle.drain_fraction == 0.0
+
+
+def test_move_view_reads_is_self_ko():
+    explosion = enc._move_view("explosion")  # real dex selfdestruct: "always"
+    assert explosion.is_self_ko is True
+
+    memento = enc._move_view("memento")  # real dex selfdestruct: "ifHit", not "always"
+    assert memento.is_self_ko is True
+
+    tackle = enc._move_view("tackle")  # no selfdestruct field at all
+    assert tackle.is_self_ko is False
+
+
+def test_move_slot_vector_encodes_bypasses_protect_recoil_drain_self_ko():
+    dusclops = make_mon("dusclops")
+    feint_vec = _move_slot("feint", (PokemonType.NORMAL,), dusclops.types)
+    tackle_vec = _move_slot("tackle", (PokemonType.NORMAL,), dusclops.types)
+    assert feint_vec[_BYPASSES_PROTECT_IDX] == 1.0
+    assert tackle_vec[_BYPASSES_PROTECT_IDX] == 0.0
+
+    flare_blitz_vec = _move_slot("flareblitz", (PokemonType.FIRE,), dusclops.types)
+    assert flare_blitz_vec[_RECOIL_FRACTION_IDX] == pytest.approx(0.33)
+    assert flare_blitz_vec[_DRAIN_FRACTION_IDX] == 0.0
+
+    giga_drain_vec = _move_slot("gigadrain", (PokemonType.GRASS,), dusclops.types)
+    assert giga_drain_vec[_DRAIN_FRACTION_IDX] == pytest.approx(0.5)
+    assert giga_drain_vec[_RECOIL_FRACTION_IDX] == 0.0
+
+    explosion_vec = _move_slot("explosion", (PokemonType.NORMAL,), dusclops.types)
+    assert explosion_vec[_IS_SELF_KO_IDX] == 1.0
+    assert tackle_vec[_IS_SELF_KO_IDX] == 0.0
+
+
+def test_DW_2_1_semi_invulnerable_charge_is_distinguishable_from_merely_charging():
+    # The real diagnosed gap: a Pokemon mid-Fly is untouchable by most moves
+    # this turn, a Pokemon mid-Solar-Beam-charge is NOT - two states that
+    # both have preparing=True but need to read differently to a model.
+    flying = make_mon("dragonite")
+    flying._preparing_move = Move("fly", gen=9)
+    charging = make_mon("dragonite")
+    charging._preparing_move = Move("solarbeam", gen=9)
+    opp = make_mon("dragapult")
+
+    fly_view = battle_view_from_poke_env(_battle([flying], flying, [opp], opp))
+    solar_view = battle_view_from_poke_env(_battle([charging], charging, [opp], opp))
+
+    assert fly_view.my_active.preparing is True
+    assert fly_view.my_active.semi_invulnerable is True
+    assert solar_view.my_active.preparing is True
+    assert solar_view.my_active.semi_invulnerable is False  # the actual distinguishing bit
+
+    # Distinguishable in the ENCODED vector, not just the PokemonView -
+    # preparing/semi_invulnerable/must_recharge sit at [-4]/[-3]/[-2] of a
+    # single Pokemon's block (protect_counter stays last, at [-1] - see
+    # module docstring).
+    fly_vec = enc._encode_pokemon(fly_view.my_active, defender=fly_view.opp_active)
+    solar_vec = enc._encode_pokemon(solar_view.my_active, defender=solar_view.opp_active)
+    assert fly_vec[-4] == 1.0 and fly_vec[-3] == 1.0  # preparing, semi_invulnerable
+    assert solar_vec[-4] == 1.0 and solar_vec[-3] == 0.0
+    assert not np.array_equal(fly_vec, solar_vec)
+
+
+def test_DW_2_2_must_recharge_is_read_from_the_live_adapter():
+    recharging = make_mon("dragonite")
+    recharging.must_recharge = True
+    opp = make_mon("dragapult")
+    view = battle_view_from_poke_env(_battle([recharging], recharging, [opp], opp))
+
+    assert view.my_active.must_recharge is True
+    vec = enc._encode_pokemon(view.my_active, defender=view.opp_active)
+    assert vec[-2] == 1.0  # must_recharge's position (see module docstring)
+
+    # Sanity: a Pokemon that hasn't just used a recharge move reads False -
+    # isolates that must_recharge is really being read, not defaulted True.
+    rested = make_mon("dragonite")
+    rested_view = battle_view_from_poke_env(_battle([rested], rested, [opp], opp))
+    assert rested_view.my_active.must_recharge is False
+    rested_vec = enc._encode_pokemon(rested_view.my_active, defender=rested_view.opp_active)
+    assert rested_vec[-2] == 0.0
+
+
+def test_charge_and_recharge_state_defaults_false_on_replay_adapter():
+    # Documented live-only gap (see module docstring for the real-replay-
+    # sample verification: no equivalent field exists anywhere in
+    # Metamon's schema, checked directly, not assumed).
+    mon = _replay_pokemon("dragonite")
+    state = _replay_state(mon, _replay_pokemon("dragapult"))
+
+    single_state_view = battle_view_from_replay_state(state)
+    assert single_state_view.my_active.preparing is False
+    assert single_state_view.my_active.semi_invulnerable is False
+    assert single_state_view.my_active.must_recharge is False
+
+    multi_state_views = battle_views_from_replay([state])
+    assert multi_state_views[0].my_active.preparing is False
+    assert multi_state_views[0].my_active.semi_invulnerable is False
+    assert multi_state_views[0].my_active.must_recharge is False
+
+
+def test_charge_and_recharge_state_defaults_false_for_bench_and_unknown_pokemon():
+    unknown = PokemonView.unknown()
+    assert unknown.preparing is False
+    assert unknown.semi_invulnerable is False
+    assert unknown.must_recharge is False
+
+    mine = make_mon("garchomp")
+    mine._preparing_move = Move("fly", gen=9)
+    bench_mon = make_mon("blissey")
+    opp = make_mon("dragapult")
+    view = battle_view_from_poke_env(_battle([mine, bench_mon], mine, [opp], opp))
+
+    assert view.my_active.preparing is True  # the active mon really is mid-charge
+    assert view.my_bench[0].preparing is False  # a benched mon structurally can't be
+    assert view.my_bench[0].semi_invulnerable is False
+    assert view.my_bench[0].must_recharge is False
+
+
+def test_poke_env_semi_invulnerable_is_false_when_not_preparing_any_move():
+    resting = make_mon("dragonite")  # preparing_move is None
+    assert enc._poke_env_semi_invulnerable(resting) is False
 
     mon = _replay_pokemon("garchomp", moves=[{"name": "earthquake"}, {"name": "dragonclaw"}])
     state = _replay_state(mon, _replay_pokemon("dragapult"))
