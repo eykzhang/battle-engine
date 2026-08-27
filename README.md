@@ -44,7 +44,7 @@ advances:
 | 2 | First ML: learned win-probability model + move-prediction model, trained on millions of parsed human replays | beats the Phase-1 bot head-to-head |
 | 3 | Reinforcement learning: PPO self-play, initialized from the Phase-2 policy | beats the Phase-2 bot head-to-head + a real ladder GXE |
 | 4 | Stretch, complete: C++ search core (MCTS/DUCT, PUCT with a trained PPO prior/value, compiled inference) | measured, not gated — exploratory by design |
-| 5+ | Stretch, underway: comprehensive state-encoding rewrite, closing the real-ladder gap | exploratory |
+| 5 | Stretch, complete: comprehensive state-encoding rewrite, closing the real-ladder gap | correctness harness passing, not a win-rate gate — retraining is the next stretch step |
 
 The end-state architecture mirrors Stockfish and Leela Chess Zero: train in Python,
 search and infer in C++.
@@ -124,19 +124,35 @@ never trained with search in the loop — doesn't close the gap to pure PPO. Tha
 tracks with why AlphaZero-style search needs the network trained on the search's own
 output, not handed a frozen one; not attempted here.
 
-## Current focus
-
-A real-ladder diagnostic (20 games under an alt account, losses read turn-by-turn)
-found the actual bottleneck isn't search depth or model architecture — it's the
-state representation. `battle_engine/encoding.py` only encodes a coarse per-Pokémon
-move-type aggregate, with no per-move signal for type effectiveness or the many
-other mechanically relevant interactions a battle turns on. The result is a literal,
+**Phase 5 (stretch: state-encoding rewrite) complete.** A real-ladder diagnostic (20
+games under an alt account, losses read turn-by-turn) found the actual bottleneck
+wasn't search depth or model architecture — it was the state representation.
+`battle_engine/encoding.py` used to encode only a coarse per-Pokémon move-type
+aggregate, with no per-move signal for type effectiveness or the many other
+mechanically relevant interactions a battle turns on. The result was a literal,
 repeated failure mode: in one loss, Dragapult's Draco Meteor was used four turns in a
 row into Clefable, immune every time — a species the policy trained against
-directly, ruling out "never saw this matchup" as the whole story. The next phase is
-a comprehensive, prioritized rewrite of the state encoding, grounded against Foul
-Play's own open-source evaluation logic and this project's C++ movedex/pokedex data,
-followed by a full retrain once cluster compute access is set up.
+directly, ruling out "never saw this matchup" as the whole story. A four-phase,
+prioritized rewrite followed, grounded against Foul Play's own open-source
+evaluation logic and this project's C++ movedex/pokedex data: a per-move-slot
+feature block (type effectiveness/STAB/secondary effects, `VECTOR_LEN` 665 → 1953),
+protect-family/charge/recharge/recoil/drain/self-KO signals (→ 2086),
+weather/terrain-conditional move behavior (→ 2120), and side-condition completeness
+— hazard stacking, status severity, tera-used (→ 2156, final). A closing
+correctness harness confirms the fix: the exact Draco-Meteor-into-Clefable failure
+now encodes as 0.0 effectiveness end to end, `dataset.py`/`rl_env.py` need no logic
+changes (both consume `VECTOR_LEN`/`encode()` opaquely), and the C++ `encode_native()`
+parity suite is honestly marked skipped (not silently broken) pending a future
+re-port. **Every existing trained checkpoint (`win_prob.pt`, `imitation.pt`, PPO) is
+invalidated by the shape change** — a full replay-dataset-rebuild → retrain pass
+(the already-fetched replay sample is fully reusable; only `encode()` changed, not
+the fetch/label logic) is the next stretch step, not yet executed.
+
+## Current focus
+
+Retraining `win_prob.pt`/`imitation.pt`/PPO against the new 2156-dim encoder, once
+university-cluster compute access is confirmed — the natural next step after Phase
+5's rewrite, not yet started.
 
 ## Setup
 

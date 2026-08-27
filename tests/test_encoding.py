@@ -1884,3 +1884,233 @@ def test_DW_4_1_opp_used_tera_is_live_adapter_only_documented_gap():
     # the real replay schema (see module docstring).
     assert single_view.opp_used_tera is False
     assert multi_view.opp_used_tera is False
+
+
+# --- Phase 5 (2026-08-27): consolidated correctness fixture suite ----------
+#
+# Every earlier phase already has its own isolated fixture tests (DW-1.1
+# through DW-4.2 above) - this section's job is different: prove the pieces
+# work together on realistic COMPOSITE battle states, through the full
+# encode() pipeline, in one place. Not re-testing what a phase's own tests
+# already cover in isolation.
+#
+# Composite PokemonViews are built directly (not via battle_view_from_poke_env)
+# - make_mon() builds a real poke_env.Pokemon but never populates moves/items,
+# and faking that live-adapter machinery just to get a specific known
+# moveset onto a synthetic species would add indirection with no correctness
+# benefit. PokemonView is the shared intermediate representation both real
+# adapters produce, so a fixture built directly at that layer plus encode()
+# still exercises the full downstream pipeline (encode() -> _encode_pokemon
+# -> _move_slots_vector -> _move_slot_vector -> _type_multiplier) on a
+# realistic state - already an established pattern in this file (see
+# test_unknown_pokemon_view_encodes_as_an_all_zero_block above).
+
+
+def _known_pokemon_view(types, base_stats, ability=None, item=None, moves=(), **overrides):
+    """Builds a fully-known PokemonView with real dex-shaped types/stats
+    directly, for composite fixtures - avoids needing to fake poke-env's
+    live Pokemon internals (preparing_move, item, moves) just to combine
+    several features on one synthetic state. Every field not explicitly
+    overridden matches PokemonView's own ordinary "healthy, unafflicted"
+    defaults.
+    """
+    view = PokemonView(
+        known=True, hp_fraction=1.0, fainted=False, status=None,
+        types=types, boosts={n: 0 for n in enc._BOOST_NAMES},
+        base_stats=base_stats, ability=ability, item=item,
+        moves=enc._move_summary_features(moves), move_slots=enc._move_views(moves),
+    )
+    return replace(view, **overrides)
+
+
+# Absolute-index helpers for the full encode() vector, derived from enc.'s
+# own constants (never a hand-copied magic number - same discipline
+# _SCALARS_OFFSET/_STAB_IDX/_EFFECTIVENESS_IDX above already established for
+# a single move-slot vector, extended here to the whole encode() output).
+_MY_ACTIVE_SLOT = 0
+_OPP_ACTIVE_SLOT = MAX_BENCH + 1  # my_active + MAX_BENCH bench slots precede it
+
+# Offset (within one Pokemon's _POKEMON_VEC_LEN-wide block) of the start of
+# its MAX_MOVES*_MOVE_VEC_LEN move-slot region - everything _encode_pokemon
+# concatenates before _move_slots_vector (see its own source): known,
+# hp_fraction, fainted, status one-hot, own-type multi-hot, boosts, base
+# stats, item one-hot(+bucket), then the MoveSummary block.
+_MOVE_SLOTS_START_IN_POKEMON_BLOCK = (
+    3
+    + len(enc._STATUSES)
+    + len(enc._ALL_TYPES)
+    + len(enc._BOOST_NAMES)
+    + len(enc._STAT_NAMES)
+    + (len(enc._ITEM_VOCAB) + 1)
+    + len(enc._move_summary_vector(enc.MoveSummary()))
+)
+
+
+def _pokemon_slot_end(slot_index: int) -> int:
+    """Absolute index one past the end of a given Pokemon-slot's block
+    within a full encode() vector (slot 0 = my_active, 1..MAX_BENCH =
+    my_bench, MAX_BENCH+1 = opp_active - see encode()'s concatenation
+    order)."""
+    return (slot_index + 1) * enc._POKEMON_VEC_LEN
+
+
+def _move_effectiveness_index(pokemon_slot: int, move_slot: int) -> int:
+    return (
+        pokemon_slot * enc._POKEMON_VEC_LEN
+        + _MOVE_SLOTS_START_IN_POKEMON_BLOCK
+        + move_slot * enc._MOVE_VEC_LEN
+        + _EFFECTIVENESS_IDX
+    )
+
+
+def _preparing_idx(slot_index: int) -> int:
+    return _pokemon_slot_end(slot_index) - 4  # see _encode_pokemon's docstring
+
+
+def _semi_invulnerable_idx(slot_index: int) -> int:
+    return _pokemon_slot_end(slot_index) - 3
+
+
+def _must_recharge_idx(slot_index: int) -> int:
+    return _pokemon_slot_end(slot_index) - 2
+
+
+def test_DW_5_1_dragapult_draco_meteor_into_clefable_shows_zero_effectiveness_end_to_end():
+    """The literal diagnosed real-ladder bug this whole plan exists to fix
+    (see encoding.py's module docstring / the plan's Context section): a
+    trained PPO policy used Draco Meteor into Clefable four turns straight,
+    immune every time, because nothing in the vector said "this specific
+    move, right now, does nothing" - only a moveset-wide type-coverage
+    aggregate. This goes through the FULL encode() pipeline on a realistic
+    composite BattleView (real Dragapult/Clefable typing and base stats),
+    not just the _move_slot_vector primitive DW-1.1 already covers with a
+    synthetic pure-Ghost fixture - proving the actual diagnosed failure is
+    fixed end to end, not just a related unit test.
+    """
+    dragapult = _known_pokemon_view(
+        types=(PokemonType.DRAGON, PokemonType.GHOST),
+        base_stats={"hp": 88, "atk": 120, "def": 75, "spa": 100, "spd": 75, "spe": 142},
+        ability="clearbody", moves=["dracometeor"],
+    )
+    clefable = _known_pokemon_view(
+        types=(PokemonType.FAIRY,),
+        base_stats={"hp": 95, "atk": 70, "def": 73, "spa": 95, "spd": 90, "spe": 60},
+        ability="unaware",
+    )
+    battle_view = BattleView(
+        my_active=dragapult, my_bench=[PokemonView.unknown()] * MAX_BENCH,
+        opp_active=clefable, opp_remaining_fraction=1.0,
+        my_hazards=set(), opp_hazards=set(), weather=None, terrain=None,
+    )
+    vec = encode(battle_view)
+    # Draco Meteor is the only known move - sorted move-slot index 0 (see
+    # _move_views).
+    idx = _move_effectiveness_index(_MY_ACTIVE_SLOT, move_slot=0)
+    assert vec[idx] == 0.0
+
+    # Sanity check on the premise, same "prove the feature is doing the
+    # work" pattern this module already uses throughout: the SAME Draco
+    # Meteor into a Dragon-type target (not immune) must NOT read 0.0 -
+    # isolates that this is really about Clefable's Fairy typing, not some
+    # unrelated bug zeroing every move's effectiveness.
+    garchomp = _known_pokemon_view(
+        types=(PokemonType.DRAGON, PokemonType.GROUND),
+        base_stats={"hp": 108, "atk": 130, "def": 95, "spa": 80, "spd": 85, "spe": 102},
+    )
+    not_immune_view = BattleView(
+        my_active=dragapult, my_bench=[PokemonView.unknown()] * MAX_BENCH,
+        opp_active=garchomp, opp_remaining_fraction=1.0,
+        my_hazards=set(), opp_hazards=set(), weather=None, terrain=None,
+    )
+    assert encode(not_immune_view)[idx] > 0.0
+
+
+def test_DW_5_1_composite_state_combines_invulnerability_recharge_weather_ability_and_terrain_signals():
+    """A single composite battle state combining Phase 2 (semi-invulnerable
+    mid-charge, must-recharge) and Phase 3 (weather-doubled ability speed,
+    terrain status immunity) signals at once, both sides, under the SAME
+    weather/terrain - not re-testing any one primitive (each already has its
+    own DW-2/DW-3 isolated test above), but proving they coexist correctly
+    in a single encode() call, which no per-phase test checks. The
+    species/ability/move-state combination here is synthetic (not
+    necessarily a legal real moveset) - this tests the encoder's own
+    composability, not move-pool legality.
+    """
+    my_active = _known_pokemon_view(
+        types=(PokemonType.WATER, PokemonType.DRAGON),
+        base_stats={"hp": 75, "atk": 95, "def": 95, "spa": 95, "spd": 95, "spe": 85},
+        ability="swiftswim", preparing=True, semi_invulnerable=True,
+    )
+    opp_active = _known_pokemon_view(
+        types=(PokemonType.NORMAL,),
+        base_stats={"hp": 250, "atk": 100, "def": 60, "spa": 55, "spd": 90, "spe": 65},
+        must_recharge=True,
+    )
+    battle_view = BattleView(
+        my_active=my_active, my_bench=[PokemonView.unknown()] * MAX_BENCH,
+        opp_active=opp_active, opp_remaining_fraction=1.0,
+        my_hazards=set(), opp_hazards=set(), weather="raindance", terrain="mistyterrain",
+    )
+    vec = encode(battle_view)
+
+    # Phase 2 signals, both sides, read from the same vector:
+    assert vec[_semi_invulnerable_idx(_MY_ACTIVE_SLOT)] == 1.0
+    assert vec[_must_recharge_idx(_OPP_ACTIVE_SLOT)] == 1.0
+    assert vec[_must_recharge_idx(_MY_ACTIVE_SLOT)] == 0.0  # not conflated across sides
+    assert vec[_preparing_idx(_OPP_ACTIVE_SLOT)] == 0.0
+
+    # Phase 3 signals, computed from the SAME weather/terrain simultaneously
+    # (order established by test_DW_3_2 above: [-9]=my_active_speed_doubled,
+    # [-8]=opp_active_speed_doubled, ..., [-5]=my_terrain_status_immune,
+    # [-4]=opp_terrain_status_immune).
+    assert vec[-9] == 1.0  # my Swift Swim doubles Speed in rain
+    assert vec[-8] == 0.0  # opponent has no such ability
+    assert vec[-5] == 1.0  # my_terrain_status_immune (Misty Terrain, grounded)
+    assert vec[-4] == 1.0  # opp_terrain_status_immune too - Misty protects the whole field
+
+
+def test_DW_5_1_composite_state_combines_hazard_stacking_status_severity_and_tera_signals():
+    """A single composite battle state combining Phase 4's headline features
+    - hazard STACK count (not just presence), badly-poisoned severity,
+    Leech Seed/Substitute, and used_tera - on both sides at once, read from
+    one encode() call.
+    """
+    my_active = _known_pokemon_view(
+        types=(PokemonType.STEEL, PokemonType.GRASS),
+        base_stats={"hp": 74, "atk": 94, "def": 131, "spa": 54, "spd": 116, "spe": 20},
+        status=Status.TOX, toxic_counter=5, has_leech_seed=True,
+    )
+    opp_active = _known_pokemon_view(
+        types=(PokemonType.WATER, PokemonType.POISON),
+        base_stats={"hp": 50, "atk": 63, "def": 152, "spa": 53, "spd": 142, "spe": 35},
+        has_substitute=True,
+    )
+    battle_view = BattleView(
+        my_active=my_active, my_bench=[PokemonView.unknown()] * MAX_BENCH,
+        opp_active=opp_active, opp_remaining_fraction=5 / 6,
+        my_hazards={"spikes"}, opp_hazards=set(),
+        weather=None, terrain=None,
+        my_spikes_layers=2, my_toxic_spikes_layers=0,
+        opp_spikes_layers=0, opp_toxic_spikes_layers=1,
+        my_used_tera=True, opp_used_tera=False,
+    )
+    vec = encode(battle_view)
+
+    # Per-Pokemon Phase 4 signals, both sides, isolated via _encode_pokemon
+    # (same already-anchored relative indices this file's own Phase 4
+    # section established above).
+    my_vec = enc._encode_pokemon(my_active, defender=opp_active)
+    opp_vec = enc._encode_pokemon(opp_active, defender=my_active)
+    assert my_vec[_TOXIC_COUNTER_IDX] == pytest.approx(5.0 / enc._TOXIC_COUNTER_SCALE)
+    assert my_vec[_HAS_LEECH_SEED_IDX] == 1.0
+    assert opp_vec[_HAS_SUBSTITUTE_IDX] == 1.0
+    assert opp_vec[_HAS_LEECH_SEED_IDX] == 0.0  # not conflated across sides
+
+    # Global Phase 4 signals, all read from the SAME encode() call - proves
+    # the 2-layer-vs-1-layer stack distinction (DW-4.2's own headline case)
+    # coexists correctly with toxic severity/leech seed/substitute/tera
+    # rather than only being verified in isolation.
+    assert vec[_MY_SPIKES_LAYERS_IDX] == pytest.approx(2.0 / enc._SPIKES_MAX_LAYERS)
+    assert vec[_OPP_TOXIC_SPIKES_LAYERS_IDX] == pytest.approx(1.0 / enc._TOXIC_SPIKES_MAX_LAYERS)
+    assert vec[_MY_USED_TERA_IDX] == 1.0
+    assert vec[_OPP_USED_TERA_IDX] == 0.0
