@@ -199,6 +199,80 @@ scalar — see `_PROTECT_COUNTER_SCALE`) fixes this:
   streaks are real and rare in human play, matching the live adapter's
   exact semantics — but the original "validates itself" framing was
   circular, not evidence.
+
+Real gap found via a real-ladder diagnostic (20 games, 2026-08-26 - see
+notes/): the trained PPO policy repeatedly used moves that were type-immune
+against the opponent (Dragapult using Draco Meteor into Clefable four turns
+straight, immune every time). `MoveSummary`'s aggregate move-type coverage
+told the model "this moveset covers Dragon type" but never "is THIS specific
+move, right now, actually going to do anything to what's in front of it" -
+that per-slot signal didn't exist anywhere in the vector. `MoveView` (below)
+and `_move_slots_vector` fix this: each known Pokemon (not just the active
+one) gets up to `MAX_MOVES` per-move-slot feature blocks, computed inside
+`encode()` (not at PokemonView-construction time, since a move's real-time
+effectiveness needs the DEFENDING side's current types/ability/item too -
+`_encode_pokemon` now takes a `defender: PokemonView` argument for exactly
+this reason). `MoveSummary`/`_move_summary_features` are left as-is
+alongside this, not replaced - they're still a real, distinct switch-safety
+signal (has_recovery/has_hazard_setup/etc.), and Phase 1's scope is fixing
+the missing per-slot gap, not re-deriving the existing aggregate from it.
+
+`_type_multiplier` is generalized (still the single source of truth for
+type-chart+ability immunity, now also handling two item-based exceptions)
+rather than duplicated - the same "generalize an existing, already-verified
+function to a new call site" approach the plan for this rewrite calls out
+explicitly. Air Balloon (Ground immunity while held) is a direct addition:
+`defending_item == "airballoon"` zeroes out a Ground-type attacker's
+multiplier, approximated as "currently holding" with no turn-scoped
+"already popped this turn" tracking (`PokemonView` has no such state) -
+documented the same way `_is_hazard_immune`'s own Iron Ball/Gravity
+exclusions are.
+
+Ring Target needed real verification before encoding (flagged as this
+phase's own Uncertainty note) - "cancels a type immunity" is easy to get
+subtly wrong. Read Showdown's own current sim source directly
+(`sim/items.ts`'s `ringtarget` entry, `sim/pokemon.ts`'s `runImmunity`/
+`isGrounded`, `sim/dex.ts`'s `getEffectiveness`), not assumed from memory:
+- Ring Target's `onNegateImmunity: false` handler makes
+  `Pokemon.runImmunity`'s `negateImmunity` true for its holder, which
+  bypasses ONLY the hard-coded `hasType('Flying')` check inside
+  `isGrounded` (Ground-vs-Flying-typing) and, for every other attacking
+  type, skips straight past `dex.getImmunity`'s type-chart-based immunity
+  gate. It does NOT touch the separate Levitate/Air-Balloon/Magnet-Rise
+  checks in the same function (none of those branches read
+  `negateImmunity` at all) - so Ring Target cancels TYPE-CHART immunities
+  only (Ghost's immunity to Normal/Fighting, Flying's to Ground, Steel's to
+  Poison, Dark's to Psychic, Normal's to Ghost, ...), never
+  ability-granted ones (Levitate, Water Absorb, Wonder Guard, ...) - those
+  are separate code paths Ring Target's handler never touches. (Air Balloon
+  and Ring Target can never co-occur on one Pokemon regardless - both are
+  held items, one slot.)
+- `dex.getEffectiveness` computes each defending type's contribution
+  independently and multiplies them together (verified empirically too:
+  `PokemonType.damage_multiplier(d1, d2, ...)` on real poke-env data equals
+  `damage_multiplier(d1) * damage_multiplier(d2)` for every real
+  attacking/defending-pair combination, 0 mismatches across the full type
+  chart) - and a type-chart "immune" (0x) contribution is stored as
+  exponent 0 (neutral), the SAME representation as an ordinary neutral
+  match. This confirms the plan's own Uncertainty note precisely: Ring
+  Target turns one type's own 0x contribution into a neutral 1x, while the
+  OTHER defending type's real resistance/weakness still multiplies in
+  unaffected - it does not create a new weakness, and a dual-typed immune
+  Pokemon doesn't become "generically hittable," only that one type's
+  immunity is gone. Implemented in `_type_multiplier` by computing each
+  defending type's multiplier separately and only overriding a 0.0 result
+  to 1.0 when Ring Target is held, then multiplying the (possibly
+  overridden) per-type results together - not by calling
+  `damage_multiplier(d1, d2)` as one combined lookup, which has no way to
+  attribute the 0x to one type or the other.
+
+`_active_matchup_score` (the pre-existing active-vs-active aggregate
+dimension) is updated to pass each side's item through the same
+generalized `_type_multiplier` too, not just the new per-move code path -
+no currently-passing test exercises Ring Target/Air Balloon there, so this
+changes no existing test's result, and leaving the older call site on a
+stale, less-correct version of the same shared function while the new one
+uses the fixed version would be an inconsistency with no upside.
 """
 
 from __future__ import annotations
@@ -356,6 +430,35 @@ _HAZARD_REMOVAL_MOVES = {"rapidspin", "defog", "courtchange", "tidyup", "mortals
 _ONHIT_SETUP_MOVES = {"bellydrum", "acupressure"}
 _MAX_BASE_POWER_SCALE = 250.0  # Explosion/Self-Destruct-class outliers, a loose ceiling
 
+# --- per-move-slot features (MoveView) --------------------------------------
+#
+# MAX_MOVES matches poke-env's/Metamon's own real cap (a Pokemon can't know
+# more than 4 moves) - same "real per-entity ceiling, loud failure if
+# exceeded" convention as MAX_BENCH/_pad_bench.
+MAX_MOVES = 4
+
+# Movedex `target` values verified (2026-08-26, real distribution survey of
+# every gen-9 move) to actually hit the opposing active Pokemon - "normal"
+# (632), "allAdjacentFoes" (62), "adjacentFoe" (53), "any" (24),
+# "allAdjacent" (20), "randomNormal" (6), "scripted" (4 - Counter/Mirror
+# Coat/Metal Burst/Comeuppance, real retaliation moves, confirmed
+# opponent-directed by inspection). Everything else ("self" - Swords Dance;
+# "foeSide"/"allySide" - hazards/screens, side-wide not mon-specific; "all";
+# ally-only targets, doubles-only and irrelevant in singles) never resolves
+# against a specific opposing Pokemon, so a type-effectiveness number for
+# those would be meaningless, not just uninteresting - see this phase's own
+# Edge Cases note. MoveView.targets_opponent records this per move so
+# encode() knows when the effectiveness number it computes is real signal
+# vs. a padded 0.0.
+_OPPONENT_DIRECTED_TARGETS = {
+    "normal", "any", "adjacentFoe", "allAdjacentFoes", "allAdjacent",
+    "randomNormal", "scripted",
+}
+
+_MOVE_CATEGORIES = ["Physical", "Special", "Status"]  # real _MOVES_DEX string values, used as-is
+_SECONDARY_KINDS = ["status", "boost_drop", "flinch"]
+_PRIORITY_SCALE = 7.0  # real gen-9 movedex priority range is exactly -7..+5
+
 # Verified against the real replay vocabulary: the 20 most common held
 # items. An "other known item" bucket below covers everything outside this
 # list rather than silently treating a rare item as blank/no-item. Original
@@ -374,6 +477,14 @@ _ITEM_VOCAB = [
 ]
 _UNKNOWN_ITEM_TOKENS = {None, "", "noitem", "unknownitem", "unknown_item"}
 
+# Per-move-slot vector layout (see _move_slot_vector): type one-hot,
+# category one-hot, secondary-kind one-hot, plus 20 scalars (known, stab,
+# base_power, accuracy, priority, targets_opponent, type_effectiveness,
+# secondary_chance, self_boost_chance, self_boost_magnitude, fixed_damage,
+# multi_hit, is_contact, is_sound, is_punch, is_bite, is_pulse, is_bullet,
+# is_wind, is_protect_counter).
+_MOVE_VEC_LEN = len(_ALL_TYPES) + len(_MOVE_CATEGORIES) + len(_SECONDARY_KINDS) + 20
+
 _POKEMON_VEC_LEN = (
     1  # known
     + 1  # hp_fraction
@@ -387,6 +498,7 @@ _POKEMON_VEC_LEN = (
     + 1  # has_priority
     + 1  # max_base_power (normalized)
     + len(_ALL_TYPES)  # move type coverage (distinct from the mon's own types above)
+    + MAX_MOVES * _MOVE_VEC_LEN  # per-move-slot block (MoveView) - see module docstring
     + 1  # protect_counter (normalized)
 )
 VECTOR_LEN = (
@@ -462,6 +574,133 @@ def _move_summary_features(move_ids: Sequence[str]) -> MoveSummary:
 
 
 @dataclass
+class MoveView:
+    """Static, context-free per-move-slot data - everything derivable from
+    the move's own _MOVES_DEX entry alone, same verify-against-real-data
+    sourcing as _move_summary_features. Battle-context-dependent numbers
+    (type effectiveness against the CURRENT opponent, STAB) are deliberately
+    NOT here - see module docstring for why encode() computes those once
+    both mons' state is available, rather than here at construction time.
+
+    self_boost_chance/self_boost_magnitude cover only the Draco Meteor/Close
+    Combat-style unconditional self-stat-change (movedex `self.boosts`,
+    always applied on a successful hit) - NOT a pure self-targeted status
+    move's top-level `boosts` field (Swords Dance - already covered by the
+    existing MoveSummary.has_setup_boost) and NOT a chance-based nested
+    `secondary.self.boosts` (Steel Wing/Ancient Power/Flame Charge - rarer,
+    deliberately out of scope, same "not attempted, revisit if it matters"
+    standard as this module's other named simplifications).
+    """
+    move_id: str
+    known: bool = True
+    type: Optional[PokemonType] = None
+    category: Optional[str] = None
+    base_power: int = 0
+    accuracy: float = 1.0
+    priority: int = 0
+    targets_opponent: bool = False
+    secondary_chance: float = 0.0
+    secondary_kind: Optional[str] = None  # "status" | "boost_drop" | "flinch" | None
+    self_boost_chance: float = 0.0
+    self_boost_magnitude: float = 0.0  # signed, mean boost delta across affected stats
+    fixed_damage: bool = False
+    multi_hit: bool = False
+    is_contact: bool = False
+    is_sound: bool = False
+    is_punch: bool = False
+    is_bite: bool = False
+    is_pulse: bool = False
+    is_bullet: bool = False
+    is_wind: bool = False
+    is_protect_counter: bool = False
+
+    @staticmethod
+    def unknown() -> "MoveView":
+        return MoveView(move_id="", known=False)
+
+
+def _secondary_effect(entry: dict) -> Tuple[float, Optional[str]]:
+    secondary = entry.get("secondary")
+    if not secondary:
+        return 0.0, None
+    chance = secondary.get("chance", 100) / 100.0
+    if secondary.get("status"):
+        return chance, "status"
+    if secondary.get("volatileStatus") == "flinch":
+        return chance, "flinch"
+    if secondary.get("boosts"):
+        return chance, "boost_drop"
+    # A real secondary effect exists (chance is still meaningful) but its
+    # kind isn't one of the three this module buckets - e.g. a chance-based
+    # SELF-only nested effect (Steel Wing's secondary.self.boosts), or a
+    # rarer volatileStatus. Not modeled further, see MoveView's docstring.
+    return chance, None
+
+
+def _self_boost(entry: dict) -> Tuple[float, float]:
+    self_effect = entry.get("self")
+    if not self_effect or not self_effect.get("boosts"):
+        return 0.0, 0.0
+    values = list(self_effect["boosts"].values())
+    return 1.0, (sum(values) / len(values)) / 6.0  # unconditional on hit -> chance 1.0
+
+
+def _move_view(move_id: str) -> Optional[MoveView]:
+    entry = _MOVES_DEX.get(move_id)
+    if entry is None:  # unrecognized/typo-guarded - skip, matches _move_summary_features
+        return None
+    flags = entry.get("flags", {})
+    secondary_chance, secondary_kind = _secondary_effect(entry)
+    self_boost_chance, self_boost_magnitude = _self_boost(entry)
+    move_type = entry.get("type")
+    accuracy = entry.get("accuracy")
+    return MoveView(
+        move_id=move_id,
+        known=True,
+        type=PokemonType.from_name(move_type) if move_type else None,
+        category=entry.get("category"),
+        base_power=entry.get("basePower", 0) or 0,
+        accuracy=1.0 if accuracy is True else (accuracy or 0) / 100.0,
+        priority=entry.get("priority", 0) or 0,
+        targets_opponent=entry.get("target") in _OPPONENT_DIRECTED_TARGETS,
+        secondary_chance=secondary_chance,
+        secondary_kind=secondary_kind,
+        self_boost_chance=self_boost_chance,
+        self_boost_magnitude=self_boost_magnitude,
+        fixed_damage=bool(entry.get("damage")),
+        multi_hit=bool(entry.get("multihit")),
+        is_contact=bool(flags.get("contact")),
+        is_sound=bool(flags.get("sound")),
+        is_punch=bool(flags.get("punch")),
+        is_bite=bool(flags.get("bite")),
+        is_pulse=bool(flags.get("pulse")),
+        is_bullet=bool(flags.get("bullet")),
+        is_wind=bool(flags.get("wind")),
+        is_protect_counter=move_id in _PROTECT_COUNTER_MOVES,
+    )
+
+
+def _move_views(move_ids: Sequence[str]) -> Tuple[MoveView, ...]:
+    """Builds up to MAX_MOVES known-move slots, sorted by move id (not
+    reveal order) for turn-to-turn identity stability against a
+    partially-revealed opponent - same "why sort bench by species name"
+    reasoning already established in this module (see docstring) - then
+    pads with MoveView.unknown() the same "unknown/zero" way
+    PokemonView.unknown() pads a whole missing Pokemon.
+    """
+    views = sorted(
+        (v for v in (_move_view(mid) for mid in move_ids) if v is not None),
+        key=lambda v: v.move_id,
+    )
+    assert len(views) <= MAX_MOVES, (
+        f"{len(views)} known moves exceeds MAX_MOVES={MAX_MOVES} - a real "
+        "Pokemon can't know more than 4 moves; silently truncating would "
+        "drop a real move rather than surface a bug"
+    )
+    return tuple(views) + tuple(MoveView.unknown() for _ in range(MAX_MOVES - len(views)))
+
+
+@dataclass
 class PokemonView:
     known: bool
     hp_fraction: float
@@ -479,6 +718,13 @@ class PokemonView:
     # from the outside" convention as ability above (see _UNKNOWN_ITEM_TOKENS).
     item: Optional[str] = None
     moves: MoveSummary = field(default_factory=MoveSummary)
+    # Up to MAX_MOVES per-move-slot views (see MoveView) - additive
+    # alongside `moves` above, not a replacement: the aggregate MoveSummary
+    # is still a real, distinct switch-safety signal. Sorted by move id,
+    # padded with MoveView.unknown() - see _move_views.
+    move_slots: Tuple[MoveView, ...] = field(
+        default_factory=lambda: tuple(MoveView.unknown() for _ in range(MAX_MOVES))
+    )
     # How many consecutive turns this Pokemon has just used a protect-
     # counter move (Protect, Endure, ...) - see module docstring for why
     # this is a real feature, not a nice-to-have, and how each adapter
@@ -502,6 +748,7 @@ class PokemonView:
             ability=None,
             item=None,
             moves=MoveSummary(),
+            move_slots=tuple(MoveView.unknown() for _ in range(MAX_MOVES)),
             protect_counter=0,
         )
 
@@ -536,6 +783,7 @@ def _poke_env_item(mon: Pokemon) -> Optional[str]:
 def _poke_env_pokemon_view(mon: Optional[Pokemon]) -> PokemonView:
     if mon is None:
         return PokemonView.unknown()
+    move_ids = [m.id for m in mon.moves.values()]
     return PokemonView(
         known=True,
         hp_fraction=mon.current_hp_fraction,
@@ -546,7 +794,8 @@ def _poke_env_pokemon_view(mon: Optional[Pokemon]) -> PokemonView:
         base_stats=dict(mon.base_stats),
         ability=mon.ability,  # None if not yet revealed, already normalized (to_id_str)
         item=_poke_env_item(mon),
-        moves=_move_summary_features([m.id for m in mon.moves.values()]),
+        moves=_move_summary_features(move_ids),
+        move_slots=_move_views(move_ids),
         protect_counter=mon.protect_counter,
     )
 
@@ -676,11 +925,13 @@ def _replay_item(mon: dict) -> Optional[str]:
     return None if mon["item"] in _UNKNOWN_ITEM_TOKENS else mon["item"]
 
 
-def _replay_moves(mon: dict) -> MoveSummary:
+def _replay_move_ids(mon: dict) -> list:
     # mon["moves"] entries are already Showdown id-form ("stealthrock", not
     # "Stealth Rock") - verified against a real downloaded replay - so each
     # name indexes _MOVES_DEX directly, same as the live adapter's move.id.
-    return _move_summary_features([m["name"] for m in mon["moves"]])
+    # Shared by both _move_summary_features (MoveSummary) and _move_views
+    # (MoveView per-slot) so the id list itself isn't computed twice.
+    return [m["name"] for m in mon["moves"]]
 
 
 def _replay_pokemon_view(mon: Optional[dict], protect_counter: int = 0) -> PokemonView:
@@ -697,6 +948,7 @@ def _replay_pokemon_view(mon: Optional[dict], protect_counter: int = 0) -> Pokem
     status = None
     if status_token not in ("nostatus", "fnt"):
         status = Status[status_token.upper()]
+    move_ids = _replay_move_ids(mon)
     return PokemonView(
         known=True,
         hp_fraction=mon["hp_pct"],
@@ -707,7 +959,8 @@ def _replay_pokemon_view(mon: Optional[dict], protect_counter: int = 0) -> Pokem
         base_stats={name: mon[f"base_{name}"] for name in _STAT_NAMES},
         ability=_replay_ability(mon),
         item=_replay_item(mon),
-        moves=_replay_moves(mon),
+        moves=_move_summary_features(move_ids),
+        move_slots=_move_views(move_ids),
         protect_counter=protect_counter,
     )
 
@@ -725,6 +978,7 @@ def _replay_pokemon_view_fainted(mon: dict) -> PokemonView:
     from that last snapshot (unlike hp/status/boosts, they don't change on
     fainting, and a fainted mon can't be switched to regardless).
     """
+    move_ids = _replay_move_ids(mon)
     return PokemonView(
         known=True,
         hp_fraction=0.0,
@@ -735,7 +989,8 @@ def _replay_pokemon_view_fainted(mon: dict) -> PokemonView:
         base_stats={name: mon[f"base_{name}"] for name in _STAT_NAMES},
         ability=_replay_ability(mon),
         item=_replay_item(mon),
-        moves=_replay_moves(mon),
+        moves=_move_summary_features(move_ids),
+        move_slots=_move_views(move_ids),
     )
 
 
@@ -950,7 +1205,92 @@ def _move_summary_vector(moves: MoveSummary) -> np.ndarray:
     return np.concatenate([flags, max_bp, coverage])
 
 
-def _encode_pokemon(view: PokemonView) -> np.ndarray:
+def _move_slot_vector(
+    move: MoveView,
+    user_types: Tuple[PokemonType, ...],
+    defender_types: Tuple[PokemonType, ...],
+    defender_ability: Optional[str],
+    defender_item: Optional[str],
+) -> np.ndarray:
+    """One move slot's full feature block: MoveView's static fields plus the
+    two battle-context-dependent numbers (type effectiveness against
+    `defender_types`/`defender_ability`/`defender_item`, and STAB against
+    `user_types`) - see module docstring for why those two live here and not
+    on MoveView itself. Both default to 0.0 for an unknown slot, a
+    not-opponent-directed move (Stealth Rock et al - see
+    _OPPONENT_DIRECTED_TARGETS), or a move with no resolvable type - the
+    accompanying `known`/`targets_opponent` flags tell a model whether that
+    0.0 means "computed and neutral-immune" or "not applicable," same
+    "don't let an information gap silently read as a real signal"
+    convention _is_hazard_immune's own docstring states explicitly.
+    """
+    type_vec = np.zeros(len(_ALL_TYPES), dtype=np.float32)
+    stab = 0.0
+    effectiveness = 0.0
+    if move.known and move.type is not None:
+        type_vec[_ALL_TYPES.index(move.type)] = 1.0
+        stab = 1.0 if move.type in user_types else 0.0
+        if move.targets_opponent and defender_types:
+            effectiveness = _type_multiplier(
+                move.type, defender_types, defender_ability, defender_item
+            )
+    category_vec = _one_hot(move.category, _MOVE_CATEGORIES)
+    secondary_kind_vec = _one_hot(move.secondary_kind, _SECONDARY_KINDS)
+    priority_scaled = max(min(move.priority, _PRIORITY_SCALE), -_PRIORITY_SCALE) / _PRIORITY_SCALE
+    scalars = np.array(
+        [
+            1.0 if move.known else 0.0,
+            stab,
+            move.base_power / _MAX_BASE_POWER_SCALE,
+            move.accuracy if move.known else 0.0,
+            priority_scaled if move.known else 0.0,
+            1.0 if move.targets_opponent else 0.0,
+            effectiveness,
+            move.secondary_chance,
+            move.self_boost_chance,
+            move.self_boost_magnitude,
+            1.0 if move.fixed_damage else 0.0,
+            1.0 if move.multi_hit else 0.0,
+            1.0 if move.is_contact else 0.0,
+            1.0 if move.is_sound else 0.0,
+            1.0 if move.is_punch else 0.0,
+            1.0 if move.is_bite else 0.0,
+            1.0 if move.is_pulse else 0.0,
+            1.0 if move.is_bullet else 0.0,
+            1.0 if move.is_wind else 0.0,
+            1.0 if move.is_protect_counter else 0.0,
+        ],
+        dtype=np.float32,
+    )
+    vec = np.concatenate([type_vec, category_vec, secondary_kind_vec, scalars])
+    assert vec.shape == (_MOVE_VEC_LEN,)
+    return vec
+
+
+def _move_slots_vector(
+    move_slots: Tuple[MoveView, ...],
+    user_types: Tuple[PokemonType, ...],
+    defender_types: Tuple[PokemonType, ...],
+    defender_ability: Optional[str],
+    defender_item: Optional[str],
+) -> np.ndarray:
+    return np.concatenate(
+        [
+            _move_slot_vector(m, user_types, defender_types, defender_ability, defender_item)
+            for m in move_slots
+        ]
+    )
+
+
+def _encode_pokemon(view: PokemonView, defender: PokemonView) -> np.ndarray:
+    """defender is the Pokemon `view`'s own moves are scored against for
+    per-move type effectiveness/STAB (see module docstring: this needs both
+    mons' state, unlike the rest of a single Pokemon's block) - always the
+    opponent's current active Pokemon for a my-side view, always my current
+    active Pokemon for the opponent's active view (see encode()'s call
+    sites) - the real defending target a switched-in move would actually
+    face right now, not a hypothetical future matchup.
+    """
     return np.concatenate(
         [
             np.array([1.0 if view.known else 0.0], dtype=np.float32),
@@ -962,6 +1302,9 @@ def _encode_pokemon(view: PokemonView) -> np.ndarray:
             _base_stat_vector(view.base_stats),
             _item_vector(view.item),
             _move_summary_vector(view.moves),
+            _move_slots_vector(
+                view.move_slots, view.types, defender.types, defender.ability, defender.item
+            ),
             np.array(
                 [min(view.protect_counter, _PROTECT_COUNTER_SCALE) / _PROTECT_COUNTER_SCALE],
                 dtype=np.float32,
@@ -987,13 +1330,34 @@ def _type_multiplier(
     attacking: PokemonType,
     defending_types: Tuple[PokemonType, ...],
     defending_ability: Optional[str] = None,
+    defending_item: Optional[str] = None,
 ) -> float:
     """Type-chart multiplier, corrected for the defender's ability when it's
     known and grants a hard type immunity (see _TYPE_IMMUNITY_ABILITIES) or is
     Wonder Guard (blocks anything that isn't already super-effective - a
     different rule shape, since it depends on the raw multiplier itself
     rather than a fixed type, so it's handled as its own case rather than
-    folded into the table).
+    folded into the table), and for two item-based exceptions verified
+    against Showdown's own current sim source (see module docstring for the
+    exact code read and reasoning, not just the summary here):
+
+    - Air Balloon: a Ground-type attack against a holder is 0.0, regardless
+      of typing/ability - approximated as "currently holding" (no
+      turn-scoped "already popped this turn" tracking - PokemonView has
+      none - same documented-simplification convention as
+      _is_hazard_immune's own exclusions).
+    - Ring Target: cancels a defender's TYPE-CHART-based immunity (0x from
+      typing alone) but NOT an ability-granted one (Levitate, Water Absorb,
+      Wonder Guard, ...) - verified in Showdown's real
+      Pokemon.runImmunity/isGrounded: Ring Target's negateImmunity bypasses
+      only the hasType('Flying') check, never the separate Levitate/Air
+      Balloon branches in the same function. Implemented by computing each
+      of the (up to two) defending types' own multiplier SEPARATELY and
+      overriding only a 0.0 result to 1.0 before multiplying them together -
+      not via one combined damage_multiplier(d1, d2) call, which can't
+      attribute a 0x result back to a single contributing type. This can
+      turn an immunity into neutral, never into a new weakness - the other
+      type's real resistance/weakness still applies on top.
     """
     if defending_ability == "wonderguard":
         d1 = defending_types[0]
@@ -1001,13 +1365,23 @@ def _type_multiplier(
         raw = attacking.damage_multiplier(d1, d2, type_chart=_TYPE_CHART)
         return raw if raw > 1 else 0.0
 
+    if defending_item == "airballoon" and attacking == PokemonType.GROUND:
+        return 0.0
+
     immune_type = _TYPE_IMMUNITY_ABILITIES.get(defending_ability or "")
     if immune_type is not None and attacking == immune_type:
         return 0.0
 
     d1 = defending_types[0]
     d2 = defending_types[1] if len(defending_types) > 1 else None
-    return attacking.damage_multiplier(d1, d2, type_chart=_TYPE_CHART)
+    m1 = attacking.damage_multiplier(d1, type_chart=_TYPE_CHART)
+    m2 = attacking.damage_multiplier(d2, type_chart=_TYPE_CHART) if d2 is not None else 1.0
+    if defending_item == "ringtarget":
+        if m1 == 0.0:
+            m1 = 1.0
+        if m2 == 0.0:
+            m2 = 1.0
+    return m1 * m2
 
 
 def _is_hazard_immune(mon: PokemonView) -> bool:
@@ -1069,10 +1443,12 @@ def _active_matchup_score(view: BattleView) -> float:
     if not my_types or not opp_types:
         return 0.0
     offense = max(
-        _type_multiplier(t, opp_types, view.opp_active.ability) for t in my_types
+        _type_multiplier(t, opp_types, view.opp_active.ability, view.opp_active.item)
+        for t in my_types
     )
     defense = max(
-        _type_multiplier(t, my_types, view.my_active.ability) for t in opp_types
+        _type_multiplier(t, my_types, view.my_active.ability, view.my_active.item)
+        for t in opp_types
     )
     return offense - defense
 
@@ -1080,9 +1456,9 @@ def _active_matchup_score(view: BattleView) -> float:
 def encode(view: BattleView) -> np.ndarray:
     vec = np.concatenate(
         [
-            _encode_pokemon(view.my_active),
-            *[_encode_pokemon(p) for p in view.my_bench],
-            _encode_pokemon(view.opp_active),
+            _encode_pokemon(view.my_active, defender=view.opp_active),
+            *[_encode_pokemon(p, defender=view.opp_active) for p in view.my_bench],
+            _encode_pokemon(view.opp_active, defender=view.my_active),
             np.array([view.opp_remaining_fraction], dtype=np.float32),
             _hazard_vector(view.my_hazards),
             _hazard_vector(view.opp_hazards),

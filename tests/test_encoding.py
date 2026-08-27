@@ -682,10 +682,11 @@ def test_protect_counter_encodes_as_a_normalized_scalar_and_clamps():
     # vector encode() returns.
     view_at_0 = PokemonView.unknown()
     view_at_0.known = True  # unknown() zeroes protect_counter too; only care about that field here
+    defender = PokemonView.unknown()  # no real matchup needed for this test
 
-    vec_at_0 = enc._encode_pokemon(replace(view_at_0, protect_counter=0))
-    vec_at_2 = enc._encode_pokemon(replace(view_at_0, protect_counter=2))
-    vec_at_999 = enc._encode_pokemon(replace(view_at_0, protect_counter=999))
+    vec_at_0 = enc._encode_pokemon(replace(view_at_0, protect_counter=0), defender)
+    vec_at_2 = enc._encode_pokemon(replace(view_at_0, protect_counter=2), defender)
+    vec_at_999 = enc._encode_pokemon(replace(view_at_0, protect_counter=999), defender)
 
     assert vec_at_0[-1] == pytest.approx(0.0)
     assert vec_at_2[-1] == pytest.approx(2.0 / _PROTECT_COUNTER_SCALE)
@@ -823,3 +824,254 @@ def test_replay_protect_streak_tracks_opponent_side_independently():
 
     assert [v.my_active.protect_counter for v in views] == [0, 0, 1]
     assert [v.opp_active.protect_counter for v in views] == [0, 1, 2]
+
+
+# --- MoveView / per-move-slot type effectiveness (2026-08-26, encoding rewrite Phase 1) ---
+#
+# The real diagnosed bug this phase exists to fix: a trained policy using
+# Draco Meteor into Clefable (immune, Fairy-type) four turns straight,
+# because nothing in the vector said "this specific move, right now, does
+# nothing" - only a moveset-wide type-coverage aggregate. These tests go
+# straight through the new MoveView pipeline (_move_view -> _move_slot_vector),
+# not just the underlying _type_multiplier primitive (already covered by
+# test_wonder_guard_blocks_non_super_effective_hits and the matchup-score
+# tests above).
+
+# _move_slot_vector's layout is [type one-hot][category one-hot]
+# [secondary-kind one-hot][20 scalars], scalars in this exact order: known,
+# stab, base_power, accuracy, priority, targets_opponent, effectiveness,
+# secondary_chance, self_boost_chance, self_boost_magnitude, fixed_damage,
+# multi_hit, is_contact, is_sound, is_punch, is_bite, is_pulse, is_bullet,
+# is_wind, is_protect_counter (see encoding.py's _move_slot_vector).
+_SCALARS_OFFSET = len(enc._ALL_TYPES) + len(enc._MOVE_CATEGORIES) + len(enc._SECONDARY_KINDS)
+_STAB_IDX = _SCALARS_OFFSET + 1
+_EFFECTIVENESS_IDX = _SCALARS_OFFSET + 6
+
+
+def _move_slot(move_id, user_types, defender_types, defending_ability=None, defending_item=None):
+    move = enc._move_view(move_id)
+    assert move is not None, f"{move_id!r} not found in _MOVES_DEX - fix the test fixture"
+    return enc._move_slot_vector(move, user_types, defender_types, defending_ability, defending_item)
+
+
+def test_DW_1_1_fighting_move_is_immune_against_pure_ghost_type():
+    dusclops = make_mon("dusclops")  # pure Ghost
+    vec = _move_slot("closecombat", (PokemonType.FIGHTING,), dusclops.types)
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+
+def test_DW_1_1_water_move_is_immune_against_water_absorb_holder():
+    quagsire = make_mon("quagsire")  # Water/Ground - ambiguous ability, forced known here
+    vec = _move_slot(
+        "scald", (PokemonType.WATER,), quagsire.types, defending_ability="waterabsorb"
+    )
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+    # Sanity check on the premise: without Water Absorb known, Scald into a
+    # Water/Ground mon is NOT immune (Water resists itself at 0.5x, but
+    # Ground is weak to Water at 2x - the two cancel to a neutral 1.0
+    # combined, verified via PokemonType.damage_multiplier directly before
+    # writing this assertion) - the ability is what's doing the work above.
+    vec_no_ability = _move_slot("scald", (PokemonType.WATER,), quagsire.types)
+    assert vec_no_ability[_EFFECTIVENESS_IDX] == pytest.approx(1.0)
+
+
+def test_DW_1_1_ground_move_is_immune_against_air_balloon_holder_while_held():
+    garchomp = make_mon("garchomp")  # Dragon/Ground - ordinarily hit normally by Ground
+    vec = _move_slot(
+        "earthquake", (PokemonType.GROUND,), garchomp.types, defending_item="airballoon"
+    )
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+    # Sanity check: without the balloon, Earthquake into Garchomp is NOT
+    # immune (Ground vs Dragon/Ground is neutral - the item is doing the work).
+    vec_no_item = _move_slot("earthquake", (PokemonType.GROUND,), garchomp.types)
+    assert vec_no_item[_EFFECTIVENESS_IDX] == pytest.approx(1.0)
+
+
+def test_DW_1_1_wonder_guard_blocks_a_resisted_not_just_immune_hit():
+    # Milotic (pure Water) resists Water at 0.5x - not immune, not the
+    # "usual" type Wonder Guard is associated with (it isn't tied to any
+    # single type at all) - Wonder Guard blocks ANY non-super-effective hit,
+    # which this proves by using a genuinely-resisted matchup, not an
+    # already-immune one.
+    milotic = make_mon("milotic")
+    vec = _move_slot(
+        "scald", (PokemonType.WATER,), milotic.types, defending_ability="wonderguard"
+    )
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+
+def test_DW_1_1_stab_flagged_only_when_move_type_is_in_the_users_own_types():
+    # Same move ("flamethrower", Fire-type), same defender - only the
+    # user's own types change, isolating STAB from every other factor
+    # (effectiveness, accuracy, ...).
+    dusclops = make_mon("dusclops")
+    fire_user_stab = _move_slot("flamethrower", (PokemonType.FIRE,), dusclops.types)
+    non_fire_user_no_stab = _move_slot(
+        "flamethrower", (PokemonType.WATER, PokemonType.GROUND), dusclops.types
+    )
+    assert fire_user_stab[_STAB_IDX] == 1.0
+    assert non_fire_user_no_stab[_STAB_IDX] == 0.0
+
+
+def test_move_slot_effectiveness_defaults_to_zero_for_a_non_opponent_directed_move():
+    # Stealth Rock (target: "foeSide", not a specific Pokemon) shouldn't get
+    # a misleading per-move multiplier - see this phase's own Edge Cases
+    # note. targets_opponent itself should read False, distinguishing this
+    # from a real computed 0.0 (immune).
+    dusclops = make_mon("dusclops")
+    vec = _move_slot("stealthrock", (PokemonType.ROCK,), dusclops.types)
+    targets_opponent_idx = _SCALARS_OFFSET + 5
+    assert vec[targets_opponent_idx] == 0.0
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+
+def test_ring_target_cancels_only_the_type_chart_immunity_not_ability_immunity():
+    # Real mechanic verified against Showdown's own current sim source (see
+    # module docstring) - Ring Target cancels a TYPE-CHART 0x (Gengar's
+    # Ghost typing blocking Normal) but never an ability-granted one
+    # (Levitate blocking Ground stays blocked even with Ring Target held).
+    gengar = make_mon("gengar")  # Ghost/Poison - immune to Normal via Ghost typing alone
+    normal_blocked = enc._type_multiplier(PokemonType.NORMAL, gengar.types)
+    normal_with_ring_target = enc._type_multiplier(
+        PokemonType.NORMAL, gengar.types, defending_item="ringtarget"
+    )
+    assert normal_blocked == 0.0
+    assert normal_with_ring_target == pytest.approx(1.0)  # Poison's own neutral response to Normal
+
+    bronzong = make_mon("bronzong")
+    ground_blocked_by_levitate = enc._type_multiplier(
+        PokemonType.GROUND, bronzong.types, defending_ability="levitate"
+    )
+    ground_with_ring_target_and_levitate = enc._type_multiplier(
+        PokemonType.GROUND, bronzong.types, defending_ability="levitate", defending_item="ringtarget"
+    )
+    assert ground_blocked_by_levitate == 0.0
+    assert ground_with_ring_target_and_levitate == 0.0  # Ring Target doesn't touch ability immunity
+
+
+def test_move_slots_are_sorted_by_move_id_not_reveal_order():
+    # Move-slot identity must be stable turn to turn for a partially-revealed
+    # opponent - see this phase's own Edge Cases note (same "sort bench by
+    # species name" reasoning already established in this module).
+    revealed_first = enc._move_views(["earthquake", "closecombat"])
+    revealed_second = enc._move_views(["closecombat", "earthquake"])
+    assert [m.move_id for m in revealed_first if m.known] == \
+        [m.move_id for m in revealed_second if m.known] == \
+        sorted(["earthquake", "closecombat"])
+
+
+def test_move_slots_pad_missing_slots_as_unknown():
+    views = enc._move_views(["earthquake"])
+    assert len(views) == enc.MAX_MOVES
+    assert views[0].known is True
+    assert all(v.known is False for v in views[1:])
+    # An unknown slot's full feature block must be all-zero, matching this
+    # module's existing "unknown/zero" padding convention (PokemonView.unknown()).
+    unknown_vec = enc._move_slot_vector(views[1], (), (), None, None)
+    assert (unknown_vec == 0.0).all()
+
+
+def test_DW_1_4_vector_len_is_the_exact_expected_value():
+    # A future accidental size change (e.g. a reordered/miscounted per-move
+    # field) must be caught immediately, not just implicitly via a shape
+    # check - MAX_MOVES(4) * _MOVE_VEC_LEN(46) per Pokemon-slot, 7
+    # Pokemon-slots (1 my_active + 5 bench + 1 opp_active) added on top of
+    # the pre-Phase-1 665.
+    assert enc._MOVE_VEC_LEN == 46
+    assert VECTOR_LEN == 1953
+
+
+def test_move_view_reads_secondary_effect_chance_and_kind():
+    scald = enc._move_view("scald")  # 30% burn
+    assert scald.secondary_chance == pytest.approx(0.30)
+    assert scald.secondary_kind == "status"
+
+    ironhead = enc._move_view("ironhead")  # 30% flinch
+    assert ironhead.secondary_kind == "flinch"
+
+    moonblast = enc._move_view("moonblast")  # 30% target spa drop
+    assert moonblast.secondary_kind == "boost_drop"
+
+    tackle = enc._move_view("tackle")  # no secondary at all
+    assert tackle.secondary_chance == 0.0
+    assert tackle.secondary_kind is None
+
+
+def test_move_view_reads_unconditional_self_boost_not_chance_based_or_top_level():
+    draco_meteor = enc._move_view("dracometeor")  # self.boosts = {spa: -2}, unconditional
+    assert draco_meteor.self_boost_chance == 1.0
+    assert draco_meteor.self_boost_magnitude == pytest.approx(-2.0 / 6.0)
+
+    # Swords Dance's boost is top-level `boosts` (already MoveSummary's
+    # has_setup_boost), not movedex `self.boosts` - deliberately not covered
+    # by self_boost_* (see MoveView's own docstring).
+    swords_dance = enc._move_view("swordsdance")
+    assert swords_dance.self_boost_chance == 0.0
+
+    # Steel Wing's self-boost is chance-based, nested under
+    # secondary.self.boosts - also deliberately not covered.
+    steel_wing = enc._move_view("steelwing")
+    assert steel_wing.self_boost_chance == 0.0
+
+
+def test_move_view_reads_category_flags_from_movedex_flags():
+    mach_punch = enc._move_view("machpunch")
+    assert mach_punch.is_contact is True
+    assert mach_punch.is_punch is True
+    assert mach_punch.is_sound is False
+
+    hyper_voice = enc._move_view("hypervoice")
+    assert hyper_voice.is_sound is True
+    assert hyper_voice.is_contact is False
+
+    crunch = enc._move_view("crunch")
+    assert crunch.is_bite is True
+
+    bulletseed = enc._move_view("bulletseed")
+    assert bulletseed.is_bullet is True
+    assert bulletseed.multi_hit is True
+
+
+def test_move_view_reads_fixed_damage_and_protect_family():
+    seismic_toss = enc._move_view("seismictoss")
+    assert seismic_toss.fixed_damage is True
+    assert seismic_toss.base_power == 0  # damage isn't basePower - see damage.py's own precedent
+
+    tackle = enc._move_view("tackle")
+    assert tackle.fixed_damage is False
+
+    protect = enc._move_view("protect")
+    assert protect.is_protect_counter is True
+    wide_guard = enc._move_view("wideguard")
+    assert wide_guard.is_protect_counter is True
+    mat_block = enc._move_view("matblock")  # deliberately excluded, matches poke-env's own list
+    assert mat_block.is_protect_counter is False
+
+
+def test_move_view_accuracy_normalizes_always_hits_to_one():
+    aerial_ace = enc._move_view("aerialace")  # accuracy: True in the real dex entry
+    assert aerial_ace.accuracy == 1.0
+
+    focus_blast = enc._move_view("focusblast")  # accuracy: 70 (a real percent)
+    assert focus_blast.accuracy == pytest.approx(0.70)
+
+
+def test_move_view_returns_none_for_an_unrecognized_move_id():
+    # Same typo-guard convention as _move_summary_features - skip silently
+    # rather than crash on a bad/garbled move id.
+    assert enc._move_view("thisisnotarealmove") is None
+
+
+def test_move_slots_present_on_both_live_and_replay_adapters():
+    live_view = battle_view_from_poke_env(
+        _battle([make_mon("garchomp")], make_mon("garchomp"), [make_mon("dragapult")], make_mon("dragapult"))
+    )
+    assert any(m.known for m in live_view.my_active.move_slots) is False  # make_mon has no real moveset
+
+    mon = _replay_pokemon("garchomp", moves=[{"name": "earthquake"}, {"name": "dragonclaw"}])
+    state = _replay_state(mon, _replay_pokemon("dragapult"))
+    replay_view = battle_view_from_replay_state(state)
+    known_ids = sorted(m.move_id for m in replay_view.my_active.move_slots if m.known)
+    assert known_ids == sorted(["earthquake", "dragonclaw"])
