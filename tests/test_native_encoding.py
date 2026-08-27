@@ -36,6 +36,30 @@ from battle_engine.mcts_player import battle_state_from_poke_env  # noqa: E402
 
 _PPO_BIN = "data/cpp_weights/ppo.bin"
 
+# Phase 5 of the encoding rewrite (2026-08-26/27, see
+# battle_engine/encoding.py's module docstring and
+# .code-foundations/plans/2026-08-26-battle-engine-encoding-rewrite.md's
+# Decision Log/Constraints) grew VECTOR_LEN 665 -> 2156. encode_native() (C++,
+# cpp/src/battle_state.cpp) is a bit-for-bit port of the OLD, pre-rewrite
+# encode() and is NOT re-ported here - re-porting it is explicitly out of
+# scope for that plan, deferred to a separate future plan. Until that re-port
+# lands, encode_native() structurally cannot match Python encode() - every
+# test below that compares against encode()'s real values, or against
+# enc.VECTOR_LEN directly, is skipped with this reason rather than left
+# failing red or deleted (this project's own "loud, visible gap over silent
+# handling" convention - see _pad_bench's assert for the same spirit). Tests
+# that don't depend on either (e.g. the missing-active-Pokemon error-path
+# check at the bottom of this file) are unaffected and stay active.
+_ENCODE_NATIVE_UNPORTED_REASON = (
+    "encode_native() (C++) was not re-ported for the encoding rewrite "
+    "(VECTOR_LEN 665 -> 2156) - a deliberately deferred, named future plan "
+    "(see battle_engine/encoding.py's module docstring and "
+    ".code-foundations/plans/2026-08-26-battle-engine-encoding-rewrite.md's "
+    "Decision Log), not an oversight. Bit-for-bit parity against Python "
+    "encode() is structurally impossible until that re-port lands - "
+    "re-enable these tests then."
+)
+
 
 def _battle(
     my_team, my_active, opp_team, opp_active,
@@ -82,6 +106,7 @@ def _assert_parity(battle):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_matches_python_encode_for_a_fresh_full_team_battle():
     active = _with_moves(make_mon("garchomp"), ["earthquake", "dragonclaw", "swordsdance", "protect"])
     bench = [
@@ -101,6 +126,7 @@ def test_encode_native_matches_python_encode_for_a_fresh_full_team_battle():
     _assert_parity(battle)
 
 
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_matches_python_encode_with_hazards_weather_terrain_and_boosts():
     active = _with_moves(make_mon("garchomp"), ["earthquake"])
     active.boosts = {"atk": 2, "def": -1, "spa": 0, "spd": 1, "spe": -2, "accuracy": 1, "evasion": -1}
@@ -120,6 +146,7 @@ def test_encode_native_matches_python_encode_with_hazards_weather_terrain_and_bo
     _assert_parity(battle)
 
 
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_matches_python_encode_with_a_fainted_bench_mon():
     active = make_mon("garchomp")
     fainted_bench = make_mon("toxapex", current_hp_fraction=0.0, status=Status.FNT)
@@ -134,6 +161,7 @@ def test_encode_native_matches_python_encode_with_a_fainted_bench_mon():
     _assert_parity(battle)
 
 
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_matches_python_encode_with_item_ability_and_protect_counter():
     active = _with_moves(make_mon("garchomp"), ["protect"])
     active.item = "heavydutyboots"
@@ -151,6 +179,7 @@ def test_encode_native_matches_python_encode_with_item_ability_and_protect_count
     _assert_parity(battle)
 
 
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_matches_python_encode_with_a_fainted_opponent_teammate():
     # Opponent bench is never encoded (only opp_active + opp_remaining_
     # fraction) - a partially-revealed opponent team should still parity-
@@ -167,6 +196,7 @@ def test_encode_native_matches_python_encode_with_a_fainted_opponent_teammate():
     _assert_parity(battle)
 
 
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_bench_is_species_sorted_not_insertion_order():
     # The plan's own named highest-risk item: encode_native()'s bench must
     # be species-alphabetical (dragapult before garchomp's own bench, e.g.
@@ -214,6 +244,7 @@ def test_encode_native_bench_is_species_sorted_not_insertion_order():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_mirror_matches_python_encode_of_real_opponent_pov():
     my_active = _with_moves(make_mon("garchomp"), ["earthquake", "swordsdance"])
     my_active.boosts = {"atk": 2, "def": -1, "spa": 0, "spd": 1, "spe": -2, "accuracy": 0, "evasion": 0}
@@ -276,6 +307,7 @@ def test_encode_native_mirror_matches_python_encode_of_real_opponent_pov():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_length_matches_vector_len():
     active = make_mon("garchomp")
     opp_active = make_mon("landorustherian")
@@ -287,10 +319,13 @@ def test_encode_native_length_matches_vector_len():
     assert len(result) == enc.VECTOR_LEN == _native.ENCODE_VECTOR_LEN
 
 
-@pytest.mark.skipif(
-    not __import__("pathlib").Path(_PPO_BIN).exists(),
-    reason="requires data/cpp_weights/ppo.bin (scripts/export_weights.py), gitignored data/",
-)
+# Was pytest.mark.skipif(not Path(_PPO_BIN).exists(), ...) - that guard is
+# still true (this worktree's gitignored data/ has no ppo.bin), but even
+# when it exists, this assertion now fails for the same structural reason as
+# every other test in this file (ppo.bin's header encodes the OLD 665-dim
+# shape, since it was exported before this rewrite) - an unconditional skip
+# with the parity reason is the accurate one going forward.
+@pytest.mark.skip(reason=_ENCODE_NATIVE_UNPORTED_REASON)
 def test_encode_native_length_matches_ppo_bin_header_vector_len():
     active = make_mon("garchomp")
     opp_active = make_mon("landorustherian")

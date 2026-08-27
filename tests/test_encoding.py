@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
+from poke_env.battle.move import Move
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
@@ -43,7 +45,7 @@ def _battle(
 def _replay_pokemon(
     name="garchomp", hp_pct=1.0, status="nostatus", types="dragon ground",
     boosts=None, base_stats=None, ability="unknownability", base_species=None,
-    item="unknownitem", moves=None,
+    item="unknownitem", moves=None, effect="noeffect",
 ):
     boosts = boosts or {}
     base_stats = base_stats or {
@@ -58,6 +60,7 @@ def _replay_pokemon(
         "ability": ability,
         "item": item,
         "moves": moves or [],
+        "effect": effect,
         **{f"{stat}_boost": boosts.get(stat, 0) for stat in
            ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")},
         **{f"base_{stat}": base_stats[stat] for stat in
@@ -83,7 +86,7 @@ def _replay_state(
     player_active, opponent_active, available_switches=None,
     opponents_remaining=6, player_conditions="noconditions",
     opponent_conditions="noconditions", weather="noweather", battle_field="nofield",
-    player_prev_move=None, opponent_prev_move=None,
+    player_prev_move=None, opponent_prev_move=None, can_tera=True,
 ):
     return {
         "player_active_pokemon": player_active,
@@ -96,6 +99,7 @@ def _replay_state(
         "battle_field": battle_field,
         "player_prev_move": player_prev_move or _replay_move(),
         "opponent_prev_move": opponent_prev_move or _replay_move(),
+        "can_tera": can_tera,
     }
 
 
@@ -682,10 +686,11 @@ def test_protect_counter_encodes_as_a_normalized_scalar_and_clamps():
     # vector encode() returns.
     view_at_0 = PokemonView.unknown()
     view_at_0.known = True  # unknown() zeroes protect_counter too; only care about that field here
+    defender = PokemonView.unknown()  # no real matchup needed for this test
 
-    vec_at_0 = enc._encode_pokemon(replace(view_at_0, protect_counter=0))
-    vec_at_2 = enc._encode_pokemon(replace(view_at_0, protect_counter=2))
-    vec_at_999 = enc._encode_pokemon(replace(view_at_0, protect_counter=999))
+    vec_at_0 = enc._encode_pokemon(replace(view_at_0, protect_counter=0), defender)
+    vec_at_2 = enc._encode_pokemon(replace(view_at_0, protect_counter=2), defender)
+    vec_at_999 = enc._encode_pokemon(replace(view_at_0, protect_counter=999), defender)
 
     assert vec_at_0[-1] == pytest.approx(0.0)
     assert vec_at_2[-1] == pytest.approx(2.0 / _PROTECT_COUNTER_SCALE)
@@ -823,3 +828,1289 @@ def test_replay_protect_streak_tracks_opponent_side_independently():
 
     assert [v.my_active.protect_counter for v in views] == [0, 0, 1]
     assert [v.opp_active.protect_counter for v in views] == [0, 1, 2]
+
+
+# --- MoveView / per-move-slot type effectiveness (2026-08-26, encoding rewrite Phase 1) ---
+#
+# The real diagnosed bug this phase exists to fix: a trained policy using
+# Draco Meteor into Clefable (immune, Fairy-type) four turns straight,
+# because nothing in the vector said "this specific move, right now, does
+# nothing" - only a moveset-wide type-coverage aggregate. These tests go
+# straight through the new MoveView pipeline (_move_view -> _move_slot_vector),
+# not just the underlying _type_multiplier primitive (already covered by
+# test_wonder_guard_blocks_non_super_effective_hits and the matchup-score
+# tests above).
+
+# _move_slot_vector's layout is [type one-hot][category one-hot]
+# [secondary-kind one-hot][20 scalars], scalars in this exact order: known,
+# stab, base_power, accuracy, priority, targets_opponent, effectiveness,
+# secondary_chance, self_boost_chance, self_boost_magnitude, fixed_damage,
+# multi_hit, is_contact, is_sound, is_punch, is_bite, is_pulse, is_bullet,
+# is_wind, is_protect_counter (see encoding.py's _move_slot_vector).
+_SCALARS_OFFSET = len(enc._ALL_TYPES) + len(enc._MOVE_CATEGORIES) + len(enc._SECONDARY_KINDS)
+_STAB_IDX = _SCALARS_OFFSET + 1
+_EFFECTIVENESS_IDX = _SCALARS_OFFSET + 6
+
+
+def _move_slot(
+    move_id, user_types, defender_types, defending_ability=None, defending_item=None,
+    weather=None, terrain=None, user_grounded=True,
+):
+    move = enc._move_view(move_id)
+    assert move is not None, f"{move_id!r} not found in _MOVES_DEX - fix the test fixture"
+    return enc._move_slot_vector(
+        move, user_types, defender_types, defending_ability, defending_item,
+        weather=weather, terrain=terrain, user_grounded=user_grounded,
+    )
+
+
+def test_DW_1_1_fighting_move_is_immune_against_pure_ghost_type():
+    dusclops = make_mon("dusclops")  # pure Ghost
+    vec = _move_slot("closecombat", (PokemonType.FIGHTING,), dusclops.types)
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+
+def test_DW_1_1_water_move_is_immune_against_water_absorb_holder():
+    quagsire = make_mon("quagsire")  # Water/Ground - ambiguous ability, forced known here
+    vec = _move_slot(
+        "scald", (PokemonType.WATER,), quagsire.types, defending_ability="waterabsorb"
+    )
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+    # Sanity check on the premise: without Water Absorb known, Scald into a
+    # Water/Ground mon is NOT immune (Water resists itself at 0.5x, but
+    # Ground is weak to Water at 2x - the two cancel to a neutral 1.0
+    # combined, verified via PokemonType.damage_multiplier directly before
+    # writing this assertion) - the ability is what's doing the work above.
+    vec_no_ability = _move_slot("scald", (PokemonType.WATER,), quagsire.types)
+    assert vec_no_ability[_EFFECTIVENESS_IDX] == pytest.approx(1.0)
+
+
+def test_DW_1_1_ground_move_is_immune_against_air_balloon_holder_while_held():
+    garchomp = make_mon("garchomp")  # Dragon/Ground - ordinarily hit normally by Ground
+    vec = _move_slot(
+        "earthquake", (PokemonType.GROUND,), garchomp.types, defending_item="airballoon"
+    )
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+    # Sanity check: without the balloon, Earthquake into Garchomp is NOT
+    # immune (Ground vs Dragon/Ground is neutral - the item is doing the work).
+    vec_no_item = _move_slot("earthquake", (PokemonType.GROUND,), garchomp.types)
+    assert vec_no_item[_EFFECTIVENESS_IDX] == pytest.approx(1.0)
+
+
+def test_DW_1_1_wonder_guard_blocks_a_resisted_not_just_immune_hit():
+    # Milotic (pure Water) resists Water at 0.5x - not immune, not the
+    # "usual" type Wonder Guard is associated with (it isn't tied to any
+    # single type at all) - Wonder Guard blocks ANY non-super-effective hit,
+    # which this proves by using a genuinely-resisted matchup, not an
+    # already-immune one.
+    milotic = make_mon("milotic")
+    vec = _move_slot(
+        "scald", (PokemonType.WATER,), milotic.types, defending_ability="wonderguard"
+    )
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+
+def test_DW_1_1_stab_flagged_only_when_move_type_is_in_the_users_own_types():
+    # Same move ("flamethrower", Fire-type), same defender - only the
+    # user's own types change, isolating STAB from every other factor
+    # (effectiveness, accuracy, ...).
+    dusclops = make_mon("dusclops")
+    fire_user_stab = _move_slot("flamethrower", (PokemonType.FIRE,), dusclops.types)
+    non_fire_user_no_stab = _move_slot(
+        "flamethrower", (PokemonType.WATER, PokemonType.GROUND), dusclops.types
+    )
+    assert fire_user_stab[_STAB_IDX] == 1.0
+    assert non_fire_user_no_stab[_STAB_IDX] == 0.0
+
+
+def test_move_slot_effectiveness_defaults_to_zero_for_a_non_opponent_directed_move():
+    # Stealth Rock (target: "foeSide", not a specific Pokemon) shouldn't get
+    # a misleading per-move multiplier - see this phase's own Edge Cases
+    # note. targets_opponent itself should read False, distinguishing this
+    # from a real computed 0.0 (immune).
+    dusclops = make_mon("dusclops")
+    vec = _move_slot("stealthrock", (PokemonType.ROCK,), dusclops.types)
+    targets_opponent_idx = _SCALARS_OFFSET + 5
+    assert vec[targets_opponent_idx] == 0.0
+    assert vec[_EFFECTIVENESS_IDX] == 0.0
+
+
+def test_ring_target_cancels_only_the_type_chart_immunity_not_ability_immunity():
+    # Real mechanic verified against Showdown's own current sim source (see
+    # module docstring) - Ring Target cancels a TYPE-CHART 0x (Gengar's
+    # Ghost typing blocking Normal) but never an ability-granted one
+    # (Levitate blocking Ground stays blocked even with Ring Target held).
+    gengar = make_mon("gengar")  # Ghost/Poison - immune to Normal via Ghost typing alone
+    normal_blocked = enc._type_multiplier(PokemonType.NORMAL, gengar.types)
+    normal_with_ring_target = enc._type_multiplier(
+        PokemonType.NORMAL, gengar.types, defending_item="ringtarget"
+    )
+    assert normal_blocked == 0.0
+    assert normal_with_ring_target == pytest.approx(1.0)  # Poison's own neutral response to Normal
+
+    bronzong = make_mon("bronzong")
+    ground_blocked_by_levitate = enc._type_multiplier(
+        PokemonType.GROUND, bronzong.types, defending_ability="levitate"
+    )
+    ground_with_ring_target_and_levitate = enc._type_multiplier(
+        PokemonType.GROUND, bronzong.types, defending_ability="levitate", defending_item="ringtarget"
+    )
+    assert ground_blocked_by_levitate == 0.0
+    assert ground_with_ring_target_and_levitate == 0.0  # Ring Target doesn't touch ability immunity
+
+
+def test_move_slots_are_sorted_by_move_id_not_reveal_order():
+    # Move-slot identity must be stable turn to turn for a partially-revealed
+    # opponent - see this phase's own Edge Cases note (same "sort bench by
+    # species name" reasoning already established in this module).
+    revealed_first = enc._move_views(["earthquake", "closecombat"])
+    revealed_second = enc._move_views(["closecombat", "earthquake"])
+    assert [m.move_id for m in revealed_first if m.known] == \
+        [m.move_id for m in revealed_second if m.known] == \
+        sorted(["earthquake", "closecombat"])
+
+
+def test_move_slots_pad_missing_slots_as_unknown():
+    views = enc._move_views(["earthquake"])
+    assert len(views) == enc.MAX_MOVES
+    assert views[0].known is True
+    assert all(v.known is False for v in views[1:])
+    # An unknown slot's full feature block must be all-zero, matching this
+    # module's existing "unknown/zero" padding convention (PokemonView.unknown()).
+    unknown_vec = enc._move_slot_vector(views[1], (), (), None, None)
+    assert (unknown_vec == 0.0).all()
+
+
+def test_DW_1_4_vector_len_is_the_exact_expected_value():
+    # A future accidental size change (e.g. a reordered/miscounted per-move
+    # field) must be caught immediately, not just implicitly via a shape
+    # check - MAX_MOVES(4) * _MOVE_VEC_LEN(46) per Pokemon-slot, 7
+    # Pokemon-slots (1 my_active + 5 bench + 1 opp_active) added on top of
+    # the pre-Phase-1 665.
+    #
+    # Phase 2 (DW-2.3): _MOVE_VEC_LEN 46 -> 50 (4 new per-move scalars:
+    # bypasses_protect, recoil_fraction, drain_fraction, is_self_ko), plus
+    # 3 new per-Pokemon-slot scalars (preparing, semi_invulnerable,
+    # must_recharge) across all 7 Pokemon-slots - 1953 + 7*(4*4 + 3) = 2086.
+    #
+    # Phase 3 (DW-3.3): _MOVE_VEC_LEN 50 -> 51 (1 new per-move scalar,
+    # needs_charge_turn), 7 Pokemon-slots * 4 moves * 1 = 28, plus 6 new
+    # GLOBAL (not per-Pokemon-slot) scalars - my/opp_active_speed_doubled,
+    # my/opp_terrain_sleep_immune, my/opp_terrain_status_immune - added once,
+    # not per-slot: 2086 + 7*4*1 + 6 = 2120.
+    #
+    # Phase 4 (DW-4.3): _MOVE_VEC_LEN unchanged at 51 (no new per-move
+    # field this phase) - +4 new per-Pokemon-slot scalars (toxic_counter,
+    # has_leech_seed, has_substitute, is_confused) across all 7
+    # Pokemon-slots = +28, +1 new hazard token (safeguard) across both sides
+    # = +2, +6 new GLOBAL scalars (my/opp_spikes_layers,
+    # my/opp_toxic_spikes_layers, my/opp_used_tera) added once, not per-slot:
+    # 2120 + 7*4 + 2 + 6 = 2156.
+    assert enc._MOVE_VEC_LEN == 51
+    assert len(enc._HAZARD_TOKENS) == 9
+    assert VECTOR_LEN == 2156
+
+
+def test_move_view_reads_secondary_effect_chance_and_kind():
+    scald = enc._move_view("scald")  # 30% burn
+    assert scald.secondary_chance == pytest.approx(0.30)
+    assert scald.secondary_kind == "status"
+
+    ironhead = enc._move_view("ironhead")  # 30% flinch
+    assert ironhead.secondary_kind == "flinch"
+
+    moonblast = enc._move_view("moonblast")  # 30% target spa drop
+    assert moonblast.secondary_kind == "boost_drop"
+
+    tackle = enc._move_view("tackle")  # no secondary at all
+    assert tackle.secondary_chance == 0.0
+    assert tackle.secondary_kind is None
+
+
+def test_move_view_reads_unconditional_self_boost_not_chance_based_or_top_level():
+    draco_meteor = enc._move_view("dracometeor")  # self.boosts = {spa: -2}, unconditional
+    assert draco_meteor.self_boost_chance == 1.0
+    assert draco_meteor.self_boost_magnitude == pytest.approx(-2.0 / 6.0)
+
+    # Swords Dance's boost is top-level `boosts` (already MoveSummary's
+    # has_setup_boost), not movedex `self.boosts` - deliberately not covered
+    # by self_boost_* (see MoveView's own docstring).
+    swords_dance = enc._move_view("swordsdance")
+    assert swords_dance.self_boost_chance == 0.0
+
+    # Steel Wing's self-boost is chance-based, nested under
+    # secondary.self.boosts - also deliberately not covered.
+    steel_wing = enc._move_view("steelwing")
+    assert steel_wing.self_boost_chance == 0.0
+
+
+def test_move_view_reads_category_flags_from_movedex_flags():
+    mach_punch = enc._move_view("machpunch")
+    assert mach_punch.is_contact is True
+    assert mach_punch.is_punch is True
+    assert mach_punch.is_sound is False
+
+    hyper_voice = enc._move_view("hypervoice")
+    assert hyper_voice.is_sound is True
+    assert hyper_voice.is_contact is False
+
+    crunch = enc._move_view("crunch")
+    assert crunch.is_bite is True
+
+    bulletseed = enc._move_view("bulletseed")
+    assert bulletseed.is_bullet is True
+    assert bulletseed.multi_hit is True
+
+
+def test_move_view_reads_fixed_damage_and_protect_family():
+    seismic_toss = enc._move_view("seismictoss")
+    assert seismic_toss.fixed_damage is True
+    assert seismic_toss.base_power == 0  # damage isn't basePower - see damage.py's own precedent
+
+    tackle = enc._move_view("tackle")
+    assert tackle.fixed_damage is False
+
+    protect = enc._move_view("protect")
+    assert protect.is_protect_counter is True
+    wide_guard = enc._move_view("wideguard")
+    assert wide_guard.is_protect_counter is True
+    mat_block = enc._move_view("matblock")  # deliberately excluded, matches poke-env's own list
+    assert mat_block.is_protect_counter is False
+
+
+def test_move_view_accuracy_normalizes_always_hits_to_one():
+    aerial_ace = enc._move_view("aerialace")  # accuracy: True in the real dex entry
+    assert aerial_ace.accuracy == 1.0
+
+    focus_blast = enc._move_view("focusblast")  # accuracy: 70 (a real percent)
+    assert focus_blast.accuracy == pytest.approx(0.70)
+
+
+def test_move_view_returns_none_for_an_unrecognized_move_id():
+    # Same typo-guard convention as _move_summary_features - skip silently
+    # rather than crash on a bad/garbled move id.
+    assert enc._move_view("thisisnotarealmove") is None
+
+
+def test_move_slots_present_on_both_live_and_replay_adapters():
+    live_view = battle_view_from_poke_env(
+        _battle([make_mon("garchomp")], make_mon("garchomp"), [make_mon("dragapult")], make_mon("dragapult"))
+    )
+    assert any(m.known for m in live_view.my_active.move_slots) is False  # make_mon has no real moveset
+
+
+# --- Phase 2: protect-family, charge/semi-invulnerable, recharge/recoil/
+# drain/self-KO ---------------------------------------------------------
+#
+# Real gap this phase exists to fix (see module docstring): nothing in the
+# vector said whether a specific move can even be blocked by Protect,
+# whether an active Pokemon is untouchable this turn behind a charge move's
+# invulnerability, or whether it's locked into recharging - all real,
+# common reasons a move that looks good on paper is actually a bad choice
+# right now.
+
+# _move_slot_vector's scalar block gained 4 new fields at the end this
+# phase (bypasses_protect, recoil_fraction, drain_fraction, is_self_ko) -
+# same _SCALARS_OFFSET-relative-index pattern Phase 1 established for
+# _STAB_IDX/_EFFECTIVENESS_IDX, so these track any future layout change
+# automatically rather than hardcoding an absolute position.
+_BYPASSES_PROTECT_IDX = _SCALARS_OFFSET + 20
+_RECOIL_FRACTION_IDX = _SCALARS_OFFSET + 21
+_DRAIN_FRACTION_IDX = _SCALARS_OFFSET + 22
+_IS_SELF_KO_IDX = _SCALARS_OFFSET + 23
+
+
+def test_move_view_reads_bypasses_protect():
+    feint = enc._move_view("feint")  # real dex flags lack "protect" entirely
+    assert feint.bypasses_protect is True
+
+    tackle = enc._move_view("tackle")  # real dex flags include protect: 1
+    assert tackle.bypasses_protect is False
+
+
+def test_move_view_reads_recoil_and_drain_fraction():
+    flare_blitz = enc._move_view("flareblitz")  # real dex recoil: [33, 100]
+    assert flare_blitz.recoil_fraction == pytest.approx(0.33)
+    assert flare_blitz.drain_fraction == 0.0
+
+    giga_drain = enc._move_view("gigadrain")  # real dex drain: [1, 2]
+    assert giga_drain.drain_fraction == pytest.approx(0.5)
+    assert giga_drain.recoil_fraction == 0.0
+
+    tackle = enc._move_view("tackle")  # neither field present
+    assert tackle.recoil_fraction == 0.0
+    assert tackle.drain_fraction == 0.0
+
+
+def test_move_view_reads_is_self_ko():
+    explosion = enc._move_view("explosion")  # real dex selfdestruct: "always"
+    assert explosion.is_self_ko is True
+
+    memento = enc._move_view("memento")  # real dex selfdestruct: "ifHit", not "always"
+    assert memento.is_self_ko is True
+
+    tackle = enc._move_view("tackle")  # no selfdestruct field at all
+    assert tackle.is_self_ko is False
+
+
+def test_move_slot_vector_encodes_bypasses_protect_recoil_drain_self_ko():
+    dusclops = make_mon("dusclops")
+    feint_vec = _move_slot("feint", (PokemonType.NORMAL,), dusclops.types)
+    tackle_vec = _move_slot("tackle", (PokemonType.NORMAL,), dusclops.types)
+    assert feint_vec[_BYPASSES_PROTECT_IDX] == 1.0
+    assert tackle_vec[_BYPASSES_PROTECT_IDX] == 0.0
+
+    flare_blitz_vec = _move_slot("flareblitz", (PokemonType.FIRE,), dusclops.types)
+    assert flare_blitz_vec[_RECOIL_FRACTION_IDX] == pytest.approx(0.33)
+    assert flare_blitz_vec[_DRAIN_FRACTION_IDX] == 0.0
+
+    giga_drain_vec = _move_slot("gigadrain", (PokemonType.GRASS,), dusclops.types)
+    assert giga_drain_vec[_DRAIN_FRACTION_IDX] == pytest.approx(0.5)
+    assert giga_drain_vec[_RECOIL_FRACTION_IDX] == 0.0
+
+    explosion_vec = _move_slot("explosion", (PokemonType.NORMAL,), dusclops.types)
+    assert explosion_vec[_IS_SELF_KO_IDX] == 1.0
+    assert tackle_vec[_IS_SELF_KO_IDX] == 0.0
+
+
+def test_DW_2_1_semi_invulnerable_charge_is_distinguishable_from_merely_charging():
+    # The real diagnosed gap: a Pokemon mid-Fly is untouchable by most moves
+    # this turn, a Pokemon mid-Solar-Beam-charge is NOT - two states that
+    # both have preparing=True but need to read differently to a model.
+    flying = make_mon("dragonite")
+    flying._preparing_move = Move("fly", gen=9)
+    charging = make_mon("dragonite")
+    charging._preparing_move = Move("solarbeam", gen=9)
+    opp = make_mon("dragapult")
+
+    fly_view = battle_view_from_poke_env(_battle([flying], flying, [opp], opp))
+    solar_view = battle_view_from_poke_env(_battle([charging], charging, [opp], opp))
+
+    assert fly_view.my_active.preparing is True
+    assert fly_view.my_active.semi_invulnerable is True
+    assert solar_view.my_active.preparing is True
+    assert solar_view.my_active.semi_invulnerable is False  # the actual distinguishing bit
+
+    # Distinguishable in the ENCODED vector, not just the PokemonView -
+    # preparing/semi_invulnerable/must_recharge sit at [-4]/[-3]/[-2] of a
+    # single Pokemon's block (protect_counter stays last, at [-1] - see
+    # module docstring).
+    fly_vec = enc._encode_pokemon(fly_view.my_active, defender=fly_view.opp_active)
+    solar_vec = enc._encode_pokemon(solar_view.my_active, defender=solar_view.opp_active)
+    assert fly_vec[-4] == 1.0 and fly_vec[-3] == 1.0  # preparing, semi_invulnerable
+    assert solar_vec[-4] == 1.0 and solar_vec[-3] == 0.0
+    assert not np.array_equal(fly_vec, solar_vec)
+
+
+def test_DW_2_2_must_recharge_is_read_from_the_live_adapter():
+    recharging = make_mon("dragonite")
+    recharging.must_recharge = True
+    opp = make_mon("dragapult")
+    view = battle_view_from_poke_env(_battle([recharging], recharging, [opp], opp))
+
+    assert view.my_active.must_recharge is True
+    vec = enc._encode_pokemon(view.my_active, defender=view.opp_active)
+    assert vec[-2] == 1.0  # must_recharge's position (see module docstring)
+
+    # Sanity: a Pokemon that hasn't just used a recharge move reads False -
+    # isolates that must_recharge is really being read, not defaulted True.
+    rested = make_mon("dragonite")
+    rested_view = battle_view_from_poke_env(_battle([rested], rested, [opp], opp))
+    assert rested_view.my_active.must_recharge is False
+    rested_vec = enc._encode_pokemon(rested_view.my_active, defender=rested_view.opp_active)
+    assert rested_vec[-2] == 0.0
+
+
+def test_charge_and_recharge_state_defaults_false_on_replay_adapter():
+    # Documented live-only gap (see module docstring for the real-replay-
+    # sample verification: no equivalent field exists anywhere in
+    # Metamon's schema, checked directly, not assumed).
+    mon = _replay_pokemon("dragonite")
+    state = _replay_state(mon, _replay_pokemon("dragapult"))
+
+    single_state_view = battle_view_from_replay_state(state)
+    assert single_state_view.my_active.preparing is False
+    assert single_state_view.my_active.semi_invulnerable is False
+    assert single_state_view.my_active.must_recharge is False
+
+    multi_state_views = battle_views_from_replay([state])
+    assert multi_state_views[0].my_active.preparing is False
+    assert multi_state_views[0].my_active.semi_invulnerable is False
+    assert multi_state_views[0].my_active.must_recharge is False
+
+
+def test_charge_and_recharge_state_defaults_false_for_bench_and_unknown_pokemon():
+    unknown = PokemonView.unknown()
+    assert unknown.preparing is False
+    assert unknown.semi_invulnerable is False
+    assert unknown.must_recharge is False
+
+    mine = make_mon("garchomp")
+    mine._preparing_move = Move("fly", gen=9)
+    bench_mon = make_mon("blissey")
+    opp = make_mon("dragapult")
+    view = battle_view_from_poke_env(_battle([mine, bench_mon], mine, [opp], opp))
+
+    assert view.my_active.preparing is True  # the active mon really is mid-charge
+    assert view.my_bench[0].preparing is False  # a benched mon structurally can't be
+    assert view.my_bench[0].semi_invulnerable is False
+    assert view.my_bench[0].must_recharge is False
+
+
+def test_poke_env_semi_invulnerable_is_false_when_not_preparing_any_move():
+    resting = make_mon("dragonite")  # preparing_move is None
+    assert enc._poke_env_semi_invulnerable(resting) is False
+
+    mon = _replay_pokemon("garchomp", moves=[{"name": "earthquake"}, {"name": "dragonclaw"}])
+    state = _replay_state(mon, _replay_pokemon("dragapult"))
+    replay_view = battle_view_from_replay_state(state)
+    known_ids = sorted(m.move_id for m in replay_view.my_active.move_slots if m.known)
+    assert known_ids == sorted(["earthquake", "dragonclaw"])
+
+
+# --- Phase 3 (2026-08-26): weather/terrain-conditional move behavior -------
+#
+# The real diagnosed gap this phase exists to fix (see module docstring):
+# nothing in the vector cross-referenced individual moves/abilities against
+# the battle's actual current weather/terrain - Solar Beam always looked
+# like a charge move even in sun, Swift Swim's speed doubling was invisible,
+# etc. Every hardcoded table below was verified against the real local
+# pokemon-showdown/data/moves.ts and data/abilities.ts checkout (see module
+# docstring for the exact reads), not assumed.
+
+_NEEDS_CHARGE_TURN_IDX = _SCALARS_OFFSET + 24
+_ACCURACY_IDX = _SCALARS_OFFSET + 3
+_BASE_POWER_IDX = _SCALARS_OFFSET + 2
+
+
+def test_DW_3_1_solar_beam_skips_charge_turn_in_sun_not_otherwise():
+    dusclops = make_mon("dusclops")
+    sun_vec = _move_slot("solarbeam", (PokemonType.GRASS,), dusclops.types, weather="sunnyday")
+    no_weather_vec = _move_slot("solarbeam", (PokemonType.GRASS,), dusclops.types)
+    rain_vec = _move_slot("solarbeam", (PokemonType.GRASS,), dusclops.types, weather="raindance")
+
+    assert sun_vec[_NEEDS_CHARGE_TURN_IDX] == 0.0  # skips the charge turn in sun
+    assert no_weather_vec[_NEEDS_CHARGE_TURN_IDX] == 1.0
+    assert rain_vec[_NEEDS_CHARGE_TURN_IDX] == 1.0  # only sun exempts it, not every weather
+
+    # Solar Blade shares the exact same real onTryMove sun-skip logic.
+    solar_blade_sun = _move_slot("solarblade", (PokemonType.GRASS,), dusclops.types, weather="sunnyday")
+    assert solar_blade_sun[_NEEDS_CHARGE_TURN_IDX] == 0.0
+
+
+def test_needs_charge_turn_has_no_sun_exemption_for_other_charge_moves():
+    # Sky Attack is a real charge move but was never verified to skip in
+    # sun (see module docstring's desolateland grep) - it must always still
+    # need its charge turn, distinguishing it from Solar Beam/Solar Blade.
+    dusclops = make_mon("dusclops")
+    vec = _move_slot("skyattack", (PokemonType.FLYING,), dusclops.types, weather="sunnyday")
+    assert vec[_NEEDS_CHARGE_TURN_IDX] == 1.0
+
+
+def test_needs_charge_turn_is_zero_for_a_non_charge_move():
+    dusclops = make_mon("dusclops")
+    vec = _move_slot("tackle", (PokemonType.NORMAL,), dusclops.types, weather="sunnyday")
+    assert vec[_NEEDS_CHARGE_TURN_IDX] == 0.0
+
+
+def test_weather_ball_type_and_power_change_with_real_weather():
+    dusclops = make_mon("dusclops")
+    normal_idx = enc._ALL_TYPES.index(PokemonType.NORMAL)
+    fire_idx = enc._ALL_TYPES.index(PokemonType.FIRE)
+    water_idx = enc._ALL_TYPES.index(PokemonType.WATER)
+    rock_idx = enc._ALL_TYPES.index(PokemonType.ROCK)
+    ice_idx = enc._ALL_TYPES.index(PokemonType.ICE)
+
+    base_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types)
+    assert base_vec[normal_idx] == 1.0  # no weather - stays its real dex type, Normal
+    assert base_vec[_BASE_POWER_IDX] == pytest.approx(50 / enc._MAX_BASE_POWER_SCALE)
+
+    sun_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types, weather="sunnyday")
+    assert sun_vec[fire_idx] == 1.0 and sun_vec[normal_idx] == 0.0
+    assert sun_vec[_BASE_POWER_IDX] == pytest.approx(100 / enc._MAX_BASE_POWER_SCALE)  # doubled
+
+    rain_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types, weather="raindance")
+    assert rain_vec[water_idx] == 1.0
+    assert rain_vec[_BASE_POWER_IDX] == pytest.approx(100 / enc._MAX_BASE_POWER_SCALE)
+
+    sand_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types, weather="sandstorm")
+    assert sand_vec[rock_idx] == 1.0
+
+    snow_vec = _move_slot("weatherball", (PokemonType.NORMAL,), dusclops.types, weather="snow")
+    assert snow_vec[ice_idx] == 1.0
+
+
+def test_weather_ball_effectiveness_uses_its_weather_dependent_type_not_its_dex_type():
+    torkoal = make_mon("torkoal")  # pure Fire - resists Fire (0.5x), weak to Water (2x)
+    sun_vec = _move_slot("weatherball", (PokemonType.NORMAL,), torkoal.types, weather="sunnyday")
+    rain_vec = _move_slot("weatherball", (PokemonType.NORMAL,), torkoal.types, weather="raindance")
+    assert sun_vec[_EFFECTIVENESS_IDX] == pytest.approx(0.5)  # Fire vs Fire
+    assert rain_vec[_EFFECTIVENESS_IDX] == pytest.approx(2.0)  # Water vs Fire
+
+
+def test_thunder_and_hurricane_accuracy_change_with_weather():
+    dusclops = make_mon("dusclops")
+    for move_id, move_type in (("thunder", PokemonType.ELECTRIC), ("hurricane", PokemonType.FLYING)):
+        base_vec = _move_slot(move_id, (move_type,), dusclops.types)
+        rain_vec = _move_slot(move_id, (move_type,), dusclops.types, weather="raindance")
+        sun_vec = _move_slot(move_id, (move_type,), dusclops.types, weather="sunnyday")
+        assert base_vec[_ACCURACY_IDX] == pytest.approx(0.70), move_id
+        assert rain_vec[_ACCURACY_IDX] == pytest.approx(1.0), move_id  # always hits in rain
+        assert sun_vec[_ACCURACY_IDX] == pytest.approx(0.5), move_id  # halved in sun
+
+    # MoveView.accuracy itself stays the static dex value - the override is
+    # only applied at _move_slot_vector time (see module docstring).
+    assert enc._move_view("thunder").accuracy == pytest.approx(0.70)
+
+
+def test_blizzard_accuracy_is_perfect_in_snow_not_other_weather():
+    dusclops = make_mon("dusclops")
+    base_vec = _move_slot("blizzard", (PokemonType.ICE,), dusclops.types)
+    snow_vec = _move_slot("blizzard", (PokemonType.ICE,), dusclops.types, weather="snow")
+    sand_vec = _move_slot("blizzard", (PokemonType.ICE,), dusclops.types, weather="sandstorm")
+    assert base_vec[_ACCURACY_IDX] == pytest.approx(0.70)
+    assert snow_vec[_ACCURACY_IDX] == pytest.approx(1.0)
+    assert sand_vec[_ACCURACY_IDX] == pytest.approx(0.70)  # only snow, not every weather
+
+
+def test_terrain_power_boost_applies_only_to_a_grounded_matching_type_attacker():
+    dusclops = make_mon("dusclops")
+    boosted = _move_slot(
+        "thunderbolt", (PokemonType.ELECTRIC,), dusclops.types,
+        terrain="electricterrain", user_grounded=True,
+    )
+    airborne = _move_slot(
+        "thunderbolt", (PokemonType.ELECTRIC,), dusclops.types,
+        terrain="electricterrain", user_grounded=False,
+    )
+    no_terrain = _move_slot("thunderbolt", (PokemonType.ELECTRIC,), dusclops.types)
+
+    assert boosted[_BASE_POWER_IDX] == pytest.approx(
+        90 * enc._TERRAIN_POWER_MULTIPLIER / enc._MAX_BASE_POWER_SCALE
+    )
+    assert airborne[_BASE_POWER_IDX] == pytest.approx(90 / enc._MAX_BASE_POWER_SCALE)
+    assert no_terrain[_BASE_POWER_IDX] == pytest.approx(90 / enc._MAX_BASE_POWER_SCALE)
+
+
+def test_misty_terrain_does_not_boost_fairy_type_moves():
+    # Real mechanic verified against moves.ts (see module docstring): unlike
+    # Electric/Grassy/Psychic Terrain, Misty Terrain's condition block has
+    # no onBasePower boost for Fairy-type moves at all.
+    dusclops = make_mon("dusclops")
+    boosted_attempt = _move_slot(
+        "moonblast", (PokemonType.FAIRY,), dusclops.types,
+        terrain="mistyterrain", user_grounded=True,
+    )
+    no_terrain = _move_slot("moonblast", (PokemonType.FAIRY,), dusclops.types)
+    assert boosted_attempt[_BASE_POWER_IDX] == pytest.approx(no_terrain[_BASE_POWER_IDX])
+
+
+def test_terrain_sleep_immune_true_under_electric_or_misty_terrain_for_a_grounded_mon():
+    garchomp = make_mon("garchomp")  # Dragon/Ground - ordinarily grounded
+    view = battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active
+    assert enc._terrain_sleep_immune(view, "electricterrain") is True
+    assert enc._terrain_sleep_immune(view, "mistyterrain") is True
+    assert enc._terrain_sleep_immune(view, "grassyterrain") is False  # doesn't block sleep
+    assert enc._terrain_sleep_immune(view, None) is False
+
+
+def test_terrain_status_immune_true_only_under_misty_terrain():
+    garchomp = make_mon("garchomp")
+    view = battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active
+    assert enc._terrain_status_immune(view, "mistyterrain") is True
+    # Electric Terrain's real scope is sleep-only, not full status immunity.
+    assert enc._terrain_status_immune(view, "electricterrain") is False
+
+
+def test_terrain_status_immunity_requires_groundedness():
+    talonflame = make_mon("talonflame")  # Fire/Flying - not grounded
+    view = battle_view_from_poke_env(
+        _battle([talonflame], talonflame, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active
+    assert enc._terrain_sleep_immune(view, "electricterrain") is False
+    assert enc._terrain_status_immune(view, "mistyterrain") is False
+
+
+def test_DW_3_2_swift_swim_speed_doubling_flag_true_in_rain_false_otherwise():
+    kingdra = make_mon("kingdra")
+    kingdra.ability = "swiftswim"
+    opp = make_mon("dragapult")
+
+    rain_view = battle_view_from_poke_env(
+        _battle([kingdra], kingdra, [opp], opp, weather={Weather.RAINDANCE: 1})
+    )
+    no_weather_view = battle_view_from_poke_env(_battle([kingdra], kingdra, [opp], opp))
+
+    assert enc._ability_speed_doubled(
+        rain_view.my_active, rain_view.weather, rain_view.terrain
+    ) is True
+    assert enc._ability_speed_doubled(
+        no_weather_view.my_active, no_weather_view.weather, no_weather_view.terrain
+    ) is False
+
+    # Distinguishable in the ENCODED vector too - the new Phase 3 global
+    # tail block places my/opp_active_speed_doubled at [-9]/[-8] (matchup
+    # score stays [-3], hazard-immunity stays [-2]/[-1] - both already-
+    # anchored tests, unaffected - see module docstring).
+    rain_vec = encode(rain_view)
+    no_weather_vec = encode(no_weather_view)
+    assert rain_vec[-9] == 1.0
+    assert no_weather_vec[-9] == 0.0
+    assert rain_vec[-3] == no_weather_vec[-3]  # matchup score untouched by this feature
+
+
+def test_ability_speed_doubled_requires_the_exact_matching_weather_or_terrain():
+    kingdra = make_mon("kingdra")
+    kingdra.ability = "swiftswim"
+    sun_view = battle_view_from_poke_env(
+        _battle([kingdra], kingdra, [make_mon("dragapult")], make_mon("dragapult"),
+                weather={Weather.SUNNYDAY: 1})
+    )
+    assert enc._ability_speed_doubled(sun_view.my_active, sun_view.weather, sun_view.terrain) is False
+
+    raichu = make_mon("raichualola")  # Alolan Raichu - Surge Surfer is real for this form
+    raichu.ability = "surgesurfer"
+    terrain_view = battle_view_from_poke_env(
+        _battle([raichu], raichu, [make_mon("dragapult")], make_mon("dragapult"),
+                fields={Field.ELECTRIC_TERRAIN: 1})
+    )
+    assert enc._ability_speed_doubled(
+        terrain_view.my_active, terrain_view.weather, terrain_view.terrain
+    ) is True
+
+
+def test_is_grounded_flying_levitate_and_air_balloon_all_block_groundedness():
+    talonflame = make_mon("talonflame")  # Flying-type
+    assert enc._is_grounded(battle_view_from_poke_env(
+        _battle([talonflame], talonflame, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is False
+
+    bronzong = make_mon("bronzong")
+    bronzong.ability = "levitate"
+    assert enc._is_grounded(battle_view_from_poke_env(
+        _battle([bronzong], bronzong, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is False
+
+    garchomp = make_mon("garchomp")
+    garchomp.item = "airballoon"
+    assert enc._is_grounded(battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active) is False
+
+    # An ordinary grounded Pokemon reads True.
+    plain_garchomp = make_mon("garchomp")
+    assert enc._is_grounded(battle_view_from_poke_env(
+        _battle([plain_garchomp], plain_garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active) is True
+
+    # Unknown types default to True (grounded) - see _is_grounded's own
+    # docstring for why this direction matters for _is_hazard_immune below.
+    assert enc._is_grounded(PokemonView.unknown()) is True
+
+
+def test_air_balloon_holder_is_now_hazard_immune_via_the_shared_grounded_helper():
+    # A real, incidental correctness fix from factoring _is_grounded out of
+    # _is_hazard_immune (see both functions' docstrings): Air Balloon
+    # genuinely blocks groundedness in real Showdown (sim/pokemon.ts's
+    # isGrounded), previously unmodeled by _is_hazard_immune's old inline
+    # Flying/Levitate-only check.
+    garchomp = make_mon("garchomp")
+    garchomp.item = "airballoon"
+    view = battle_view_from_poke_env(
+        _battle([garchomp], garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    )
+    assert enc._is_hazard_immune(view.my_active) is True
+
+
+def test_is_hazard_immune_existing_behavior_is_unchanged_by_the_refactor():
+    # Every pre-Phase-3 _is_hazard_immune case must still hold exactly -
+    # re-asserted here directly against the refactored implementation
+    # (see _is_hazard_immune's own Phase 3 docstring note for the by-hand
+    # trace this test backs up).
+    talonflame = make_mon("talonflame")
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([talonflame], talonflame, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is True
+
+    bronzong = make_mon("bronzong")
+    bronzong.ability = "levitate"
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([bronzong], bronzong, [make_mon("garchomp")], make_mon("garchomp"))
+    ).my_active) is True
+
+    garchomp_boots = make_mon("garchomp")
+    garchomp_boots.item = "heavydutyboots"
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([garchomp_boots], garchomp_boots, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active) is True
+
+    plain_garchomp = make_mon("garchomp")
+    assert enc._is_hazard_immune(battle_view_from_poke_env(
+        _battle([plain_garchomp], plain_garchomp, [make_mon("dragapult")], make_mon("dragapult"))
+    ).my_active) is False
+
+    assert enc._is_hazard_immune(PokemonView.unknown()) is False
+
+
+def test_weather_terrain_context_defaults_are_backward_compatible():
+    # Every pre-Phase-3 caller of _move_slot_vector/_move_slots_vector/
+    # _encode_pokemon (including this module's own Phase 1/2 tests, which
+    # never pass weather/terrain/user_grounded) must see identical output
+    # to an explicit "no weather, no terrain, grounded" call.
+    dusclops = make_mon("dusclops")
+    move = enc._move_view("solarbeam")
+    implicit = enc._move_slot_vector(move, (PokemonType.GRASS,), dusclops.types, None, None)
+    explicit = enc._move_slot_vector(
+        move, (PokemonType.GRASS,), dusclops.types, None, None,
+        weather=None, terrain=None, user_grounded=True,
+    )
+    assert np.array_equal(implicit, explicit)
+
+
+# --- Phase 4 (2026-08-27): side-condition completeness, hazard stacking,
+# status severity, tera-used ---------------------------------------------
+#
+# The real gaps this phase closes (see module docstring): Safeguard was
+# absent from the hazard-token vocabulary, hazard stacking (Spikes/Toxic
+# Spikes layer count) was presence-only, badly-poisoned severity had no
+# magnitude, Leech Seed/Substitute/Confusion were invisible, and whether a
+# side had spent its one-time Tera resource wasn't encoded at all.
+#
+# Per-Pokemon-block tail indices (see _encode_pokemon's docstring - these
+# sit BEFORE the already-anchored preparing/semi_invulnerable/
+# must_recharge/protect_counter quartet at [-4]/[-3]/[-2]/[-1]), verified
+# directly against the real implementation, not just derived by hand:
+_TOXIC_COUNTER_IDX = -8
+_HAS_LEECH_SEED_IDX = -7
+_HAS_SUBSTITUTE_IDX = -6
+_IS_CONFUSED_IDX = -5
+
+# Full-vector (encode()) global tail indices - sit BEFORE the already-
+# anchored Phase 3 6-scalar block at [-9]..[-4], matchup score at [-3], and
+# hazard-immunity pair at [-2]/[-1] - also verified directly:
+_MY_SPIKES_LAYERS_IDX = -15
+_MY_TOXIC_SPIKES_LAYERS_IDX = -14
+_OPP_SPIKES_LAYERS_IDX = -13
+_OPP_TOXIC_SPIKES_LAYERS_IDX = -12
+_MY_USED_TERA_IDX = -11
+_OPP_USED_TERA_IDX = -10
+
+
+def test_safeguard_is_now_a_tracked_hazard_token():
+    # Real gap #1 (see module docstring): Safeguard was entirely absent
+    # from _HAZARD_TOKENS - folded in with identical shape to Reflect/Light
+    # Screen (turn-tracked, not stackable).
+    mine = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    live_view = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.SAFEGUARD: 3})
+    )
+    assert live_view.my_hazards == {"safeguard"}
+
+    mon = _replay_pokemon("garchomp")
+    opp_mon = _replay_pokemon("dragapult")
+    replay_view = battle_view_from_replay_state(
+        _replay_state(mon, opp_mon, player_conditions="safeguard")
+    )
+    assert replay_view.my_hazards == {"safeguard"}
+
+
+def test_DW_4_2_spikes_layer_count_encodes_the_real_stack_not_just_presence():
+    mine = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    one_layer = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.SPIKES: 1})
+    )
+    two_layer = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.SPIKES: 2})
+    )
+    assert one_layer.my_spikes_layers == 1
+    assert two_layer.my_spikes_layers == 2
+    # Presence alone (my_hazards) can't distinguish these - the whole point
+    # of this new field.
+    assert one_layer.my_hazards == two_layer.my_hazards == {"spikes"}
+
+    one_vec = encode(one_layer)
+    two_vec = encode(two_layer)
+    assert one_vec[_MY_SPIKES_LAYERS_IDX] == pytest.approx(1.0 / enc._SPIKES_MAX_LAYERS)
+    assert two_vec[_MY_SPIKES_LAYERS_IDX] == pytest.approx(2.0 / enc._SPIKES_MAX_LAYERS)
+    assert not np.array_equal(one_vec, two_vec)
+
+
+def test_toxic_spikes_and_opponent_side_hazard_layers_also_encode_the_real_stack():
+    mine = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    my_toxic_spikes = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.TOXIC_SPIKES: 2})
+    )
+    opp_spikes = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, opp_hazards={SideCondition.SPIKES: 1})
+    )
+    opp_toxic_spikes = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, opp_hazards={SideCondition.TOXIC_SPIKES: 1})
+    )
+    assert my_toxic_spikes.my_toxic_spikes_layers == 2
+    assert opp_spikes.opp_spikes_layers == 1
+    assert opp_toxic_spikes.opp_toxic_spikes_layers == 1
+
+    assert encode(my_toxic_spikes)[_MY_TOXIC_SPIKES_LAYERS_IDX] == pytest.approx(
+        2.0 / enc._TOXIC_SPIKES_MAX_LAYERS
+    )
+    assert encode(opp_spikes)[_OPP_SPIKES_LAYERS_IDX] == pytest.approx(1.0 / enc._SPIKES_MAX_LAYERS)
+    assert encode(opp_toxic_spikes)[_OPP_TOXIC_SPIKES_LAYERS_IDX] == pytest.approx(
+        1.0 / enc._TOXIC_SPIKES_MAX_LAYERS
+    )
+
+
+def test_hazard_stack_layers_clamp_beyond_the_real_showdown_cap():
+    mine = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    over_capped = battle_view_from_poke_env(
+        _battle([mine], mine, [opp], opp, my_hazards={SideCondition.SPIKES: 99})
+    )
+    assert encode(over_capped)[_MY_SPIKES_LAYERS_IDX] == pytest.approx(1.0)  # clamped, not > 1.0
+
+
+def test_DW_4_2_hazard_stack_layers_default_zero_on_replay_adapter_documented_gap():
+    # Structural gap (see module docstring): no "spikes2"/"spikes3"-style
+    # token exists anywhere in the real replay vocabulary - the field only
+    # ever holds the bare condition name, so this can't be reconstructed
+    # even with the whole turn sequence.
+    mon = _replay_pokemon("garchomp")
+    opp = _replay_pokemon("dragapult")
+    state = _replay_state(mon, opp, player_conditions="spikes", opponent_conditions="toxicspikes")
+
+    single_view = battle_view_from_replay_state(state)
+    multi_view = battle_views_from_replay([state])[0]
+
+    for view in (single_view, multi_view):
+        assert view.my_spikes_layers == 0
+        assert view.my_toxic_spikes_layers == 0
+        assert view.opp_spikes_layers == 0
+        assert view.opp_toxic_spikes_layers == 0
+
+
+def test_toxic_counter_is_read_from_the_live_adapter_only_while_badly_poisoned():
+    toxic = make_mon("garchomp", status=Status.TOX)
+    toxic._status_counter = 3
+    opp = make_mon("dragapult")
+    view = battle_view_from_poke_env(_battle([toxic], toxic, [opp], opp)).my_active
+    assert view.toxic_counter == 3
+
+    # Sanity: status_counter is dual-purpose (also tracks sleep turns) - a
+    # Pokemon with a DIFFERENT status must read 0 even if the underlying
+    # poke-env field happens to be nonzero, isolating that the TOX gate
+    # itself is doing the work, not just a pass-through.
+    paralyzed = make_mon("garchomp", status=Status.PAR)
+    paralyzed._status_counter = 3
+    par_view = battle_view_from_poke_env(_battle([paralyzed], paralyzed, [opp], opp)).my_active
+    assert par_view.toxic_counter == 0
+
+
+def test_toxic_counter_encodes_as_a_normalized_scalar_and_clamps():
+    view = PokemonView.unknown()
+    view.known = True  # unknown() zeroes toxic_counter too; only care about that field here
+    defender = PokemonView.unknown()
+
+    vec_at_0 = enc._encode_pokemon(replace(view, toxic_counter=0), defender)
+    vec_at_8 = enc._encode_pokemon(replace(view, toxic_counter=8), defender)
+    vec_at_999 = enc._encode_pokemon(replace(view, toxic_counter=999), defender)
+
+    assert vec_at_0[_TOXIC_COUNTER_IDX] == pytest.approx(0.0)
+    assert vec_at_8[_TOXIC_COUNTER_IDX] == pytest.approx(8.0 / enc._TOXIC_COUNTER_SCALE)
+    assert vec_at_999[_TOXIC_COUNTER_IDX] == pytest.approx(1.0)  # far beyond any real streak - must clamp
+
+
+def test_toxic_counter_defaults_zero_on_replay_adapter_documented_gap():
+    # No equivalent field exists anywhere in Metamon's per-state schema
+    # (only the current status token, no turn count) - see module docstring.
+    mon = _replay_pokemon("garchomp", status="tox")
+    state = _replay_state(mon, _replay_pokemon("dragapult"))
+    single_view = battle_view_from_replay_state(state)
+    multi_view = battle_views_from_replay([state])[0]
+    assert single_view.my_active.toxic_counter == 0
+    assert multi_view.my_active.toxic_counter == 0
+
+
+def test_DW_4_1_leech_seed_substitute_confusion_encode_on_live_adapter():
+    seeded = make_mon("garchomp")
+    seeded.effects[Effect.LEECH_SEED] = 0
+    substituted = make_mon("garchomp")
+    substituted.effects[Effect.SUBSTITUTE] = 0
+    confused = make_mon("garchomp")
+    confused.effects[Effect.CONFUSION] = 0
+    plain = make_mon("garchomp")
+    opp = make_mon("dragapult")
+
+    seeded_view = battle_view_from_poke_env(_battle([seeded], seeded, [opp], opp)).my_active
+    substituted_view = battle_view_from_poke_env(_battle([substituted], substituted, [opp], opp)).my_active
+    confused_view = battle_view_from_poke_env(_battle([confused], confused, [opp], opp)).my_active
+    plain_view = battle_view_from_poke_env(_battle([plain], plain, [opp], opp)).my_active
+
+    assert seeded_view.has_leech_seed is True
+    assert seeded_view.has_substitute is False
+    assert seeded_view.is_confused is False
+    assert substituted_view.has_substitute is True
+    assert confused_view.is_confused is True
+    assert plain_view.has_leech_seed is False
+    assert plain_view.has_substitute is False
+    assert plain_view.is_confused is False
+
+    # Distinguishable in the encoded per-Pokemon block, not just the view.
+    seeded_vec = enc._encode_pokemon(seeded_view, defender=plain_view)
+    assert seeded_vec[_HAS_LEECH_SEED_IDX] == 1.0
+    assert seeded_vec[_HAS_SUBSTITUTE_IDX] == 0.0
+    assert seeded_vec[_IS_CONFUSED_IDX] == 0.0
+
+    substituted_vec = enc._encode_pokemon(substituted_view, defender=plain_view)
+    assert substituted_vec[_HAS_SUBSTITUTE_IDX] == 1.0
+
+    confused_vec = enc._encode_pokemon(confused_view, defender=plain_view)
+    assert confused_vec[_IS_CONFUSED_IDX] == 1.0
+
+
+def test_DW_4_1_leech_seed_substitute_confusion_encode_on_replay_adapter():
+    seeded = _replay_pokemon("garchomp", effect="leechseed")
+    substituted = _replay_pokemon("dragapult", effect="substitute")
+    confused = _replay_pokemon("blissey", effect="confusion")
+    plain = _replay_pokemon("tinkaton", effect="noeffect")
+
+    seeded_view = battle_view_from_replay_state(_replay_state(seeded, plain)).my_active
+    substituted_view = battle_view_from_replay_state(_replay_state(substituted, plain)).my_active
+    confused_view = battle_view_from_replay_state(_replay_state(confused, plain)).my_active
+    plain_view = battle_view_from_replay_state(_replay_state(plain, plain)).my_active
+
+    assert seeded_view.has_leech_seed is True
+    assert seeded_view.has_substitute is False
+    assert substituted_view.has_substitute is True
+    assert confused_view.is_confused is True
+    assert plain_view.has_leech_seed is False
+    assert plain_view.has_substitute is False
+    assert plain_view.is_confused is False
+
+    seeded_vec = enc._encode_pokemon(seeded_view, defender=plain_view)
+    assert seeded_vec[_HAS_LEECH_SEED_IDX] == 1.0
+
+    # battle_views_from_replay (the multi-state adapter) must agree.
+    multi_view = battle_views_from_replay([_replay_state(seeded, plain)])[0].my_active
+    assert multi_view.has_leech_seed is True
+
+
+def test_fainted_teammate_leech_seed_substitute_confusion_flags_are_explicitly_cleared():
+    # A fainted teammate's last-seen snapshot may still show a stale
+    # "effect" from when it was alive - must NOT be trusted (see
+    # _replay_pokemon_view_fainted's docstring: these don't survive a faint
+    # any more than boosts do).
+    seeded_then_fainted = _replay_pokemon("zapdos", effect="leechseed")
+    states = [
+        _replay_state(
+            _replay_pokemon("garchomp"), _replay_pokemon("dragapult"),
+            available_switches=[seeded_then_fainted],
+        ),
+        # zapdos no longer appears anywhere (fainted) - reconstructed as a
+        # known-but-fainted bench slot.
+        _replay_state(_replay_pokemon("garchomp"), _replay_pokemon("dragapult")),
+    ]
+    views = battle_views_from_replay(states)
+    fainted_zapdos = next(p for p in views[1].my_bench if p.known)
+    assert fainted_zapdos.fainted is True
+    assert fainted_zapdos.has_leech_seed is False
+
+
+def test_DW_4_1_my_used_tera_encodes_correctly_on_both_adapters():
+    active = make_mon("garchomp")
+    opp = make_mon("dragapult")
+    not_used = battle_view_from_poke_env(_battle([active], active, [opp], opp))
+    assert not_used.my_used_tera is False
+
+    tera_active = make_mon("garchomp")
+    tera_active._terastallized = True
+    used = battle_view_from_poke_env(_battle([tera_active], tera_active, [opp], opp))
+    assert used.my_used_tera is True
+
+    # Replay: can_tera is verified monotonic (see module docstring) - False
+    # means tera has already been used this battle, exact from one state.
+    mon = _replay_pokemon("garchomp")
+    replay_not_used = battle_view_from_replay_state(
+        _replay_state(mon, _replay_pokemon("dragapult"), can_tera=True)
+    )
+    replay_used = battle_view_from_replay_state(
+        _replay_state(mon, _replay_pokemon("dragapult"), can_tera=False)
+    )
+    assert replay_not_used.my_used_tera is False
+    assert replay_used.my_used_tera is True
+
+    # battle_views_from_replay (multi-state adapter) must agree.
+    multi_used = battle_views_from_replay(
+        [_replay_state(mon, _replay_pokemon("dragapult"), can_tera=False)]
+    )[0]
+    assert multi_used.my_used_tera is True
+
+    # Distinguishable in the encoded vector too.
+    assert encode(used)[_MY_USED_TERA_IDX] == 1.0
+    assert encode(not_used)[_MY_USED_TERA_IDX] == 0.0
+
+
+def test_DW_4_1_used_tera_checks_the_whole_team_not_just_the_active_mon():
+    active = make_mon("garchomp")  # currently active, NOT terastallized
+    benched_tera = make_mon("blissey")
+    benched_tera._terastallized = True  # terastallized earlier, now benched
+    opp = make_mon("dragapult")
+
+    view = battle_view_from_poke_env(_battle([active, benched_tera], active, [opp], opp))
+    assert view.my_used_tera is True  # a benched mon's past tera use still counts
+
+
+def test_DW_4_1_opp_used_tera_is_live_adapter_only_documented_gap():
+    mine = make_mon("garchomp")
+    opp_tera = make_mon("dragapult")
+    opp_tera._terastallized = True
+    live_view = battle_view_from_poke_env(_battle([mine], mine, [opp_tera], opp_tera))
+    assert live_view.opp_used_tera is True  # live-exact
+    assert encode(live_view)[_OPP_USED_TERA_IDX] == 1.0
+
+    mon = _replay_pokemon("garchomp")
+    opp_mon = _replay_pokemon("dragapult")
+    replay_state = _replay_state(mon, opp_mon, can_tera=True)
+    single_view = battle_view_from_replay_state(replay_state)
+    multi_view = battle_views_from_replay([replay_state])[0]
+    # Documented gap - always False, no opponent_can_tera field exists in
+    # the real replay schema (see module docstring).
+    assert single_view.opp_used_tera is False
+    assert multi_view.opp_used_tera is False
+
+
+# --- Phase 5 (2026-08-27): consolidated correctness fixture suite ----------
+#
+# Every earlier phase already has its own isolated fixture tests (DW-1.1
+# through DW-4.2 above) - this section's job is different: prove the pieces
+# work together on realistic COMPOSITE battle states, through the full
+# encode() pipeline, in one place. Not re-testing what a phase's own tests
+# already cover in isolation.
+#
+# Composite PokemonViews are built directly (not via battle_view_from_poke_env)
+# - make_mon() builds a real poke_env.Pokemon but never populates moves/items,
+# and faking that live-adapter machinery just to get a specific known
+# moveset onto a synthetic species would add indirection with no correctness
+# benefit. PokemonView is the shared intermediate representation both real
+# adapters produce, so a fixture built directly at that layer plus encode()
+# still exercises the full downstream pipeline (encode() -> _encode_pokemon
+# -> _move_slots_vector -> _move_slot_vector -> _type_multiplier) on a
+# realistic state - already an established pattern in this file (see
+# test_unknown_pokemon_view_encodes_as_an_all_zero_block above).
+
+
+def _known_pokemon_view(types, base_stats, ability=None, item=None, moves=(), **overrides):
+    """Builds a fully-known PokemonView with real dex-shaped types/stats
+    directly, for composite fixtures - avoids needing to fake poke-env's
+    live Pokemon internals (preparing_move, item, moves) just to combine
+    several features on one synthetic state. Every field not explicitly
+    overridden matches PokemonView's own ordinary "healthy, unafflicted"
+    defaults.
+    """
+    view = PokemonView(
+        known=True, hp_fraction=1.0, fainted=False, status=None,
+        types=types, boosts={n: 0 for n in enc._BOOST_NAMES},
+        base_stats=base_stats, ability=ability, item=item,
+        moves=enc._move_summary_features(moves), move_slots=enc._move_views(moves),
+    )
+    return replace(view, **overrides)
+
+
+# Absolute-index helpers for the full encode() vector, derived from enc.'s
+# own constants (never a hand-copied magic number - same discipline
+# _SCALARS_OFFSET/_STAB_IDX/_EFFECTIVENESS_IDX above already established for
+# a single move-slot vector, extended here to the whole encode() output).
+_MY_ACTIVE_SLOT = 0
+_OPP_ACTIVE_SLOT = MAX_BENCH + 1  # my_active + MAX_BENCH bench slots precede it
+
+# Offset (within one Pokemon's _POKEMON_VEC_LEN-wide block) of the start of
+# its MAX_MOVES*_MOVE_VEC_LEN move-slot region - everything _encode_pokemon
+# concatenates before _move_slots_vector (see its own source): known,
+# hp_fraction, fainted, status one-hot, own-type multi-hot, boosts, base
+# stats, item one-hot(+bucket), then the MoveSummary block.
+_MOVE_SLOTS_START_IN_POKEMON_BLOCK = (
+    3
+    + len(enc._STATUSES)
+    + len(enc._ALL_TYPES)
+    + len(enc._BOOST_NAMES)
+    + len(enc._STAT_NAMES)
+    + (len(enc._ITEM_VOCAB) + 1)
+    + len(enc._move_summary_vector(enc.MoveSummary()))
+)
+
+
+def _pokemon_slot_end(slot_index: int) -> int:
+    """Absolute index one past the end of a given Pokemon-slot's block
+    within a full encode() vector (slot 0 = my_active, 1..MAX_BENCH =
+    my_bench, MAX_BENCH+1 = opp_active - see encode()'s concatenation
+    order)."""
+    return (slot_index + 1) * enc._POKEMON_VEC_LEN
+
+
+def _move_effectiveness_index(pokemon_slot: int, move_slot: int) -> int:
+    return (
+        pokemon_slot * enc._POKEMON_VEC_LEN
+        + _MOVE_SLOTS_START_IN_POKEMON_BLOCK
+        + move_slot * enc._MOVE_VEC_LEN
+        + _EFFECTIVENESS_IDX
+    )
+
+
+def _preparing_idx(slot_index: int) -> int:
+    return _pokemon_slot_end(slot_index) - 4  # see _encode_pokemon's docstring
+
+
+def _semi_invulnerable_idx(slot_index: int) -> int:
+    return _pokemon_slot_end(slot_index) - 3
+
+
+def _must_recharge_idx(slot_index: int) -> int:
+    return _pokemon_slot_end(slot_index) - 2
+
+
+def test_DW_5_1_dragapult_draco_meteor_into_clefable_shows_zero_effectiveness_end_to_end():
+    """The literal diagnosed real-ladder bug this whole plan exists to fix
+    (see encoding.py's module docstring / the plan's Context section): a
+    trained PPO policy used Draco Meteor into Clefable four turns straight,
+    immune every time, because nothing in the vector said "this specific
+    move, right now, does nothing" - only a moveset-wide type-coverage
+    aggregate. This goes through the FULL encode() pipeline on a realistic
+    composite BattleView (real Dragapult/Clefable typing and base stats),
+    not just the _move_slot_vector primitive DW-1.1 already covers with a
+    synthetic pure-Ghost fixture - proving the actual diagnosed failure is
+    fixed end to end, not just a related unit test.
+    """
+    dragapult = _known_pokemon_view(
+        types=(PokemonType.DRAGON, PokemonType.GHOST),
+        base_stats={"hp": 88, "atk": 120, "def": 75, "spa": 100, "spd": 75, "spe": 142},
+        ability="clearbody", moves=["dracometeor"],
+    )
+    clefable = _known_pokemon_view(
+        types=(PokemonType.FAIRY,),
+        base_stats={"hp": 95, "atk": 70, "def": 73, "spa": 95, "spd": 90, "spe": 60},
+        ability="unaware",
+    )
+    battle_view = BattleView(
+        my_active=dragapult, my_bench=[PokemonView.unknown()] * MAX_BENCH,
+        opp_active=clefable, opp_remaining_fraction=1.0,
+        my_hazards=set(), opp_hazards=set(), weather=None, terrain=None,
+    )
+    vec = encode(battle_view)
+    # Draco Meteor is the only known move - sorted move-slot index 0 (see
+    # _move_views).
+    idx = _move_effectiveness_index(_MY_ACTIVE_SLOT, move_slot=0)
+    assert vec[idx] == 0.0
+
+    # Sanity check on the premise, same "prove the feature is doing the
+    # work" pattern this module already uses throughout: the SAME Draco
+    # Meteor into a Dragon-type target (not immune) must NOT read 0.0 -
+    # isolates that this is really about Clefable's Fairy typing, not some
+    # unrelated bug zeroing every move's effectiveness.
+    garchomp = _known_pokemon_view(
+        types=(PokemonType.DRAGON, PokemonType.GROUND),
+        base_stats={"hp": 108, "atk": 130, "def": 95, "spa": 80, "spd": 85, "spe": 102},
+    )
+    not_immune_view = BattleView(
+        my_active=dragapult, my_bench=[PokemonView.unknown()] * MAX_BENCH,
+        opp_active=garchomp, opp_remaining_fraction=1.0,
+        my_hazards=set(), opp_hazards=set(), weather=None, terrain=None,
+    )
+    assert encode(not_immune_view)[idx] > 0.0
+
+
+def test_DW_5_1_composite_state_combines_invulnerability_recharge_weather_ability_and_terrain_signals():
+    """A single composite battle state combining Phase 2 (semi-invulnerable
+    mid-charge, must-recharge) and Phase 3 (weather-doubled ability speed,
+    terrain status immunity) signals at once, both sides, under the SAME
+    weather/terrain - not re-testing any one primitive (each already has its
+    own DW-2/DW-3 isolated test above), but proving they coexist correctly
+    in a single encode() call, which no per-phase test checks. The
+    species/ability/move-state combination here is synthetic (not
+    necessarily a legal real moveset) - this tests the encoder's own
+    composability, not move-pool legality.
+    """
+    my_active = _known_pokemon_view(
+        types=(PokemonType.WATER, PokemonType.DRAGON),
+        base_stats={"hp": 75, "atk": 95, "def": 95, "spa": 95, "spd": 95, "spe": 85},
+        ability="swiftswim", preparing=True, semi_invulnerable=True,
+    )
+    opp_active = _known_pokemon_view(
+        types=(PokemonType.NORMAL,),
+        base_stats={"hp": 250, "atk": 100, "def": 60, "spa": 55, "spd": 90, "spe": 65},
+        must_recharge=True,
+    )
+    battle_view = BattleView(
+        my_active=my_active, my_bench=[PokemonView.unknown()] * MAX_BENCH,
+        opp_active=opp_active, opp_remaining_fraction=1.0,
+        my_hazards=set(), opp_hazards=set(), weather="raindance", terrain="mistyterrain",
+    )
+    vec = encode(battle_view)
+
+    # Phase 2 signals, both sides, read from the same vector:
+    assert vec[_semi_invulnerable_idx(_MY_ACTIVE_SLOT)] == 1.0
+    assert vec[_must_recharge_idx(_OPP_ACTIVE_SLOT)] == 1.0
+    assert vec[_must_recharge_idx(_MY_ACTIVE_SLOT)] == 0.0  # not conflated across sides
+    assert vec[_preparing_idx(_OPP_ACTIVE_SLOT)] == 0.0
+
+    # Phase 3 signals, computed from the SAME weather/terrain simultaneously
+    # (order established by test_DW_3_2 above: [-9]=my_active_speed_doubled,
+    # [-8]=opp_active_speed_doubled, ..., [-5]=my_terrain_status_immune,
+    # [-4]=opp_terrain_status_immune).
+    assert vec[-9] == 1.0  # my Swift Swim doubles Speed in rain
+    assert vec[-8] == 0.0  # opponent has no such ability
+    assert vec[-5] == 1.0  # my_terrain_status_immune (Misty Terrain, grounded)
+    assert vec[-4] == 1.0  # opp_terrain_status_immune too - Misty protects the whole field
+
+
+def test_DW_5_1_composite_state_combines_hazard_stacking_status_severity_and_tera_signals():
+    """A single composite battle state combining Phase 4's headline features
+    - hazard STACK count (not just presence), badly-poisoned severity,
+    Leech Seed/Substitute, and used_tera - on both sides at once, read from
+    one encode() call.
+    """
+    my_active = _known_pokemon_view(
+        types=(PokemonType.STEEL, PokemonType.GRASS),
+        base_stats={"hp": 74, "atk": 94, "def": 131, "spa": 54, "spd": 116, "spe": 20},
+        status=Status.TOX, toxic_counter=5, has_leech_seed=True,
+    )
+    opp_active = _known_pokemon_view(
+        types=(PokemonType.WATER, PokemonType.POISON),
+        base_stats={"hp": 50, "atk": 63, "def": 152, "spa": 53, "spd": 142, "spe": 35},
+        has_substitute=True,
+    )
+    battle_view = BattleView(
+        my_active=my_active, my_bench=[PokemonView.unknown()] * MAX_BENCH,
+        opp_active=opp_active, opp_remaining_fraction=5 / 6,
+        my_hazards={"spikes"}, opp_hazards=set(),
+        weather=None, terrain=None,
+        my_spikes_layers=2, my_toxic_spikes_layers=0,
+        opp_spikes_layers=0, opp_toxic_spikes_layers=1,
+        my_used_tera=True, opp_used_tera=False,
+    )
+    vec = encode(battle_view)
+
+    # Per-Pokemon Phase 4 signals, both sides, isolated via _encode_pokemon
+    # (same already-anchored relative indices this file's own Phase 4
+    # section established above).
+    my_vec = enc._encode_pokemon(my_active, defender=opp_active)
+    opp_vec = enc._encode_pokemon(opp_active, defender=my_active)
+    assert my_vec[_TOXIC_COUNTER_IDX] == pytest.approx(5.0 / enc._TOXIC_COUNTER_SCALE)
+    assert my_vec[_HAS_LEECH_SEED_IDX] == 1.0
+    assert opp_vec[_HAS_SUBSTITUTE_IDX] == 1.0
+    assert opp_vec[_HAS_LEECH_SEED_IDX] == 0.0  # not conflated across sides
+
+    # Global Phase 4 signals, all read from the SAME encode() call - proves
+    # the 2-layer-vs-1-layer stack distinction (DW-4.2's own headline case)
+    # coexists correctly with toxic severity/leech seed/substitute/tera
+    # rather than only being verified in isolation.
+    assert vec[_MY_SPIKES_LAYERS_IDX] == pytest.approx(2.0 / enc._SPIKES_MAX_LAYERS)
+    assert vec[_OPP_TOXIC_SPIKES_LAYERS_IDX] == pytest.approx(1.0 / enc._TOXIC_SPIKES_MAX_LAYERS)
+    assert vec[_MY_USED_TERA_IDX] == 1.0
+    assert vec[_OPP_USED_TERA_IDX] == 0.0

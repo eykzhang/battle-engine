@@ -54,6 +54,7 @@ def _state(won: bool, lost: bool, active=None, available_switches=None) -> dict:
         "battle_lost": lost,
         "player_prev_move": _move(),
         "opponent_prev_move": _move(),
+        "can_tera": True,
     }
 
 
