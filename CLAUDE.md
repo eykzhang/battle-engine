@@ -222,6 +222,21 @@ ctest --test-dir cpp/build
 brew install rustup && export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && rustup default stable
 git clone --depth 1 --branch v0.0.48 https://github.com/pmariglia/poke-engine.git poke-engine
 ./scripts/build_poke_engine.sh
+
+# Phase 6 M2: fetch real gen9ou replays from Showdown's own replay API, into
+# data/replays_showdown/ (gitignored). Unlike the Metamon corpus in
+# data/replays_raw/, these carry BOTH players' actions per turn, which is what
+# M3's fidelity harness needs. Resumable and idempotent - files already on disk
+# count toward --n and are never re-downloaded. Rate-limited by default (--delay);
+# be polite, this is a free public API.
+.venv/bin/python scripts/fetch_showdown_replays.py --n 50 --min-rating 1300
+
+# Parse those replays into (state_before, p1_action, p2_action, state_after)
+# turn transitions. Note the module's central rule: anything not observable from
+# the log is the UNKNOWN sentinel, and bool(UNKNOWN) raises rather than being
+# falsy - see notes/decision-unknown-is-a-sentinel-that-refuses-to-be-falsy.md.
+.venv/bin/python -c "from battle_engine.replay_log import parse_replay_file; \
+  r = parse_replay_file('data/replays_showdown/<id>.json'); print(len(r.transitions))"
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
@@ -237,7 +252,14 @@ harness/training scripts land — don't leave this stale.
   pool for gen9ou (`teams.py`); Phase 3: action-space translation (`action_space.py`),
   the PPO-facing Gymnasium env (`rl_env.py`), imitation/win-prob weight transplant
   (`ppo_warm_start.py`), self-play (`self_play.py`), periodic real-game eval callback
-  + benchmark-facing PPO loader (`ppo_eval.py`); Phase 4: pure-Python MCTS/DUCT
+  + benchmark-facing PPO loader (`ppo_eval.py`); Phase 6: Showdown replay-log parser
+  (`replay_log.py` — protocol log to turn transitions, with an explicit UNKNOWN
+  sentinel for anything the log does not observe) and the poke-env -> poke-engine
+  state translator (`poke_engine_state.py` — validates every species/move/item id
+  against the built extension's own vocabulary, and returns a provenance ledger
+  separating what was observed from what an injectable `UnknownFiller` assumed;
+  M4's set prediction plugs into that seam without touching the module); Phase 4:
+  pure-Python MCTS/DUCT
   validation prototype (`mcts_prototype.py`, throwaway, see Status), compiled C++
   extension lands here as `_native*.so` (gitignored)
 - `cpp/` — Phase 4's C++ engine (M1 toolchain + M4 `BattleState`/hand-crafted-eval
@@ -247,8 +269,9 @@ harness/training scripts land — don't leave this stale.
   and `.cache/` gitignored)
 - `scripts/` — runnable entry points (smoke test, benchmarks, replay fetching,
   dataset building, training, PPO training, PPO replay diagnosis
-  `inspect_ppo_replays.py`, real-ladder play `ladder_ppo.py`, C++ build
-  (`build_cpp.sh`) and its ASan-aware pytest wrapper (`pytest_native.sh`))
+  `inspect_ppo_replays.py`, real-ladder play `ladder_ppo.py`, Showdown replay
+  fetching `fetch_showdown_replays.py`, C++ build (`build_cpp.sh`) and its
+  ASan-aware pytest wrapper (`pytest_native.sh`))
 - `tests/` — pytest (state encoding, damage calc, dataset/action-label logic, model
   training loops, harness determinism w/ seeded RNG, action-space translation, the
   PPO env — including one real-server integration test — PPO warm-start weight
@@ -259,7 +282,9 @@ harness/training scripts land — don't leave this stale.
   (gitignored, built via `scripts/build_poke_engine.sh` — never `pip install`ed, see
   Commands). `src/state.rs`'s `State::deserialize` doctest is the authoritative state
   format; `poke-engine-py/src/lib.rs` is the exposed Python API surface
-- `data/` — gitignored: `replays_raw/` (fetched replays), `dataset/` (cached train/val
+- `data/` — gitignored: `replays_raw/` (Metamon parsed replays, supervised datasets
+  only), `replays_showdown/` (Phase 6: raw Showdown replay JSON, both sides'
+  actions), `dataset/` (cached train/val
   arrays for both the win-prob and action-label datasets), `models/` (trained
   checkpoints: `win_prob.pt`, `imitation.pt`, and PPO checkpoints once
   `train_ppo.py --save` is used) — see commands above
