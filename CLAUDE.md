@@ -82,6 +82,33 @@ Current state, as of 2026-08-30:
   Phase 3's measured 26.3% baseline. Full plan:
   `/Users/edward/.claude/plans/phase-6-foul-play-architecture.md`.
 
+  Milestone state as of 2026-08-30:
+
+  - **M1** (gen9 toolchain) — built and verified; `scripts/build_poke_engine.sh` plus the
+    gen9 guard test.
+  - **M2** (replay corpus + protocol parser) — done. 300 rating-filtered gen9ou replays in
+    `data/replays_showdown/`, `battle_engine/replay_log.py`.
+  - **M3** (translation layer + fidelity harness) — done, with one scope cut recorded in
+    [[battle-engine/notes/phase-6-m3-fidelity-harness|the log note]]: only the poke-engine
+    backend is scored, not our own `forward_model.cpp`, because the integration decision it
+    fed was already made on throughput grounds. Measured over 5,738 turns of real gen9ou:
+    **only 29.6% of turns are representable from revealed information alone** — on the other
+    70.4%, a search cannot even express the move that was actually played. Given the action,
+    poke-engine is exactly right on 33.7% of turns and right-or-near-right (only error an HP
+    figure within 10%) on **54.1%**. Residual error is dominated by damage numbers, and
+    supplying every ability the battle eventually reveals barely moves them — the gap is EV
+    spreads and items, which no replay ever shows.
+  - **M4** (set prediction) — next, and now scoped against measured numbers rather than
+    Foul Play's assertion. The M3 result says it must predict **spreads**, not just species,
+    items and abilities: a filler that supplies only the latter leaves most of the damage
+    error on the table. Note also that a battle eventually reveals just 40.5% of abilities and
+    26.8% of items, so in-battle inference cannot be the primary source — usage statistics are.
+  - **M5** (the player) and **M6** (real-ladder GXE) — not started. M5 is blocked on M4 more
+    strictly than the plan assumed: an unrevealed slot's placeholder species id is `none`,
+    which is also poke-engine's "do nothing" action string, so an unrevealed slot cannot be
+    switched into at all
+    ([[battle-engine/notes/gotcha-poke-engine-addresses-actions-by-name-not-index|note]]).
+
 ## Working notes
 
 When a session solves something non-obvious, write it down in that session:
@@ -237,6 +264,19 @@ git clone --depth 1 --branch v0.0.48 https://github.com/pmariglia/poke-engine.gi
 # falsy - see notes/decision-unknown-is-a-sentinel-that-refuses-to-be-falsy.md.
 .venv/bin/python -c "from battle_engine.replay_log import parse_replay_file; \
   r = parse_replay_file('data/replays_showdown/<id>.json'); print(len(r.transitions))"
+
+# Phase 6 M3: score the forward model against the replay corpus. Drives a real
+# poke-env Battle from each replay log, stops at every turn boundary, asks the
+# model what both players' actual actions will do, and diffs its answer against
+# the log. Reads cached JSON off disk - no Showdown server, no network.
+# Runs two conditions by default and prints the delta between them: the
+# "action-oracle" supplies only the move/switch/Tera the turn needs, the
+# "hindsight-oracle" also supplies every ability and move the battle will
+# eventually reveal. That delta is what set prediction is worth, and it is the
+# number M4 is scoped against. Full results and method:
+# notes/phase-6-m3-fidelity-harness.md.
+.venv/bin/python scripts/fidelity_harness.py
+.venv/bin/python scripts/fidelity_harness.py --limit 50 --condition action --json data/fidelity.json
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
@@ -258,7 +298,12 @@ harness/training scripts land — don't leave this stale.
   state translator (`poke_engine_state.py` — validates every species/move/item id
   against the built extension's own vocabulary, and returns a provenance ledger
   separating what was observed from what an injectable `UnknownFiller` assumed;
-  M4's set prediction plugs into that seam without touching the module); Phase 4:
+  M4's set prediction plugs into that seam without touching the module), and the
+  forward-model fidelity harness (`fidelity.py` — replay log -> poke-env
+  `Battle` -> poke-engine `State`, one turn simulated, diffed against what the
+  log says happened; `ForwardModelBackend` is a real seam but only the
+  poke-engine backend is implemented, see the module docstring for why);
+  Phase 4:
   pure-Python MCTS/DUCT
   validation prototype (`mcts_prototype.py`, throwaway, see Status), compiled C++
   extension lands here as `_native*.so` (gitignored)
@@ -270,12 +315,15 @@ harness/training scripts land — don't leave this stale.
 - `scripts/` — runnable entry points (smoke test, benchmarks, replay fetching,
   dataset building, training, PPO training, PPO replay diagnosis
   `inspect_ppo_replays.py`, real-ladder play `ladder_ppo.py`, Showdown replay
-  fetching `fetch_showdown_replays.py`, C++ build (`build_cpp.sh`) and its
+  fetching `fetch_showdown_replays.py`, forward-model fidelity scoring
+  `fidelity_harness.py`, C++ build (`build_cpp.sh`) and its
   ASan-aware pytest wrapper (`pytest_native.sh`))
 - `tests/` — pytest (state encoding, damage calc, dataset/action-label logic, model
   training loops, harness determinism w/ seeded RNG, action-space translation, the
   PPO env — including one real-server integration test — PPO warm-start weight
-  transplant, self-play, PPO eval/benchmark loading, native-extension bindings)
+  transplant, self-play, PPO eval/benchmark loading, native-extension bindings;
+  Phase 6: the replay-log parser, the poke-env -> poke-engine translator, and the
+  fidelity harness's own judgment calls — which turns it excludes and why)
 - `pokemon-showdown/` — local simulator checkout (gitignored). `sim/SIM-PROTOCOL.md`
   is the authoritative spec for Phase 6's replay-log parser
 - `poke-engine/` — Phase 6's Rust forward model, pinned checkout at v0.0.48

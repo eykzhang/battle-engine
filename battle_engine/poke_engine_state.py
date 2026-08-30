@@ -234,6 +234,21 @@ def require_ability(ability_id: str) -> str:
     return ability_id
 
 
+def require_tera_type(type_name: str) -> str:
+    """Normalize a poke-env type name or a poke-engine type id to the latter.
+
+    poke-engine's `PokemonType` is the one enum with a default arm
+    (module docstring, point 4), so a bad Tera type here would not panic -
+    it would silently become `typeless`, which reads as "no Tera type" and
+    is exactly the kind of assumption that looks like an observation. So it
+    is checked.
+    """
+    candidate = to_id_str(type_name)
+    if candidate not in _ENGINE_TYPES:
+        raise UnknownToPokeEngine("type", type_name, "poke-engine PokemonType")
+    return candidate
+
+
 def require_item(item_id: str) -> str:
     if not is_known_item(item_id):
         raise UnknownToPokeEngine(
@@ -301,6 +316,7 @@ _TYPE_TO_ENGINE: Dict[PokemonType, str] = {
     t: t.name.lower() for t in PokemonType if t is not PokemonType.THREE_QUESTION_MARKS
 }
 _TYPE_TO_ENGINE[PokemonType.THREE_QUESTION_MARKS] = TYPELESS
+_ENGINE_TYPES = frozenset(_TYPE_TO_ENGINE.values())
 
 # poke-engine keeps every side condition as one i8 field on `SideConditions`.
 # Stealth Rock and Sticky Web are 0/1 flags there; Spikes and Toxic Spikes
@@ -414,6 +430,11 @@ class SlotFill:
     ability: Optional[str] = None
     moves: Tuple[str, ...] = ()
     level: Optional[int] = None
+    tera_type: Optional[str] = None
+    """A poke-engine type id, or a poke-env type name - `require_tera_type`
+    normalizes either. Only meaningful before the Pokemon has actually
+    terastallized: once it has, poke-env reveals the real Tera type and the
+    observation wins, like every other field here."""
 
 
 class UnknownFiller(Protocol):
@@ -663,6 +684,29 @@ def _resolve_ability(
     return candidate
 
 
+def _resolve_tera_type(
+    observed: Optional[str], filled: Optional[str], slot: str, source: str, log: list
+) -> str:
+    """Observation wins over fill, same as everywhere else here.
+
+    A Pokemon that has not terastallized yet has no *observable* Tera type,
+    but it still has one, and `-tera` move choices are resolved against it -
+    so a fill that names it is the difference between a simulated Tera
+    getting real STAB and getting `typeless`. Left alone, the value is
+    `typeless`, which is also what poke-engine uses for "no second type",
+    so an assumed one is always recorded rather than left to look like a
+    reading.
+    """
+    if observed:
+        log.append(Attribution(slot, "tera_type", observed, True, "poke-env"))
+        return observed
+    if not filled:
+        return TYPELESS
+    candidate = require_tera_type(filled)
+    log.append(Attribution(slot, "tera_type", candidate, False, source))
+    return candidate
+
+
 def _resolve_moves(
     observed: Tuple[str, ...], filled: Tuple[str, ...], slot: str, source: str, log: list
 ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
@@ -713,7 +757,7 @@ def _pokemon_from_observation(
         # own docstring); poke-engine's sleep_turns means the same thing.
         sleep_turns = mon.status_counter if mon.status is Status.SLP else 0
         terastallized = mon.is_terastallized
-        tera_type = observation.tera_type or TYPELESS
+        tera_type = _resolve_tera_type(observation.tera_type, fill.tera_type, slot, source, log)
         pp = {to_id_str(mid): move.current_pp for mid, move in mon.moves.items()}
         stats_observed = _known_stat(mon, "atk")
         hp_observed = _known_stat(mon, "hp")
@@ -727,7 +771,7 @@ def _pokemon_from_observation(
         status = NO_STATUS
         sleep_turns = 0
         terastallized = False
-        tera_type = TYPELESS
+        tera_type = _resolve_tera_type(None, fill.tera_type, slot, source, log)
         pp = {}
         stats_observed = hp_observed = False
     log.append(Attribution(slot, "stats", stats, stats_observed, "poke-env" if stats_observed else source))
@@ -828,6 +872,41 @@ def _side_conditions(conditions: Mapping, turn: int, side: str, toxic_count: int
     return poke_engine.SideConditions(**fields)
 
 
+def _last_used_move(
+    active: Optional[Pokemon], built_moves: Sequence, volatiles: set, side: str, log: list
+) -> str:
+    """poke-engine's `Side.last_used_move`, as `move:<index>` or `move:none`.
+
+    This field looks inert and is not. `generate_instructions` **panics**
+    (not raises - see this module's footgun 4) with "Encore should not be
+    active when last used move is not a move" whenever a side carries the
+    `encore` volatile and this is anything but `Move(_)`: encore.rs looks up
+    `side.get_active_immutable().moves[&last_used_move]` unconditionally.
+    Leaving the field at its `move:none` default therefore turns every
+    Encored position into a hard crash of the whole process, which on the
+    real ladder is a forfeited game. Found by
+    battle_engine/fidelity.py's corpus run, not by reading the code.
+
+    poke-env tracks the move via `Move.is_last_used`, which is exactly the
+    move Encore locks, so the observation is available. When it is not -
+    the Pokemon has not moved since it came in - `encore` is *dropped* from
+    the volatile set rather than pointed at an arbitrary move index: a wrong
+    index would silently force the wrong move every turn, which is worse
+    than not modelling Encore at all.
+    """
+    last = active.last_move if active is not None else None
+    if last is not None:
+        last_id = to_id_str(last.id)
+        for index, move in enumerate(built_moves):
+            if move.id == last_id:
+                log.append(Attribution(side, "last_used_move", last_id, True, "poke-env"))
+                return f"move:{index}"
+    if "encore" in volatiles:
+        volatiles.discard("encore")
+        log.append(Attribution(side, "volatile_statuses_dropped", ("encore",), False, "no-last-used-move"))
+    return "move:none"
+
+
 def _build_side(
     team: Mapping[str, Pokemon],
     active: Optional[Pokemon],
@@ -901,11 +980,15 @@ def _build_side(
         substitute_health = _hp_pair(active)[1] // 4
         log.append(Attribution(side, "substitute_health", substitute_health, False, "assumed-full"))
 
+    volatiles = _volatile_statuses(active, f"{side}:{active_index}", log)
+    last_used_move = _last_used_move(active, pokemon[active_index].moves, volatiles, side, log)
+
     return poke_engine.Side(
         pokemon=pokemon,
         active_index=str(active_index),
         side_conditions=side_conditions,
-        volatile_statuses=_volatile_statuses(active, f"{side}:{active_index}", log),
+        volatile_statuses=volatiles,
+        last_used_move=last_used_move,
         substitute_health=substitute_health,
         attack_boost=boosts.get("atk", 0),
         defense_boost=boosts.get("def", 0),

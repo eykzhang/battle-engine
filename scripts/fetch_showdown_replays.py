@@ -147,6 +147,7 @@ def fetch_replays(
     before: int | None = None
     scanned = 0
     skipped_filtered = 0
+    skipped_no_battle = 0
     ratings: list[int] = []
 
     for page in range(max_pages):
@@ -180,6 +181,16 @@ def fetch_replays(
             time.sleep(delay)
             if payload is None or not payload.get("log"):
                 continue
+            if "\n|turn|" not in payload["log"]:
+                # A real and not-rare case: a rated game forfeited at team
+                # preview still gets a replay, an id, and a rating, but its log
+                # is player/badge chatter with no battle in it. Rejected here
+                # rather than on the way out, because everything downstream
+                # treats "a file in the corpus" as "a battle" - one of these
+                # slipping in fails the M2 corpus invariant test with a
+                # `ReplayParseError` that reads like a parser bug.
+                skipped_no_battle += 1
+                continue
 
             (out_dir / f"{replay_id}.json").write_text(json.dumps(payload))
             on_disk.add(replay_id)
@@ -197,8 +208,8 @@ def fetch_replays(
 
     rating_range = f"{min(ratings)}-{max(ratings)}" if ratings else "n/a"
     print(f"Done: {collected} replays in {out_dir} (scanned {scanned} search results, "
-          f"{skipped_filtered} filtered out, ratings this run {rating_range}, "
-          f"{time.monotonic() - started:.0f}s)")
+          f"{skipped_filtered} filtered out, {skipped_no_battle} with no |turn| in the log, "
+          f"ratings this run {rating_range}, {time.monotonic() - started:.0f}s)")
     return collected
 
 
