@@ -5,21 +5,34 @@ this repository.
 
 ## Project
 
-battle-engine is an ML/search Pokémon battle engine ("Stockfish for Pokémon") — the
+battle-engine is a search-based Pokémon battle engine ("Stockfish for Pokémon") — the
 intelligence layer behind the sibling `../battle-brain` iOS app. It plays and analyzes
-Pokémon Showdown battles via game-tree search and machine learning, developed in
-phased stages (classical search → supervised learning → RL → C++ core as stretch).
+Pokémon Showdown battles by game-tree search over a battle simulator, guided by a
+hand-crafted evaluation function.
 
-**This is explicitly a learning project** — the user has little prior ML experience
-and wants to learn it here (and C++ in the stretch phase). Prefer explaining-while-
-building over dropping in finished solutions: when introducing an ML concept
-(loss functions, state encoding, PPO, etc.), explain what it is and why it's the right
-tool before/while using it. Small, understood steps beat big opaque ones.
+It got here through phased stages (classical search → supervised learning → RL → C++
+core), and the machine-learning phases are recorded work rather than the live
+architecture: **the reinforcement-learning track was terminated on 2026-08-30** in
+favor of the Foul Play architecture — search plus set prediction over a complete
+forward model, no learned policy. See the Status section for what that means for the
+existing checkpoints and code.
 
-The full phased roadmap, decisions, and rationale are in
-`/Users/edward/.claude/plans/completely-overhaul-the-battle-wondrous-pillow.md` — read
-it before making architectural decisions. The iOS/AWS side is planned in
-`/Users/edward/.claude/plans/battlebrain-an-happy-summit.md`.
+**This is explicitly a learning project** — the user had little prior ML experience
+and wanted to learn it here (and C++ in the later phases). Prefer explaining-while-
+building over dropping in finished solutions: when introducing a concept (search,
+state representation, set prediction, PPO in the historical code), explain what it is
+and why it's the right tool before/while using it. Small, understood steps beat big
+opaque ones.
+
+Plans, in roadmap order (read the active one before making architectural decisions):
+
+- Phase 4, the C++ search core: `/Users/edward/.claude/plans/precious-crafting-bachman.md`
+- Phase 4 close-out (M7 + enhancement track): `/Users/edward/.claude/plans/zesty-zooming-wozniak.md`
+- **Phase 6, active** — the Foul Play architecture:
+  `/Users/edward/.claude/plans/phase-6-foul-play-architecture.md`
+
+(The original roadmap plan file no longer exists on disk; `notes/index.md` plus the
+Status section below are the surviving record of phases 0-3.)
 
 ## Status and history
 
@@ -35,23 +48,39 @@ Current state, as of 2026-08-30:
 - **Phase 2** (supervised) — win-probability and imitation models built. Milestone E gate **not
   met**: a learned eval bolted onto the same 2-ply search plateaued in a 35-40% band, judged a
   structural ceiling rather than a tuning problem.
-- **Phase 3** (RL) — **gate met, directly measured, historically** (pre-rewrite encoding). PPO
-  self-play beat the Phase-1 search bot 69.6% [65.4, 73.5] and the Phase-2 supervised bot 69.2%
-  [65.0, 73.1] on a 665-dim encoding. The 2026-08-27 encoding rewrite (`VECTOR_LEN` 665 -> 2156)
-  and same-day team-pool expansion (5 -> 26 teams) invalidated every trained checkpoint; a
-  4-day, 9-run retrain attempt (2026-08-27 to 2026-08-30) never reproduced the gate and was
-  **abandoned, not continued** — see
+- **Phase 3** (RL) — **terminated 2026-08-30.** The gate was met historically and directly
+  measured against the pre-rewrite 665-dim encoding: PPO self-play beat the Phase-1 search bot
+  69.6% [65.4, 73.5] and the Phase-2 supervised bot 69.2% [65.0, 73.1]. The 2026-08-27 encoding
+  rewrite (`VECTOR_LEN` 665 -> 2156) and same-day team-pool expansion (5 -> 26 teams)
+  invalidated every trained checkpoint; a 4-day, 9-run retrain attempt never reproduced the gate
+  and was abandoned — see
   [[battle-engine/notes/decision-phase-3-retrain-abandoned-for-phase-4-focus|the decision note]].
-  Not being actively worked; historical result stands, frozen against the old encoding.
-- **Phase 4** (C++ core) — **now the project's active focus.** M0-M7 complete as of 2026-08-26
-  (MCTS/DUCT search, hand-crafted eval as the default leaf evaluator, PUCT search with the
-  pre-rewrite PPO actor as an optional prior — real 60.4% [56.0, 64.6] vs. hand-crafted-eval-only
-  search; see `overview.md`'s Measurable Outcomes). New goal as of 2026-08-30: get the engine to
-  beat most players, not just this project's own internal bot roster — not yet turned into a
-  measured, gated target (population, rating band, real match count all still to be decided).
-  Does not depend on Phase 3 — modeled in part on
-  [pmariglia/foul-play](https://github.com/pmariglia/foul-play), one of the top-ranked real
-  Showdown bots, which uses search over a hand-crafted eval with no RL/self-play at all.
+  Phase 6 makes that permanent rather than paused: **no learned policy is on the critical path
+  any more.** The PPO/PUCT code, `cpp/src/mlp.cpp`, and the trained checkpoints stay in the tree
+  as recorded work — not maintained, not retrained, and **not to be described as the engine's
+  current architecture.** The 69.6%/69.2% numbers remain quotable only with their
+  "against the old encoding, historical" qualifier attached.
+- **Phase 4** (C++ core) — complete as of 2026-08-26. M0-M7: MCTS/DUCT search, hand-crafted eval
+  as the default leaf evaluator, PUCT search with the pre-rewrite PPO actor as an optional prior
+  (real 60.4% [56.0, 64.6] vs. hand-crafted-eval-only search). The search is sound; the honest
+  result is that it **loses to the Phase-1 2-ply bot, 32.4% [28.4, 36.6]** — see
+  [[battle-engine/notes/phase-4-m7-and-enhancement-track|the close-out note]] for the full
+  inventory.
+- **Phase 5** (state-encoding rewrite) — complete. `VECTOR_LEN` 665 -> 2156, per-move-slot
+  feature blocks, correctness harness passing. Numbered as Phase 5 in `README.md`'s public phase
+  table; note that some existing notes use "Phase 5" for plan-local milestone numbering inside
+  the Phase 4 plan instead.
+- **Phase 6** (the Foul Play architecture) — **now the project's active focus**, started
+  2026-08-30. Diagnosis: Phase 4 did not fail to build a search, it built a good search over a
+  forward model that cannot represent the game (`forward_model.cpp` mentions `Status` exactly
+  once, an early `return 0.0f` — no boosts, items, abilities, residuals, weather effects, or
+  Tera). Phase 6 binds [poke-engine](https://github.com/pmariglia/poke-engine) as a complete
+  gen9 forward model, adds usage-stats-based opponent set prediction, and searches under a
+  wall-clock budget with root parallelism — the architecture
+  [pmariglia/foul-play](https://github.com/pmariglia/foul-play) uses to reach 80% GXE and top
+  100 in gen9 OU with no RL at all. **Gate: GXE above 50% on the real gen9ou ladder**, against
+  Phase 3's measured 26.3% baseline. Full plan:
+  `/Users/edward/.claude/plans/phase-6-foul-play-architecture.md`.
 
 ## Working notes
 
@@ -181,6 +210,18 @@ export POKE_SHOWDOWN_PASSWORD=...
 
 # Run the Catch2 C++ unit test suite once cpp/tests/ has real tests (M4+)
 ctest --test-dir cpp/build
+
+# Phase 6: build the gen9 poke-engine Python bindings. DO NOT `pip install
+# poke-engine` - the published wheel is a gen4 build (generation is a
+# compile-time Cargo feature) and would simulate gen9ou states under gen4
+# mechanics with no error at all. See
+# notes/gotcha-poke-engine-pypi-wheel-is-gen4-not-gen9.md for the full finding,
+# the three checks that confirm a build really is gen9, and the three
+# silent-failure footguns in its Python API.
+# cargo is NOT on the default PATH - brew's rustup formula is keg-only.
+brew install rustup && export PATH="/opt/homebrew/opt/rustup/bin:$PATH" && rustup default stable
+git clone --depth 1 --branch v0.0.48 https://github.com/pmariglia/poke-engine.git poke-engine
+./scripts/build_poke_engine.sh
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
@@ -212,7 +253,12 @@ harness/training scripts land — don't leave this stale.
   training loops, harness determinism w/ seeded RNG, action-space translation, the
   PPO env — including one real-server integration test — PPO warm-start weight
   transplant, self-play, PPO eval/benchmark loading, native-extension bindings)
-- `pokemon-showdown/` — local simulator checkout (gitignored)
+- `pokemon-showdown/` — local simulator checkout (gitignored). `sim/SIM-PROTOCOL.md`
+  is the authoritative spec for Phase 6's replay-log parser
+- `poke-engine/` — Phase 6's Rust forward model, pinned checkout at v0.0.48
+  (gitignored, built via `scripts/build_poke_engine.sh` — never `pip install`ed, see
+  Commands). `src/state.rs`'s `State::deserialize` doctest is the authoritative state
+  format; `poke-engine-py/src/lib.rs` is the exposed Python API surface
 - `data/` — gitignored: `replays_raw/` (fetched replays), `dataset/` (cached train/val
   arrays for both the win-prob and action-label datasets), `models/` (trained
   checkpoints: `win_prob.pt`, `imitation.pt`, and PPO checkpoints once

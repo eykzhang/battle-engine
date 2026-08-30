@@ -3,10 +3,16 @@
 An ML/search battle engine for competitive Pokémon: "Stockfish for Pokémon."
 
 The engine plays and analyzes [Pokémon Showdown](https://pokemonshowdown.com/)
-battles using game-tree search and machine learning, built in stages that mirror how
-chess engines actually evolved: hand-crafted evaluation and search first, then a
-learned evaluation trained on millions of human replays (the "NNUE moment"), then
-reinforcement learning through self-play.
+battles using game-tree search, built in stages that mirror how chess engines actually
+evolved: hand-crafted evaluation and search first, then a learned evaluation trained on
+millions of human replays (the "NNUE moment"), then reinforcement learning through
+self-play, then a compiled C++ search core.
+
+The learning phases were built, measured, and are documented below — including the one
+that met its gate. They are recorded work rather than the current architecture. As of
+2026-08-30 the reinforcement-learning track is **terminated**, and development has
+turned to search plus opponent set prediction over a complete forward model, with no
+learned policy in the loop. Phase 6 below explains why, and what measurement forced it.
 
 It's the intelligence layer behind [BattleBrain](https://github.com/eykzhang/battle-brain),
 a native iOS app that surfaces the engine's per-turn win-probability analysis for
@@ -44,7 +50,8 @@ advances:
 | 2 | First ML: learned win-probability model + move-prediction model, trained on millions of parsed human replays | beats the Phase-1 bot head-to-head |
 | 3 | Reinforcement learning: PPO self-play, initialized from the Phase-2 policy | beats the Phase-2 bot head-to-head + a real ladder GXE |
 | 4 | Stretch, complete: C++ search core (MCTS/DUCT, PUCT with a trained PPO prior/value, compiled inference) | measured, not gated — exploratory by design |
-| 5 | Stretch, complete: comprehensive state-encoding rewrite, closing the real-ladder gap | correctness harness passing, not a win-rate gate — retraining is the next stretch step |
+| 5 | Stretch, complete: comprehensive state-encoding rewrite, closing the real-ladder gap | correctness harness passing, not a win-rate gate |
+| 6 | Active: search + opponent set prediction over a complete forward model (the Foul Play architecture); RL track terminated | GXE above 50% on the real gen9ou ladder |
 
 The end-state architecture mirrors Stockfish and Leela Chess Zero: train in Python,
 search and infer in C++.
@@ -82,7 +89,13 @@ setup-move detection). After four rounds of iteration, the learned eval plateaue
 lingering bug: a learned evaluation bolted onto the same shallow 2-ply search
 structurally can't see switching's multi-turn value.
 
-**Phase 3 gate met.** PPO self-play sidesteps Phase 2's ceiling by learning a policy
+**Phase 3 gate met, then terminated (2026-08-30).** The result below is real and was
+directly measured, but it was measured against the pre-rewrite 665-dim encoder. Phase
+5's encoding rewrite invalidated every trained checkpoint, a nine-run retrain never
+reproduced the gate, and Phase 6 ended the track rather than continuing it. Read the
+numbers as a historical measurement, not as the engine's current strength.
+
+PPO self-play sidesteps Phase 2's ceiling by learning a policy
 directly instead of ranking states through fixed-depth lookahead. Built and
 independently reviewed: an action-space translation layer reconciling poke-env's
 scheme with the project's own, masked PPO (illegal actions excluded at the
@@ -148,11 +161,48 @@ invalidated by the shape change** — a full replay-dataset-rebuild → retrain 
 (the already-fetched replay sample is fully reusable; only `encode()` changed, not
 the fetch/label logic) is the next stretch step, not yet executed.
 
+**Phase 6 (search + set prediction over a complete forward model) in progress; the RL
+track is terminated.** Retraining against the new 2156-dim encoder was the planned next
+step. It isn't any more, and the reason is a number rather than a preference.
+
+Two measurements framed it. The C++ MCTS/DUCT search loses to the much simpler Phase-1
+2-ply bot, 32.4% [28.4, 36.6]. And the best asset the project has ever produced, the
+trained PPO policy, went 16-29 on the real ladder for 26.3% GXE. Against real opponents,
+every version of this engine has been an underdog.
+
+The diagnosis is that Phase 4 didn't fail to build a search — it built a sound search
+over a forward model that can't represent the game. `cpp/src/forward_model.cpp` mentions
+status moves exactly once, as an early return of zero damage: no stat boosts, no items,
+no abilities, no residual damage, no weather effects, no Terastallization. That was a
+deliberate, documented scope cut, but it explains the result better than the original
+"branching search doesn't help" reading did. A 2-ply search makes one forward-model
+call; a depth-4 search compounds the same model error four times over. Deeper search
+over a model that thin *should* lose to shallower search, and it does.
+
+The reference point is [Foul Play](https://github.com/pmariglia/foul-play), which
+reaches 80% GXE and top 100 in gen9 OU using no reinforcement learning at all: DUCT
+search guided by a hand-crafted evaluation, over the near-complete
+[poke-engine](https://github.com/pmariglia/poke-engine) simulator, with unknown opponent
+sets sampled from usage statistics. Its author's stated headline lesson is that set
+prediction matters as much as or more than the search itself. This project already had
+the search — architecturally the same algorithm — and neither of the other two pieces.
+
+So Phase 6 keeps the search shape, binds poke-engine as a complete gen9 forward model,
+and adds the opponent modeling. The gate is GXE above 50% on the real ladder: better
+than most human players, measured against real ones rather than against this project's
+own bots.
+
+The trained checkpoints, the PPO and PUCT code, and the C++ neural-network forward pass
+stay in the tree as recorded, measured work. They are not maintained, and the Phase 3
+win rates are only quotable against the pre-rewrite encoder they were measured on.
+
 ## Current focus
 
-Retraining `win_prob.pt`/`imitation.pt`/PPO against the new 2156-dim encoder, once
-university-cluster compute access is confirmed — the natural next step after Phase
-5's rewrite, not yet started.
+Phase 6 M1–M3: the gen9 poke-engine toolchain (done — with a guard test, because the
+published wheel is a gen4 build that fails silently), a Showdown replay corpus with both
+sides' actions parsed from the raw protocol, and a backend-pluggable fidelity harness
+that measures per-turn divergence for the old and new forward models against the same
+real battles.
 
 ## Setup
 

@@ -8,6 +8,11 @@ __pycache__/
 # Local Pokémon Showdown server checkout (cloned per README, not vendored)
 pokemon-showdown/
 
+# poke-engine Rust source checkout (Phase 5). Cloned + built per
+# notes/gotcha-poke-engine-pypi-wheel-is-gen4-not-gen9.md, not vendored -
+# the PyPI wheel is a gen4 build and cannot be used.
+poke-engine/
+
 # Training artifacts / datasets (large, regenerable)
 data/
 runs/
