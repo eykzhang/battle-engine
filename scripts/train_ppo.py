@@ -58,6 +58,27 @@ so the policy can never actually pick one - env.strict=False stays on only
 as defense in depth (e.g. a hypothetical mask/legality mismatch), not as
 the primary mechanism anymore.
 
+--team-pool-size (default: full pool) restricts the trainee's own training
+battles to the first N teams of GEN9OU_SAMPLE_TEAMS - a team-diversity
+curriculum, for the same reason --search-bot-fraction exists: the 2026-08-27
+team-pool expansion (5 -> 26 teams) and encoding rewrite together made every
+self-play-leaning retrain attempt collapse (approx_kl/policy_gradient_loss
+vanishing toward zero while win rate stayed flat or dropped), reproducibly,
+across multiple search-bot-fraction values - not what the original 5-team
+pool's self-play run ever did. Diagnosis: self-play's implicit curriculum
+(opponent gets harder in lockstep with the trainee, since it's a frozen copy
+of an earlier, weaker self) depends on the surrounding task being stable
+enough that skill differences dominate outcomes - 26 teams means ~676
+possible team-vs-team matchups instead of 5 teams' ~25, swamping that signal
+with matchup variance instead of skill variance. --team-pool-size 5
+reproduces the original pool exactly (verified via a literal AST diff
+against the pre-expansion commit's teams.py) as a controlled starting point,
+meant to be widened in stages once stable - same manual "kill and resume
+with a new flag value" pattern as every other curriculum staging in this
+project, not an automatic in-run schedule. eval_opponent always draws from
+the full pool regardless of this flag, so eval stays a fair, comparable
+signal across every stage.
+
 Two more pieces (--eval/--checkpoint, both on by default), added once a real,
 multi-hour training run became the actual next step rather than a feasibility
 check: PPO's own logged metrics (loss, entropy, explained_variance) don't
@@ -114,7 +135,7 @@ from battle_engine.ppo_warm_start import load_warm_start_weights, warm_start_pol
 from battle_engine.rl_env import MetamonActionSinglesEnv, sb3_contrib_action_mask_fn
 from battle_engine.search import TwoPlySearchPlayer
 from battle_engine.self_play import FrozenPolicyPlayer, MixedOpponentPlayer, SelfPlaySnapshotCallback
-from battle_engine.teams import RandomTeamFromPool
+from battle_engine.teams import GEN9OU_SAMPLE_TEAMS, RandomTeamFromPool
 from battle_engine.win_prob import WinProbModel
 
 DEFAULT_MODEL_PATH = Path("data/models/ppo.zip")
@@ -148,12 +169,26 @@ DEFAULT_CHECKPOINT_INTERVAL = 8192
 DEFAULT_CHECKPOINT_DIR = Path("data/models/checkpoints")
 
 
-def build_env(opponent: Player) -> ActionMasker:
+def build_env(opponent: Player, team_pool_size: Optional[int] = None) -> ActionMasker:
     """A fresh env + the given opponent, wrapped for SB3's single-agent Gym
     API and then for action masking. strict=False remains as defense in
     depth, not the primary illegal-action mechanism now that masking
     prevents the policy from sampling an illegal action in the first place
     (see module docstring).
+
+    team_pool_size (see --team-pool-size) restricts BOTH sides of every
+    training battle to the first N teams of GEN9OU_SAMPLE_TEAMS - a team
+    curriculum, staged the same "kill and resume with a different flag" way
+    --search-bot-fraction has been all along, not an automatic in-run
+    schedule. The first 5 entries are, in order, exactly the original
+    5-team pool the project's one confirmed-successful 22M-step PPO run
+    (2026-08-10, pre-encoding-rewrite) trained against - verified via a
+    literal AST diff against that commit's teams.py, not assumed from
+    ordering. None (default) uses the full current pool. Only the
+    TRAINEE's own env is restricted - eval_opponent below always draws from
+    the full pool regardless, so eval stays a fair, comparable measurement
+    of the real target distribution across every curriculum stage, not just
+    whatever subset training is currently narrowed to.
 
     The opponent should be built with start_listening=False and no team= -
     SingleAgentWrapper never actually connects `opponent` to the server or
@@ -165,8 +200,9 @@ def build_env(opponent: Player) -> ActionMasker:
     leak a live, logged-in, unclosed websocket connection per call for no
     purpose.
     """
+    teams = GEN9OU_SAMPLE_TEAMS[:team_pool_size] if team_pool_size else GEN9OU_SAMPLE_TEAMS
     env = MetamonActionSinglesEnv(
-        battle_format="gen9ou", team=RandomTeamFromPool(), strict=False
+        battle_format="gen9ou", team=RandomTeamFromPool(teams=teams), strict=False
     )
     wrapped = SingleAgentWrapper(env, opponent)
     return ActionMasker(wrapped, sb3_contrib_action_mask_fn)
@@ -232,6 +268,20 @@ def main() -> None:
         "snapshots. 0.0 reproduces the old pure-self-play behavior.",
     )
     parser.add_argument(
+        "--team-pool-size",
+        type=int,
+        default=None,
+        help="restrict the TRAINEE's own training battles (both sides) to the "
+        "first N teams of GEN9OU_SAMPLE_TEAMS, for a team-diversity curriculum - "
+        "the first 5 are exactly the original 5-team pool the project's one "
+        "confirmed-successful pre-encoding-rewrite PPO run trained against. "
+        "eval_opponent always uses the full pool regardless, so eval stays a "
+        "fair, comparable signal across curriculum stages. None (default) uses "
+        "the full current pool (see build_env's docstring for the full "
+        "rationale). Staged manually (kill and resume with a larger value), "
+        "same pattern as --search-bot-fraction - no in-run schedule.",
+    )
+    parser.add_argument(
         "--eval",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -292,6 +342,12 @@ def main() -> None:
         # not an error.
         parser.error("--search-bot-fraction must be between 0.0 and 1.0")
 
+    if args.team_pool_size is not None and not 1 <= args.team_pool_size <= len(GEN9OU_SAMPLE_TEAMS):
+        parser.error(
+            f"--team-pool-size must be between 1 and {len(GEN9OU_SAMPLE_TEAMS)} "
+            f"(the full current pool)"
+        )
+
     if args.resume_from is not None and args.warm_start:
         print("--resume-from given: ignoring --warm-start (resumed weights take precedence)")
         args.warm_start = False
@@ -318,7 +374,11 @@ def main() -> None:
     else:
         opponent = RandomPlayer(battle_format="gen9ou", start_listening=False)
 
-    env = build_env(opponent)
+    print(
+        f"team pool: {args.team_pool_size or len(GEN9OU_SAMPLE_TEAMS)} of "
+        f"{len(GEN9OU_SAMPLE_TEAMS)} teams (trainee side); eval always uses the full pool"
+    )
+    env = build_env(opponent, team_pool_size=args.team_pool_size)
     if args.resume_from is not None:
         # env= reconnects the loaded model to this run's fresh
         # SingleAgentWrapper/ActionMasker chain (a new opponent instance,
