@@ -98,16 +98,41 @@ Current state, as of 2026-08-30:
     figure within 10%) on **54.1%**. Residual error is dominated by damage numbers, and
     supplying every ability the battle eventually reveals barely moves them — the gap is EV
     spreads and items, which no replay ever shows.
-  - **M4** (set prediction) — next, and now scoped against measured numbers rather than
-    Foul Play's assertion. The M3 result says it must predict **spreads**, not just species,
-    items and abilities: a filler that supplies only the latter leaves most of the damage
-    error on the table. Note also that a battle eventually reveals just 40.5% of abilities and
-    26.8% of items, so in-battle inference cannot be the primary source — usage statistics are.
-  - **M5** (the player) and **M6** (real-ladder GXE) — not started. M5 is blocked on M4 more
-    strictly than the plan assumed: an unrevealed slot's placeholder species id is `none`,
-    which is also poke-engine's "do nothing" action string, so an unrevealed slot cannot be
-    switched into at all
-    ([[battle-engine/notes/gotcha-poke-engine-addresses-actions-by-name-not-index|note]]).
+  - **M4** (set prediction) — done, prior half. Smogon **chaos** JSON (the only published form
+    carrying EV spreads) becomes per-species distributions over abilities, items, moves,
+    spreads, Tera types and teammates, behind M3's `UnknownFiller` seam. Measured twice over
+    the same 299-replay corpus, because a prior can name the right Pokemon and still mis-model
+    every turn:
+    - **Set-prediction accuracy** (`scripts/set_prediction_eval.py`), turn-weighted over what
+      was still hidden and revealed later: **33.5% species recall, 67.0% move recall, 54.9%
+      Tera type, 50.4% item**, against a revealed-only baseline that is 0% on every line *by
+      construction*. Conditioning species choice on already-revealed teammates is worth
+      **+13.9 points of species recall** and moves nothing else — a clean ablation.
+    - **Forward-model fidelity** (`scripts/fidelity_harness.py --prior usage-stats`), the only
+      place spreads get scored at all: representability **30.4% -> 66.3%**, right-or-near-right
+      **51.1% -> 57.2%**, and M3's systematic **−2.9% HP under-bulk bias eliminated** (+0.5%).
+      For scale, M3's hindsight-oracle — every ability and move the battle would ever reveal —
+      bought +2.5 points and did not move HP.
+    The rating cutoff barely matters and *lower* is better (1500 beats 1825 by 10.5 points of
+    species recall): match the population being predicted, not "higher is stronger". Full
+    numbers, the design decisions and what M4 deliberately leaves out:
+    [[battle-engine/notes/phase-6-m4-set-prediction|the log note]].
+    **Not done: mid-battle refinement** — narrowing the distributions from observed damage
+    rolls, move ordering and item tells. The plan's M4 text asks for it; M3's numbers say it is
+    the smaller half (a battle reveals only 40.5% of abilities and 26.8% of items, so on most
+    slots there is nothing to narrow from), and the 305 turns with a wrong item prediction are
+    where it would show up.
+  - **M5** (the player) and **M6** (real-ladder GXE) — not started. M5's hard blocker is
+    **lifted**: an unrevealed slot's placeholder species id was `none`, which is also
+    poke-engine's "do nothing" action string, so an unrevealed slot could not be switched into
+    at all ([[battle-engine/notes/gotcha-poke-engine-addresses-actions-by-name-not-index|note]]);
+    under the M4 prior every slot carries a real species. The open M5 question is
+    modal-vs-sampled: a single sample is worse than the mode on every single-state metric
+    (52.2% representability vs 66.3%), which is exactly why the design is K sampled opponent
+    states aggregated by summed visits rather than one. No corpus measurement can settle that —
+    only the search can. Prior cost is not the constraint: 2.8 ms per state build modal / 4.2 ms
+    sampled, once per state rather than once per search node, against a per-turn budget measured
+    in seconds.
 
 ## Working notes
 
@@ -277,6 +302,34 @@ git clone --depth 1 --branch v0.0.48 https://github.com/pmariglia/poke-engine.gi
 # notes/phase-6-m3-fidelity-harness.md.
 .venv/bin/python scripts/fidelity_harness.py
 .venv/bin/python scripts/fidelity_harness.py --limit 50 --condition action --json data/fidelity.json
+
+# Phase 6 M4: cache a Smogon usage-statistics file for a format. The CHAOS
+# JSON, not the human-readable .txt tables - it is the only form carrying EV
+# spreads, which M3 measured as the dominant residual damage error. Resolves
+# the newest month that actually has the file (the current month usually 404s).
+# The --cutoff is a rating floor on the games counted and is a real modelling
+# choice: measured over the M2 corpus, 1500 beats 1825 by 10.5 points of
+# species recall, because it matches the population being predicted.
+.venv/bin/python scripts/fetch_usage_stats.py --cutoff 1500
+
+# Score the set-prediction filler against what each battle eventually revealed
+# - species, ability, item, Tera type and moves that were still hidden at the
+# turn. Runs every condition by default, including the revealed-only baseline
+# (zero on every line BY CONSTRUCTION, which is the point of showing it) and
+# the ablations that isolate teammate conditioning, rating cutoff and
+# modal-vs-sampled. Reads cached replay JSON; no server, no network.
+# Denominators are turn-weighted and repeat the same slot every turn - read
+# the "distinct cases" column before quoting a sample size.
+.venv/bin/python scripts/set_prediction_eval.py
+.venv/bin/python scripts/set_prediction_eval.py --condition usage-1500 --limit 50
+
+# The other half of M4's evidence, and the only place spreads are scored at
+# all (no replay reveals an EV spread, so the set-prediction eval above cannot
+# see them): re-run M3's fidelity harness with the usage prior underneath the
+# action-oracle. --prior changes BOTH the representability line and the
+# fidelity numbers. Full results: notes/phase-6-m4-set-prediction.md.
+.venv/bin/python scripts/fidelity_harness.py --condition action --prior revealed-only
+.venv/bin/python scripts/fidelity_harness.py --condition action --prior usage-stats --cutoff 1500
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
@@ -303,6 +356,12 @@ harness/training scripts land — don't leave this stale.
   `Battle` -> poke-engine `State`, one turn simulated, diffed against what the
   log says happened; `ForwardModelBackend` is a real seam but only the
   poke-engine backend is implemented, see the module docstring for why);
+  M4: Smogon chaos-file loader (`usage_stats.py` — per-species distributions
+  over abilities, items, moves, spreads, Tera types and teammates; read its
+  docstring before touching the arithmetic, the obvious denominator is the
+  wrong one), the usage-statistics `UnknownFiller` and filler composition
+  (`set_prediction.py`), and the set-prediction accuracy measurement
+  (`set_eval.py`);
   Phase 4:
   pure-Python MCTS/DUCT
   validation prototype (`mcts_prototype.py`, throwaway, see Status), compiled C++
@@ -316,14 +375,17 @@ harness/training scripts land — don't leave this stale.
   dataset building, training, PPO training, PPO replay diagnosis
   `inspect_ppo_replays.py`, real-ladder play `ladder_ppo.py`, Showdown replay
   fetching `fetch_showdown_replays.py`, forward-model fidelity scoring
-  `fidelity_harness.py`, C++ build (`build_cpp.sh`) and its
-  ASan-aware pytest wrapper (`pytest_native.sh`))
+  `fidelity_harness.py`, usage-statistics fetching `fetch_usage_stats.py`,
+  set-prediction scoring `set_prediction_eval.py`, C++ build (`build_cpp.sh`)
+  and its ASan-aware pytest wrapper (`pytest_native.sh`))
 - `tests/` — pytest (state encoding, damage calc, dataset/action-label logic, model
   training loops, harness determinism w/ seeded RNG, action-space translation, the
   PPO env — including one real-server integration test — PPO warm-start weight
   transplant, self-play, PPO eval/benchmark loading, native-extension bindings;
-  Phase 6: the replay-log parser, the poke-env -> poke-engine translator, and the
-  fidelity harness's own judgment calls — which turns it excludes and why)
+  Phase 6: the replay-log parser, the poke-env -> poke-engine translator, the
+  fidelity harness's own judgment calls — which turns it excludes and why — the
+  chaos-file arithmetic, the usage-statistics filler and its layering, and the
+  set-prediction evaluation's own judgment calls)
 - `pokemon-showdown/` — local simulator checkout (gitignored). `sim/SIM-PROTOCOL.md`
   is the authoritative spec for Phase 6's replay-log parser
 - `poke-engine/` — Phase 6's Rust forward model, pinned checkout at v0.0.48
@@ -332,7 +394,8 @@ harness/training scripts land — don't leave this stale.
   format; `poke-engine-py/src/lib.rs` is the exposed Python API surface
 - `data/` — gitignored: `replays_raw/` (Metamon parsed replays, supervised datasets
   only), `replays_showdown/` (Phase 6: raw Showdown replay JSON, both sides'
-  actions), `dataset/` (cached train/val
+  actions), `usage_stats/` (Phase 6 M4: cached Smogon chaos JSON, one file per
+  month/format/rating cutoff), `dataset/` (cached train/val
   arrays for both the win-prob and action-label datasets), `models/` (trained
   checkpoints: `win_prob.pt`, `imitation.pt`, and PPO checkpoints once
   `train_ppo.py --save` is used) — see commands above

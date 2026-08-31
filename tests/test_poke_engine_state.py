@@ -650,6 +650,126 @@ def test_a_filler_may_hand_back_a_display_name_and_it_is_normalized():
 
 
 # ---------------------------------------------------------------------------
+# The spread seam (M4). `SlotFill.stats` is final stats, not a nature and EVs -
+# see the field's own docstring for why the seam is shaped that way.
+# ---------------------------------------------------------------------------
+
+
+class _SpreadFiller:
+    """Supplies one spread's worth of final stats to every slot."""
+
+    name = "spread"
+
+    def __init__(self, stats):
+        self._stats = stats
+
+    def fill_side(self, observation):
+        return [SlotFill(stats=self._stats) for _ in range(observation.team_size)]
+
+
+_BULKY = {"hp": 450, "atk": 200, "def": 350, "spa": 150, "spd": 300, "spe": 120}
+
+
+def test_a_spread_replaces_poke_envs_neutral_estimate_for_the_opponent():
+    """The error M3 measured. poke-env's `estimate_stat` returns a 0-EV,
+    neutral-nature guess for anything it has not been told, and that guess is
+    not an observation - it is the systematic damage error set prediction
+    exists to fix.
+    """
+    plain = _slot(state_from_poke_env(_battle()).state, "p2", 0)
+    filled = _slot(state_from_poke_env(_battle(), filler=_SpreadFiller(_BULKY)).state, "p2", 0)
+
+    # Serialized slot layout: 6 hp, 7 maxhp, 13-17 atk/def/spa/spd/spe.
+    assert plain[7] != "450"  # the neutral estimate, whatever it is
+    assert filled[7] == "450"  # max HP
+    assert filled[13] == "200"  # attack
+    assert filled[14] == "350"  # defense
+
+
+def test_a_spread_never_touches_our_own_observed_stats():
+    """Our team's real stats come from the request JSON. A fill that could
+    overwrite them would be the seam's one unbreakable rule broken.
+    """
+    ours = _slot(state_from_poke_env(_battle(), filler=_SpreadFiller(_BULKY)).state, "p1", 0)
+    assert ours[13] == "359"  # from _MY_TEAM_REQUEST, not the fill
+    assert ours[7] != "450"
+
+
+def test_a_spread_rescales_current_hp_and_keeps_the_fraction():
+    """poke-env reports an opponent's HP as a percentage, so the *fraction* is
+    the only part of it that was ever real. Changing max HP has to carry the
+    current value with it or the model starts the turn at the wrong health.
+    """
+    battle = _battle()
+    battle.parse_message(["", "-damage", "p2a: Gholdengo", "50/100"])
+
+    plain = _slot(state_from_poke_env(battle).state, "p2", 0)
+    filled = _slot(state_from_poke_env(battle, filler=_SpreadFiller(_BULKY)).state, "p2", 0)
+
+    assert int(plain[6]) / int(plain[7]) == pytest.approx(0.5, abs=0.01)
+    assert int(filled[6]) / int(filled[7]) == pytest.approx(0.5, abs=0.01)
+    assert filled[6] == "225"
+
+
+def test_a_spread_on_an_unrevealed_slot_beats_the_dex_default():
+    result = state_from_poke_env(
+        _battle(),
+        filler=_LayerFill(SlotFill(species="kingambit", stats=_BULKY)),
+    )
+    filled = _slot(result.state, "p2", 3)
+    assert filled[0] == "KINGAMBIT"
+    assert filled[7] == "450" and filled[6] == "450"  # unrevealed slots start full
+
+
+def test_nature_and_evs_stay_at_the_engine_default_and_are_genuinely_inert():
+    """Why the seam is final stats and not a nature plus six EVs: poke-engine
+    recomputes from base stats only on a form change, so these two fields are
+    carried along and ignored. The serialized state shows both - a SERIOUS
+    nature and 85 EVs everywhere - next to the explicit stats that actually
+    apply."""
+    filled = _slot(state_from_poke_env(_battle(), filler=_SpreadFiller(_BULKY)).state, "p2", 0)
+    assert filled[11] == "SERIOUS"
+    assert filled[12] == "85;85;85;85;85;85"
+    assert filled[13] == "200"
+
+
+def test_a_spread_is_recorded_as_an_assumption_with_its_source():
+    result = state_from_poke_env(_battle(), filler=_SpreadFiller(_BULKY))
+    stats = next(a for a in result.for_slot("p2:0") if a.attribute == "stats")
+    assert not stats.observed and stats.source == "spread:spread"
+    ours = next(a for a in result.for_slot("p1:0") if a.attribute == "stats")
+    assert ours.observed and ours.source == "poke-env"
+
+
+class _LayerFill:
+    name = "one-fill"
+
+    def __init__(self, fill):
+        self._fill = fill
+
+    def fill_side(self, observation):
+        return [self._fill for _ in range(observation.team_size)]
+
+
+# ---------------------------------------------------------------------------
+# Observation building, exposed for M4's evaluation.
+# ---------------------------------------------------------------------------
+
+
+def test_observe_side_matches_what_the_filler_is_handed():
+    """`observe_side` and the translator's internal path must not drift: M4's
+    evaluation scores the filler through the first and the search runs it
+    through the second."""
+    from battle_engine.poke_engine_state import observe_side
+
+    filler = _StubUsageStatsFiller()
+    battle = _battle()
+    state_from_poke_env(battle, filler=filler)
+    from_translator = next(o for o in filler.seen if not o.is_ours)
+    assert observe_side(battle, ours=False) == from_translator
+
+
+# ---------------------------------------------------------------------------
 # Item strictness.
 # ---------------------------------------------------------------------------
 

@@ -350,6 +350,30 @@ def test_an_unknownitem_prediction_is_reported_but_not_scored():
     assert "volatile" in fidelity.INFORMATIONAL
 
 
+def test_an_item_prediction_the_replay_cannot_check_is_reported_but_not_scored():
+    """The mirror of the case above, and the one M4 introduced. A replay never
+    reveals 73.2% of items, so a prior that names one is making a claim the log
+    has no way to confirm or deny. Scoring it would charge set prediction for
+    the fog of war; without this arm every turn under a usage-stats prior
+    counted as a miss, which was a measurement artifact and not a finding. If
+    the guess is wrong, its cost still lands in `hp`.
+    """
+    divergences = (
+        fidelity.Divergence("item_predicted", "side_two", "kingambit", "unknownitem", "leftovers"),
+        fidelity.Divergence("hp", "side_two", "kingambit", 0.9, 0.8, 0.1),
+    )
+    assert [d.category for d in fidelity.scoring_divergences(divergences)] == ["hp"]
+    assert "item_predicted" in fidelity.INFORMATIONAL
+
+
+def test_two_real_items_that_disagree_are_still_a_real_divergence():
+    """The informational arms are about *unknowns*, not about items generally.
+    When the battle showed one item and the model has another, that is the
+    prior being wrong and it is scored."""
+    divergence = fidelity.Divergence("item", "side_two", "kingambit", "leftovers", "airballoon")
+    assert fidelity.scoring_divergences((divergence,)) == (divergence,)
+
+
 def test_weather_expiry_is_a_separate_finding_from_a_missed_weather():
     """How long a weather has left is not observable (poke-env records only
     when it started, and poke-engine implements none of the four rocks that

@@ -436,6 +436,28 @@ class SlotFill:
     terastallized: once it has, poke-env reveals the real Tera type and the
     observation wins, like every other field here."""
 
+    stats: Optional[Mapping[str, int]] = None
+    """Final stats keyed `hp/atk/def/spa/spd/spe`, in real points.
+
+    This is the seam M3's measurement said M4 actually needed, and it is
+    deliberately final stats rather than a nature and an EV spread. Two
+    reasons. Nature and EVs are inert on a poke-engine `Pokemon` once explicit
+    stats are set - it only recomputes from base stats on a form change - so
+    passing them through would be passing through something the engine ignores.
+    And keeping the spread arithmetic on the filler's side of the seam means
+    this module never has to know what a nature is, which is what stops
+    `usage_stats` (which imports this one for its vocabulary checks) from
+    becoming a circular import.
+
+    Applied only where nothing was observed. Our own team's real stats come
+    from the request JSON and always win; an opponent's never do, because
+    poke-env is guessing there too - `estimate_stat` returns a 0-EV,
+    neutral-nature, 31-IV estimate, which is exactly the systematic error M3
+    measured over 5,846 real turns: a mean signed HP error of -2.9%, with 26.9%
+    of HP divergences past the 20% mark where a KO judgment flips. Filling this
+    field from usage statistics removes the bias (+0.5%) and shrinks the tail.
+    """
+
 
 class UnknownFiller(Protocol):
     """The M4 seam. `name` is what shows up in the provenance ledger."""
@@ -761,6 +783,7 @@ def _pokemon_from_observation(
         pp = {to_id_str(mid): move.current_pp for mid, move in mon.moves.items()}
         stats_observed = _known_stat(mon, "atk")
         hp_observed = _known_stat(mon, "hp")
+        hp_fraction = 0.0 if mon.fainted else mon.current_hp_fraction
     else:
         # A slot the battle never revealed, for which the filler named a
         # species anyway - the M4 case. Nothing about it was observed, so
@@ -774,8 +797,31 @@ def _pokemon_from_observation(
         tera_type = _resolve_tera_type(None, fill.tera_type, slot, source, log)
         pp = {}
         stats_observed = hp_observed = False
-    log.append(Attribution(slot, "stats", stats, stats_observed, "poke-env" if stats_observed else source))
-    log.append(Attribution(slot, "max_hp", maxhp, hp_observed, "poke-env" if hp_observed else source))
+        hp_fraction = 1.0
+
+    # A fill can only supply what was never observed, same rule as everywhere
+    # else here. `estimate_stat`'s 0-EV neutral guess counts as unobserved, so a
+    # filler that knows the metagame's real spreads replaces it; our own team's
+    # stats come from the request JSON and are untouchable.
+    stats_source = "poke-env" if stats_observed else source
+    hp_source = "poke-env" if hp_observed else source
+    if fill.stats:
+        supplied = {s: int(v) for s, v in fill.stats.items() if v}
+        if not stats_observed:
+            replaced = {s: supplied[s] for s in ("atk", "def", "spa", "spd", "spe") if s in supplied}
+            if replaced:
+                stats = {**stats, **replaced}
+                stats_source = f"{source}:spread"
+        if not hp_observed and "hp" in supplied:
+            maxhp = supplied["hp"]
+            # `hp_fraction` survives the rescale by construction - poke-env
+            # reports an opponent's HP as a percentage, so the fraction is the
+            # only part of it that was ever real.
+            hp = 0 if hp_fraction <= 0 else max(1, min(maxhp, round(hp_fraction * maxhp)))
+            hp_source = f"{source}:spread"
+
+    log.append(Attribution(slot, "stats", stats, stats_observed, stats_source))
+    log.append(Attribution(slot, "max_hp", maxhp, hp_observed, hp_source))
 
     moves = [
         poke_engine.Move(id=move_id, pp=pp.get(move_id, 16), disabled=move_id in disabled_moves)
@@ -907,6 +953,29 @@ def _last_used_move(
     return "move:none"
 
 
+def side_observation_from_team(
+    mons: Sequence[Pokemon], *, is_ours: bool, format_id: Optional[str] = None
+) -> SideObservation:
+    """What a battle has revealed about one side, as a filler sees it.
+
+    Public because the fill is worth evaluating on its own, separately from
+    the state it ends up in: M4's set-prediction evaluation asks a filler what
+    it thinks at turn N and scores that against what the battle eventually
+    reveals, with no poke-engine `State` in the loop at all.
+    """
+    revealed = tuple(_observe_slot(i, mon) for i, mon in enumerate(mons))
+    unrevealed = tuple(SlotObservation(index=i) for i in range(len(mons), TEAM_SIZE))
+    return SideObservation(
+        is_ours=is_ours, format_id=format_id, team_size=TEAM_SIZE, slots=revealed + unrevealed
+    )
+
+
+def observe_side(battle: AbstractBattle, *, ours: bool) -> SideObservation:
+    """`side_observation_from_team` straight off a live or replayed battle."""
+    team = battle.team if ours else battle.opponent_team
+    return side_observation_from_team(list(team.values()), is_ours=ours, format_id=battle.format)
+
+
 def _build_side(
     team: Mapping[str, Pokemon],
     active: Optional[Pokemon],
@@ -933,11 +1002,7 @@ def _build_side(
             "slot per side, so team preview needs its own handling, not this translator"
         )
 
-    observations = tuple(_observe_slot(i, mon) for i, mon in enumerate(mons))
-    unrevealed = tuple(SlotObservation(index=i) for i in range(len(mons), TEAM_SIZE))
-    side_observation = SideObservation(
-        is_ours=is_ours, format_id=format_id, team_size=TEAM_SIZE, slots=observations + unrevealed
-    )
+    side_observation = side_observation_from_team(mons, is_ours=is_ours, format_id=format_id)
     fills = list(filler.fill_side(side_observation))
     if len(fills) != TEAM_SIZE:
         raise ValueError(
@@ -966,7 +1031,13 @@ def _build_side(
     # Side, not on the Pokemon - they belong to the slot that is active.
     boosts = active.boosts
     active_index = mons.index(active)
-    log.append(Attribution(side, "nature_and_evs", "serious/85s", False, "not-observable"))
+    # Nature and EVs are inert on a poke-engine Pokemon once explicit stats are
+    # set (it recomputes from base stats only on a form change), so the spread
+    # question is answered by the per-slot "stats" attribution above and its
+    # source, not by these two fields. They serialize as SERIOUS and 85 EVs
+    # across the board - poke-engine's own defaults - and are recorded once
+    # here so a reader of the ledger knows they were left there on purpose.
+    log.append(Attribution(side, "nature_and_evs", "serious/85s (inert)", False, "not-observable"))
 
     # poke-engine tracks the badly-poisoned counter per SIDE, not per
     # Pokemon, so it is the active Pokemon's counter that goes here.

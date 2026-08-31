@@ -23,12 +23,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import List
 
 from battle_engine.fidelity import CONDITIONS, FidelityReport, PokeEngineBackend, score_corpus
+from battle_engine.poke_engine_state import RevealedOnlyFiller
+from battle_engine.set_prediction import UsageStatsFiller
 
 DEFAULT_CORPUS = Path("data/replays_showdown")
 
@@ -50,6 +53,30 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
             "action: the oracle supplies only the move/switch/Tera the turn needs. "
             "hindsight: it also supplies every ability, Tera type and move the battle "
             "will eventually reveal. both (default): run each and print the delta."
+        ),
+    )
+    parser.add_argument(
+        "--prior",
+        choices=("revealed-only", "usage-stats"),
+        default="revealed-only",
+        help=(
+            "the UnknownFiller underneath the oracle. revealed-only (default) is M3's "
+            "baseline: assume nothing the battle has not shown. usage-stats is M4's "
+            "Smogon prior, and running both is how M4 is measured - it changes both the "
+            "representability line and the fidelity numbers."
+        ),
+    )
+    parser.add_argument(
+        "--cutoff", type=int, default=1500, help="usage-stats rating cutoff (--prior usage-stats)"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "sample the usage-stats prior with this seed instead of taking each "
+            "distribution's mode. Modal is the default because it is the single "
+            "maximum-likelihood opponent; sampling is what M5's root parallelism does."
         ),
     )
     parser.add_argument("--json", type=Path, default=None, help="also write per-turn scores here")
@@ -92,14 +119,36 @@ def main(argv: List[str]) -> int:
     if args.limit is not None:
         paths = paths[: args.limit]
 
+    if args.prior == "usage-stats":
+        try:
+            base_filler = UsageStatsFiller.from_cache(
+                cutoff=args.cutoff,
+                rng=random.Random(args.seed) if args.seed is not None else None,
+            )
+        except FileNotFoundError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+    else:
+        base_filler = RevealedOnlyFiller()
+
     conditions = [False, True] if args.condition == "both" else [args.condition == "hindsight"]
     backend = PokeEngineBackend()
     reports: List[FidelityReport] = []
     for hindsight in conditions:
         if not args.quiet:
-            print(f"Scoring {len(paths)} replays - condition: {CONDITIONS[hindsight]}", file=sys.stderr)
+            print(
+                f"Scoring {len(paths)} replays - condition: {CONDITIONS[hindsight]}, "
+                f"prior: {base_filler.name}",
+                file=sys.stderr,
+            )
         reports.append(
-            score_corpus(paths, backend=backend, hindsight=hindsight, on_replay=_progress(len(paths), args.quiet))
+            score_corpus(
+                paths,
+                backend=backend,
+                hindsight=hindsight,
+                base_filler=base_filler,
+                on_replay=_progress(len(paths), args.quiet),
+            )
         )
 
     for report in reports:
@@ -117,6 +166,7 @@ def main(argv: List[str]) -> int:
                 {
                     report.condition: {
                         "backend": report.backend,
+                        "prior": report.base_filler,
                         "replays": report.replays,
                         "turns_seen": report.turns_seen,
                         "skipped": dict(report.skipped),

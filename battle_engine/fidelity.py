@@ -96,6 +96,7 @@ from battle_engine.poke_engine_state import (
     is_known_species,
     state_from_poke_env,
 )
+from battle_engine.set_prediction import LayeredFiller
 from battle_engine.replay_log import (
     Action,
     ActionKind,
@@ -140,13 +141,21 @@ CONDITIONS = {False: "action-oracle", True: "hindsight-oracle"}
 #   upkeep is the common case). Its real cost already lands in `hp`. The
 #   count is kept because it is a direct measure of how often a turn hands
 #   set prediction a new fact.
+# - `item_predicted`: the mirror image, and the one M4 introduced. The
+#   *observed* state's value is `unknownitem` - the battle never revealed the
+#   item - while the model has predicted a real one. A replay cannot say
+#   whether that prediction was right, so scoring it would charge the prior
+#   for the fog of war rather than for being wrong. Its real cost, if it is
+#   wrong, still lands in `hp` where it belongs. Without this arm every single
+#   turn under a set-prediction prior scores as a miss, which is a measurement
+#   artifact and not a finding.
 # - `volatile`: the observed set comes from a translator that documents
 #   dropping 139 of poke-env's 224 `Effect` members, so an absent volatile
 #   says nothing about whether the battle had one. Measured examples that are
 #   translator artifacts rather than model error: Heal Block (dropped by us,
 #   correctly set by poke-engine) and Roost's typechange (cleared by
 #   poke-engine at end of turn, still live in poke-env at `|upkeep|`).
-INFORMATIONAL = frozenset({"item_revealed", "volatile"})
+INFORMATIONAL = frozenset({"item_revealed", "item_predicted", "volatile"})
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +651,12 @@ def compare_states(observed: Any, predicted: Any, before: Any) -> Tuple[Divergen
                 out.append(Divergence("status", side_name, species, o.status.lower(), p.status.lower()))
             o_item, p_item = o.item.lower(), p.item.lower()
             if o_item != p_item:
-                category = "item_revealed" if p_item == UNKNOWN_ITEM else "item"
+                if p_item == UNKNOWN_ITEM:
+                    category = "item_revealed"
+                elif o_item == UNKNOWN_ITEM:
+                    category = "item_predicted"
+                else:
+                    category = "item"
                 out.append(Divergence(category, side_name, species, o_item, p_item))
             if o.terastallized != p.terastallized:
                 out.append(Divergence("terastallized", side_name, species, o.terastallized, p.terastallized))
@@ -770,6 +784,9 @@ class FidelityReport:
 
     backend: str
     condition: str = "action-oracle"
+    # The prior underneath the oracle. M3 measured everything against
+    # `revealed-only`; M4's whole question is what changes when it is not.
+    base_filler: str = "revealed-only"
     replays: int = 0
     turns_seen: int = 0
     scores: List[TurnScore] = field(default_factory=list)
@@ -789,6 +806,7 @@ class FidelityReport:
         lines: List[str] = []
         add = lines.append
         add(f"Forward-model fidelity - backend: {self.backend}   condition: {self.condition}")
+        add(f"  prior: {self.base_filler}")
         add(f"  replays: {self.replays}   turns in corpus: {self.turns_seen}   scored: {self.scored}")
 
         add("")
@@ -803,7 +821,7 @@ class FidelityReport:
             return "\n".join(lines)
 
         add("")
-        add("Representability from revealed information only (the M4 baseline):")
+        add(f"Representability under the {self.base_filler} prior:")
         representable = sum(1 for s in self.scores if s.representable)
         add(f"  {'both actions addressable':<34}{self._rate(representable, self.scored)}")
         missing = Counter(tag for s in self.scores for tag in s.missing)
@@ -904,6 +922,7 @@ def score_replay(
     report: Optional[FidelityReport] = None,
     *,
     hindsight: bool = False,
+    base_filler: Any = None,
 ) -> FidelityReport:
     """Score every scorable turn of one replay, accumulating into `report`.
 
@@ -912,7 +931,11 @@ def score_replay(
     See `Hindsight` for what that does and does not cover.
     """
     backend = backend or PokeEngineBackend()
-    report = report or FidelityReport(backend=backend.name, condition=CONDITIONS[hindsight])
+    report = report or FidelityReport(
+        backend=backend.name,
+        condition=CONDITIONS[hindsight],
+        base_filler=getattr(base_filler, "name", "revealed-only"),
+    )
     path = Path(path)
     payload = json.loads(path.read_text())
     # Parsed from the payload already in hand rather than by path: one read,
@@ -937,7 +960,7 @@ def score_replay(
                 continue
             report.turns_seen += 1
             try:
-                pending = _prepare(transition, battle, knowledge)
+                pending = _prepare(transition, battle, knowledge, base_filler)
             except UnscorableTurn as exc:
                 report.skipped[exc.reason] += 1
         elif marker == "upkeep" and pending is not None:
@@ -986,7 +1009,10 @@ def score_replay(
 
 
 def _prepare(
-    transition: TurnTransition, battle: Battle, knowledge: Dict[str, Dict[str, Hindsight]]
+    transition: TurnTransition,
+    battle: Battle,
+    knowledge: Dict[str, Dict[str, Hindsight]],
+    base_filler: Any = None,
 ) -> Tuple[TurnTransition, Any, Tuple[str, ...], bool, EngineAction, EngineAction]:
     """Everything that has to happen while the battle is at `|turn|N`.
 
@@ -1019,8 +1045,12 @@ def _prepare(
     a1 = engine_action(transition.p1_action, transition)
     a2 = engine_action(transition.p2_action, transition)
 
+    base_filler = base_filler if base_filler is not None else RevealedOnlyFiller()
     try:
-        baseline = state_from_poke_env(battle, filler=RevealedOnlyFiller()).state
+        # The representability question is asked of the *prior*, with no oracle:
+        # a set-prediction filler that names the right move makes the turn
+        # representable, and that is precisely the effect M4 has to demonstrate.
+        baseline = state_from_poke_env(battle, filler=base_filler).state
     except (ValueError, UnknownToPokeEngine):
         raise UnscorableTurn("state_before_untranslatable")
 
@@ -1036,10 +1066,14 @@ def _prepare(
         if action.needs_tera_type:
             missing.append(f"{label}:tera_type")
 
-    oracle = OracleFiller(
+    oracle: Any = OracleFiller(
         _side_oracle(battle, a1, ours=True, knowledge=knowledge["p1"]),
         _side_oracle(battle, a2, ours=False, knowledge=knowledge["p2"]),
     )
+    if not isinstance(base_filler, RevealedOnlyFiller):
+        # Oracle first: what the turn actually needs outranks what the
+        # metagame guesses, so a divergence still cannot be an addressing gap.
+        oracle = LayeredFiller(oracle, base_filler)
     try:
         state_before = state_from_poke_env(battle, filler=oracle).state
     except (ValueError, UnknownToPokeEngine) as exc:
@@ -1093,6 +1127,7 @@ def score_corpus(
     on_replay: Optional[Callable[[int, Path | str, FidelityReport], None]] = None,
     *,
     hindsight: bool = False,
+    base_filler: Any = None,
 ) -> FidelityReport:
     """Score a whole corpus. `on_replay(index, path, report)` is called after
     each file, for progress reporting - a 300-replay run is minutes long and
@@ -1101,11 +1136,17 @@ def score_corpus(
     already recorded once.
     """
     backend = backend or PokeEngineBackend()
-    report = FidelityReport(backend=backend.name, condition=CONDITIONS[hindsight])
+    report = FidelityReport(
+        backend=backend.name,
+        condition=CONDITIONS[hindsight],
+        base_filler=getattr(base_filler, "name", "revealed-only"),
+    )
     start = time.perf_counter()
     for index, path in enumerate(paths):
         try:
-            score_replay(path, backend=backend, report=report, hindsight=hindsight)
+            score_replay(
+                path, backend=backend, report=report, hindsight=hindsight, base_filler=base_filler
+            )
         except Exception as exc:  # noqa: BLE001 - one bad file must not end the run
             report.skipped[f"replay_failed:{type(exc).__name__}"] += 1
         if on_replay is not None:
