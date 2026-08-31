@@ -39,7 +39,7 @@ Status section below are the surviving record of phases 0-3.)
 Working history lives in `notes/`, not in this file — see
 [[battle-engine/notes/index|notes/index]] for the full map.
 
-Current state, as of 2026-08-30:
+Current state, as of 2026-08-31:
 
 - **Phase 0** (harness, baselines) — gate met.
 - **Phase 1** (classical search) — gate met. `TwoPlySearchPlayer` beats `MaxBasePowerPlayer`
@@ -82,7 +82,7 @@ Current state, as of 2026-08-30:
   Phase 3's measured 26.3% baseline. Full plan:
   `/Users/edward/.claude/plans/phase-6-foul-play-architecture.md`.
 
-  Milestone state as of 2026-08-30:
+  Milestone state as of 2026-08-31:
 
   - **M1** (gen9 toolchain) — built and verified; `scripts/build_poke_engine.sh` plus the
     gen9 guard test.
@@ -122,17 +122,35 @@ Current state, as of 2026-08-30:
     the smaller half (a battle reveals only 40.5% of abilities and 26.8% of items, so on most
     slots there is nothing to narrow from), and the 305 turns with a wrong item prediction are
     where it would show up.
-  - **M5** (the player) and **M6** (real-ladder GXE) — not started. M5's hard blocker is
-    **lifted**: an unrevealed slot's placeholder species id was `none`, which is also
-    poke-engine's "do nothing" action string, so an unrevealed slot could not be switched into
-    at all ([[battle-engine/notes/gotcha-poke-engine-addresses-actions-by-name-not-index|note]]);
-    under the M4 prior every slot carries a real species. The open M5 question is
-    modal-vs-sampled: a single sample is worse than the mode on every single-state metric
-    (52.2% representability vs 66.3%), which is exactly why the design is K sampled opponent
-    states aggregated by summed visits rather than one. No corpus measurement can settle that —
-    only the search can. Prior cost is not the constraint: 2.8 ms per state build modal / 4.2 ms
-    sampled, once per state rather than once per search node, against a per-turn budget measured
-    in seconds.
+  - **M5** (the player) — **done, gate met**. `battle_engine/set_search.py`'s `SetSearchPlayer`
+    resolves the modal-vs-sampled question the plan left open: K=4-8 sampled opponent states
+    (M4's prior), each searched under an equal slice of a wall-clock budget, aggregated by summed
+    visits, with a root legality backstop for the one gap poke-engine's action space can't
+    represent (trapping). Measured over a full 500-battle run each: **477/500 = 95.4% [93.2%,
+    96.9%] vs `TwoPlySearchPlayer`** (Phase 1) and **495/500 = 99.0% [97.7%, 99.6%] vs `mcts`**
+    (Phase 4 C++) — both clear the plan's 50%-CI bar by a wide margin, and both legs of Phase 6's
+    core claim now hold under real measurement: complete-forward-model-plus-set-prediction beats
+    hand-tuned search over an incomplete one, and beats the C++ search that itself lost to
+    `TwoPlySearchPlayer` at 32.4%. `mcts_puct` stays **not measurable** — its checkpoint is
+    665-dim, the encoder is now 2156-dim, same invalidation as everywhere else in this doc. One
+    real gap found and left open: poke-engine's known `NonFinite` threaded-search panic
+    (~0.1% of sample-searches, self-recovering via a per-sample catch) clusters in tight bursts
+    tied to a still-unidentified recurring battle condition rather than landing uniformly; when
+    every sample in a turn fails this way the bot falls through to a default move for that turn.
+    Full numbers and the panic-clustering finding:
+    [[battle-engine/notes/phase-6-m5-the-player|the log note]].
+  - **M6** (real-ladder GXE) — started 2026-08-31, **blocked on a decision**.
+    `scripts/ladder_setsearch.py` plays `SetSearchPlayer` on the real gen9ou ladder; a 10-game
+    canary went cleanly (6/10 won, no crashes, panic-recovery behavior confirmed live). But it
+    reused `battle-engine-test`, the same alt Phase 3's `ladder_ppo.py` used, and that account's
+    GXE after the canary (26.5%, Glicko 1307 +/- 41) is essentially Phase 3's PPO endpoint
+    unmoved (26.3%, 1305 +/- 39) — a converged rating from 45+ prior games doesn't shift
+    meaningfully in 10 more. **The gate cannot be measured on this account without a very large
+    game count.** Needs either a fresh dedicated alt (the real fix, but registration needs a
+    human — not attempted autonomously) or a deliberate decision to grind a much larger count on
+    the shared account. Full findings:
+    [[battle-engine/notes/phase-6-m6-ladder-canary-and-account-contamination|the log note]].
+    **Phase 6 gate: GXE above 50%**, against Phase 3's measured 26.3% baseline.
 
 ## Working notes
 
@@ -330,6 +348,42 @@ git clone --depth 1 --branch v0.0.48 https://github.com/pmariglia/poke-engine.gi
 # fidelity numbers. Full results: notes/phase-6-m4-set-prediction.md.
 .venv/bin/python scripts/fidelity_harness.py --condition action --prior revealed-only
 .venv/bin/python scripts/fidelity_harness.py --condition action --prior usage-stats --cutoff 1500
+
+# Phase 6 M5: the player. poke-engine's MCTS run over --opponent-samples
+# independently sampled opponent teams (M4's prior), each getting an equal
+# slice of a --search-time-ms WALL-CLOCK budget, with the action chosen by
+# visits summed across all of them. Needs the local Showdown server, a cached
+# usage-stats file, and the gen9 poke-engine build. --format gen9ou: the prior
+# describes that metagame and nothing else.
+# Defaults measured on the M4 Air rather than guessed: ~1,830 visits/ms at 4
+# threads and flat past 4 (4 performance cores), and splitting the budget
+# across sampled opponents is close to free (850k visits at 1 sample vs 906k
+# at 8 over the same 1,000 ms) - so samples buy opponent coverage, not depth.
+.venv/bin/python scripts/benchmark.py --p1 setsearch --p2 search --format gen9ou \
+  --n-battles 500 --search-time-ms 400 --opponent-samples 4
+
+# Diagnostic (not a benchmark): plays real games and prints what the search
+# chose each turn, its share of the visit mass, its win-probability estimate
+# and the runners-up - the "watch real replays" technique
+# (notes/pattern-watch-real-replays-not-just-metrics.md) applied to M5. Watch
+# the `rank` column: non-zero means the search's top pick was illegal in the
+# real game and a lower-ranked action was played, which trapping causes and
+# nothing else should.
+.venv/bin/python scripts/inspect_set_search.py --n-battles 3 --opponent search
+
+# Phase 6 M6: the phase gate itself. Plays SetSearchPlayer on the REAL
+# Showdown ladder (sim3.psim.us) for a real GXE number, the same mechanism
+# scripts/ladder_ppo.py used for Phase 3's 26.3% baseline - see that script's
+# module docstring for the account/etiquette rules (already-registered alt,
+# password via POKE_SHOWDOWN_PASSWORD or .env.local, never a CLI arg). Keep
+# --max-concurrent-battles at 1 (the default): unlike the PPO policy player,
+# SetSearchPlayer.choose_move blocks the single asyncio event loop for its
+# whole search-time-ms budget, and raising concurrency has not been verified
+# safe against a real opponent's turn timer. GXE isn't printed by this script
+# (poke-env's ladder() doesn't compute it) - check
+# https://pokemonshowdown.com/users/<username> after enough games settle it.
+export POKE_SHOWDOWN_PASSWORD=...
+.venv/bin/python scripts/ladder_setsearch.py --username my-bot-alt --n-games 10
 ```
 
 The venv is `.venv/` (Python 3.13); `pokemon-showdown/` is a gitignored local clone.
@@ -361,7 +415,10 @@ harness/training scripts land — don't leave this stale.
   docstring before touching the arithmetic, the obvious denominator is the
   wrong one), the usage-statistics `UnknownFiller` and filler composition
   (`set_prediction.py`), and the set-prediction accuracy measurement
-  (`set_eval.py`);
+  (`set_eval.py`); M5: the player (`set_search.py` — `SetSearchPlayer`,
+  poke-engine MCTS over K sampled opponent teams on a wall-clock budget, with
+  a root legality backstop and a `BaseException` catch that turns a Rust panic
+  into a bad move rather than a forfeited game);
   Phase 4:
   pure-Python MCTS/DUCT
   validation prototype (`mcts_prototype.py`, throwaway, see Status), compiled C++
@@ -376,7 +433,9 @@ harness/training scripts land — don't leave this stale.
   `inspect_ppo_replays.py`, real-ladder play `ladder_ppo.py`, Showdown replay
   fetching `fetch_showdown_replays.py`, forward-model fidelity scoring
   `fidelity_harness.py`, usage-statistics fetching `fetch_usage_stats.py`,
-  set-prediction scoring `set_prediction_eval.py`, C++ build (`build_cpp.sh`)
+  set-prediction scoring `set_prediction_eval.py`, set-search decision
+  inspection `inspect_set_search.py`, real-ladder play for the M5 player
+  `ladder_setsearch.py`, C++ build (`build_cpp.sh`)
   and its ASan-aware pytest wrapper (`pytest_native.sh`))
 - `tests/` — pytest (state encoding, damage calc, dataset/action-label logic, model
   training loops, harness determinism w/ seeded RNG, action-space translation, the
@@ -384,8 +443,10 @@ harness/training scripts land — don't leave this stale.
   transplant, self-play, PPO eval/benchmark loading, native-extension bindings;
   Phase 6: the replay-log parser, the poke-env -> poke-engine translator, the
   fidelity harness's own judgment calls — which turns it excludes and why — the
-  chaos-file arithmetic, the usage-statistics filler and its layering, and the
-  set-prediction evaluation's own judgment calls)
+  chaos-file arithmetic, the usage-statistics filler and its layering, the
+  set-prediction evaluation's own judgment calls, and the M5 player's action
+  translation, visit aggregation and every failure path that keeps a real
+  ladder game alive)
 - `pokemon-showdown/` — local simulator checkout (gitignored). `sim/SIM-PROTOCOL.md`
   is the authoritative spec for Phase 6's replay-log parser
 - `poke-engine/` — Phase 6's Rust forward model, pinned checkout at v0.0.48

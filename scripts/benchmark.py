@@ -38,6 +38,19 @@ baselines3 rather than this C++-facing binary format). Trained on gen9ou,
 same distribution-mismatch caveat as "learned"/"ppo" — only meaningful with
 --format gen9ou.
 
+"setsearch" (Phase 6 M5) wires battle_engine.set_search.SetSearchPlayer — the
+Foul Play architecture, and the first player here whose forward model is a
+complete gen9 simulator rather than this project's own. poke-engine's MCTS run
+over --opponent-samples independently sampled opponent teams (M4's Smogon
+usage-statistics prior), each getting an equal slice of a --search-time-ms
+wall-clock budget, with the action chosen by visits summed across all of them.
+Unlike "mcts"/"mcts_puct" it takes a time budget rather than --n-simulations,
+because the budget is what a real ladder turn actually constrains. Needs a
+cached usage-stats file (scripts/fetch_usage_stats.py) and the gen9 poke-engine
+build (scripts/build_poke_engine.sh). gen9ou is what the prior is for, so
+--format gen9ou; on gen9randombattle the usage statistics describe a different
+metagame entirely, a sharper distribution mismatch than "learned"/"ppo" have.
+
 The model was trained on gen9ou human replays (constructed OU teams), but the
 default --format is gen9randombattle (Phase 0/1's format, auto-generated
 teams, no team-building infra needed) - a "learned" benchmark on
@@ -87,7 +100,7 @@ PLAYERS = {
     "heuristic": SimpleHeuristicsPlayer,
     "search": TwoPlySearchPlayer,
 }
-CHOICES = sorted(PLAYERS) + ["learned", "ppo", "mcts", "mcts_puct"]
+CHOICES = sorted(PLAYERS) + ["learned", "ppo", "mcts", "mcts_puct", "setsearch"]
 
 
 # Formats poke-env/Showdown generate a team for server-side - no submitted
@@ -107,6 +120,10 @@ def _make_player(
     ppo_model_path: Path,
     n_simulations: int,
     ppo_bin_path: Path,
+    search_time_ms: int = 1000,
+    opponent_samples: int = 8,
+    threads: int = 4,
+    usage_cutoff: int = 1500,
 ) -> Player:
     team = None if battle_format in _AUTO_TEAM_FORMATS else RandomTeamFromPool()
     # rand=True (a random 5-char suffix, not poke-env's own default per-process
@@ -156,6 +173,21 @@ def _make_player(
             n_simulations=n_simulations,
             account_configuration=account_configuration,
         )
+    if name == "setsearch":
+        # Deferred for the same reason as "mcts" above, plus one of its own:
+        # importing it parses a ~14 MB usage-stats file, which a benchmark that
+        # never uses this player should not pay for.
+        from battle_engine.set_search import SetSearchPlayer
+
+        return SetSearchPlayer(
+            battle_format=battle_format,
+            team=team,
+            search_time_ms=search_time_ms,
+            n_opponent_samples=opponent_samples,
+            threads=threads,
+            cutoff=usage_cutoff,
+            account_configuration=account_configuration,
+        )
     return PLAYERS[name](battle_format=battle_format, team=team, account_configuration=account_configuration)
 
 
@@ -182,6 +214,26 @@ def parse_args() -> argparse.Namespace:
     # full comparison and arithmetic. Override for a different
     # laptop-feasibility tradeoff.
     parser.add_argument("--n-simulations", type=int, default=200)
+    # "setsearch" only. A wall-clock budget, not a simulation count - see this
+    # module's docstring. The defaults are measured on the M4 MacBook Air (the
+    # laptop-first hard rule's target machine) rather than guessed: ~1,830
+    # visits/ms at 4 threads and flat past 4, and splitting the budget across
+    # sampled opponents is close to free (850k visits at 1 sample vs 906k at 8,
+    # over the same 1,000 ms), so samples are chosen for opponent coverage
+    # rather than against throughput.
+    parser.add_argument("--search-time-ms", type=int, default=1000)
+    parser.add_argument("--opponent-samples", type=int, default=8)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument(
+        "--usage-cutoff",
+        type=int,
+        default=1500,
+        help=(
+            "rating cutoff of the usage-stats file 'setsearch' predicts from. 1500 "
+            "measured best on the M4 corpus; higher cuts describe a stronger "
+            "population than the one being played."
+        ),
+    )
     # Real progress visibility + a survivable early exit - both genuinely
     # missing before 2026-08-25 (see notes/gotcha-benchmark-runs-need-
     # empirical-timing-and-progress-visibility.md): an 8+ hour run with
@@ -207,11 +259,17 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
+    extras = dict(
+        search_time_ms=args.search_time_ms,
+        opponent_samples=args.opponent_samples,
+        threads=args.threads,
+        usage_cutoff=args.usage_cutoff,
+    )
     p1 = _make_player(
-        args.p1, args.format, args.model_path, args.ppo_model_path, args.n_simulations, args.ppo_bin_path
+        args.p1, args.format, args.model_path, args.ppo_model_path, args.n_simulations, args.ppo_bin_path, **extras
     )
     p2 = _make_player(
-        args.p2, args.format, args.model_path, args.ppo_model_path, args.n_simulations, args.ppo_bin_path
+        args.p2, args.format, args.model_path, args.ppo_model_path, args.n_simulations, args.ppo_bin_path, **extras
     )
     checkpoint_path = args.checkpoint_path or Path(f"/tmp/benchmark_checkpoint_{args.p1}_vs_{args.p2}.json")
     print(
