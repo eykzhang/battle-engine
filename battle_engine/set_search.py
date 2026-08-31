@@ -68,8 +68,11 @@ actually explored instead of falling through to Showdown's default.
 
 from __future__ import annotations
 
+import asyncio
 import random
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -260,6 +263,22 @@ class SetSearchPlayer(Player):
         self._rng = random.Random(seed)
         self._on_decision = on_decision
         self.search_stats = SearchStats()
+        # Bounded to this player's own concurrent-battle limit: poke-env's
+        # `_battle_count_queue` (see plan) already enforces that no more than
+        # `self._max_concurrent_battles` battles are in flight on this player
+        # at once, so this is an exact sizing, not a guess - and it avoids the
+        # oversubscription a default `ThreadPoolExecutor` size would cause
+        # against this project's laptop-first constraint (each worker can
+        # spawn its own `threads=4` internal poke-engine threads).
+        self._executor = ThreadPoolExecutor(max_workers=max(1, self._max_concurrent_battles))
+        # Guards exactly two things across concurrent `choose_move` calls on
+        # this one player instance: the shared `self._rng` draw, and every
+        # `self.search_stats` mutation. Never held around
+        # `poke_engine.monte_carlo_tree_search` itself - that must stay
+        # lock-free for real parallel search - and never held around the
+        # `_on_decision` callback in `_record`, so a slow callback cannot
+        # block another battle's search thread from finishing its bookkeeping.
+        self._lock = threading.Lock()
 
     @property
     def per_state_ms(self) -> int:
@@ -273,7 +292,8 @@ class SetSearchPlayer(Player):
         are correlated - the same convention `MctsPlayer` uses for its search
         seeds.
         """
-        base = self._rng.getrandbits(48)
+        with self._lock:
+            base = self._rng.getrandbits(48)
         states = []
         for index in range(self._n_samples):
             filler = UsageStatsFiller(stats=self._stats_source, rng=random.Random(base + index))
@@ -309,14 +329,38 @@ class SetSearchPlayer(Player):
             except BaseException as exc:  # noqa: BLE001
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
-                self.search_stats.sample_failures += 1
-                self.search_stats.note_failure(f"sample:{type(exc).__name__}")
+                with self._lock:
+                    self.search_stats.sample_failures += 1
+                    self.search_stats.note_failure(f"sample:{type(exc).__name__}")
         return results
 
-    def choose_move(self, battle: AbstractBattle) -> BattleOrder:
+    async def choose_move(self, battle: AbstractBattle) -> BattleOrder:
+        """Async front door: only the actual search runs off the event loop.
+
+        Everything that reads `battle` - the "nothing to choose" check, the
+        battle-to-state translation in `_sampled_states`, and the legality
+        walk over `ranked` below - runs synchronously here, on poke-env's own
+        event loop, exactly as the old fully-synchronous `choose_move` did.
+        That is what keeps it atomic with respect to poke-env's own message
+        handling: `ps_client.py` spawns one asyncio Task per inbound message
+        with no per-battle serialization, and those tasks call
+        `battle.parse_request(...)`, which mutates
+        `battle.available_moves`/`available_switches` in place. Offloading
+        that reading to a worker thread would let it race a same-battle
+        `parse_request` running concurrently on the loop - which is exactly
+        what an earlier version of this method did and a review caught.
+
+        Only `_search_each` - which operates purely on already-translated
+        `poke_engine.State` objects and never touches `battle` at all - is
+        handed to the executor. That is also the expensive part (the real
+        wall-clock search budget), so this is what makes the method
+        non-blocking to poke-env's single asyncio event loop without letting
+        a worker thread read `battle` while the loop can mutate it.
+        """
         if not battle.available_moves and not battle.available_switches:
             # Nothing to choose between; poke-env still wants an order.
-            self.search_stats.defaulted += 1
+            with self._lock:
+                self.search_stats.defaulted += 1
             return self.choose_default_move()
 
         start = time.perf_counter()
@@ -329,20 +373,28 @@ class SetSearchPlayer(Player):
                 raise
             return self._default(battle, start, f"translation:{type(exc).__name__}")
 
-        results = self._search_each(states)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(self._executor, self._search_each, states)
         if not results:
             return self._default(battle, start, "all_searches_failed")
 
-        self.search_stats.samples_run += len(results)
+        with self._lock:
+            self.search_stats.samples_run += len(results)
         ranked = aggregate(results)
         elapsed = time.perf_counter() - start
 
+        # Back on the event loop after the `await` above: `battle` is read
+        # here as it currently stands, which may legitimately differ from
+        # what translation saw - Showdown's own request is what defines what
+        # is actually legal to play right now, and this is the point where
+        # that's supposed to be checked.
         for rank, (choice, visits, value) in enumerate(ranked):
             order = order_from_choice(choice, battle)
             if order is None:
                 continue
             if rank:
-                self.search_stats.root_pick_illegal += 1
+                with self._lock:
+                    self.search_stats.root_pick_illegal += 1
             self._record(
                 battle,
                 Decision(
@@ -372,8 +424,9 @@ class SetSearchPlayer(Player):
         reason: str,
         ranked: Tuple[Tuple[str, int, float], ...] = (),
     ) -> BattleOrder:
-        self.search_stats.defaulted += 1
-        self.search_stats.note_failure(reason)
+        with self._lock:
+            self.search_stats.defaulted += 1
+            self.search_stats.note_failure(reason)
         order = self.choose_default_move()
         self._record(
             battle,
@@ -393,8 +446,9 @@ class SetSearchPlayer(Player):
         return order
 
     def _record(self, battle: AbstractBattle, decision: Decision) -> None:
-        self.search_stats.turns += 1
-        self.search_stats.seconds += decision.seconds
-        self.search_stats.visits += decision.total_visits
+        with self._lock:
+            self.search_stats.turns += 1
+            self.search_stats.seconds += decision.seconds
+            self.search_stats.visits += decision.total_visits
         if self._on_decision is not None:
             self._on_decision(decision)
