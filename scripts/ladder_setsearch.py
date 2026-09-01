@@ -11,8 +11,13 @@ Requires an already-registered Showdown account (this script cannot create
 one - see scripts/ladder_ppo.py's module docstring, which verified this
 against poke-env's own login code). Per this project's Hard Rules ("Ladder
 runs of the bot itself follow bot etiquette (alt account, register as bot
-where required)"): use a dedicated alt, not a personal account - the same
-alt scripts/ladder_ppo.py used is fine to reuse. The password is never taken
+where required)"): use a dedicated alt, not a personal account - and a
+DIFFERENT alt from ladder_ppo.py's, not the same one. Reusing that account
+was tried first and found to contaminate the reading: Glicko rating deviation
+converges after enough games that a new bot's results barely move it, so this
+player's GXE would really be reporting Phase 3's PPO endpoint, not this
+player's own strength - see
+notes/phase-6-m6-ladder-canary-and-account-contamination.md. The password is never taken
 as a plain CLI argument; set POKE_SHOWDOWN_USERNAME/POKE_SHOWDOWN_PASSWORD or
 put them in the gitignored .env.local, exactly as ladder_ppo.py does.
 
@@ -35,15 +40,32 @@ raising --max-concurrent-battles here has not been tested against a real
 opponent's turn timer.
 
 Each ladder game is real and real-time, unlike the local benchmark harness's
-batched near-instant battles, and --search-time-ms (default matches the M5
-gate: 400 ms x 4 samples) is added directly to Showdown's own per-turn clock
-from the bot's side - a real cost against a human opponent's patience, not
-just wall-clock housekeeping. Start with a small --n-games.
+batched near-instant battles, and --search-time-ms (default: set_search.py's
+own DEFAULT_SEARCH_TIME_MS/DEFAULT_OPPONENT_SAMPLES, 1000 ms x 8 samples - a
+real ladder turn has no benchmark-budget pressure, only Showdown's own timer)
+is added directly to Showdown's own per-turn clock from the bot's side - a
+real cost against a human opponent's patience, not just wall-clock
+housekeeping. Start with a small --n-games.
+
+**Pause/resume**: games are played one at a time via a Python-level loop
+around poke_env's own `Player.ladder(1)` (not a single `ladder(n)` call),
+checking --pause-file between iterations - the only point in a ladder run
+where stopping doesn't strand a real opponent mid-game. `Player.ladder`'s own
+internals (poke_env/player/player.py's `_ladder`) already loop battle-by-
+battle this way internally, so calling it once per game from here is
+equivalent, not a behavior change. Touch the pause file (`touch <path>`) to
+pause before the next game is searched for, `rm` it to resume; the process
+polls for it every --pause-poll-seconds. A SIGSTOP/SIGCONT on the process
+itself would NOT be safe here - it would freeze the websocket mid-battle,
+which is exactly the "goes silent, opponent's connection times out, game gets
+abandoned" failure this avoids.
 
 Usage:
     echo 'POKE_SHOWDOWN_USERNAME=my-bot-alt' >> .env.local
     echo 'POKE_SHOWDOWN_PASSWORD=...' >> .env.local
     .venv/bin/python scripts/ladder_setsearch.py --n-games 10
+    touch /tmp/pause-m6   # pauses before the next game once the current one ends
+    rm /tmp/pause-m6      # resumes
 """
 
 from __future__ import annotations
@@ -54,6 +76,7 @@ import getpass
 import os
 import time
 from pathlib import Path
+from typing import Optional
 
 from poke_env.player.battle_order import BattleOrder
 from poke_env.ps_client import AccountConfiguration, ShowdownServerConfiguration
@@ -97,6 +120,36 @@ def _instrument_progress(player: SetSearchPlayer) -> None:
         )
 
     player._battle_finished_callback = logged_finished_callback
+
+
+async def _play_with_pause_support(
+    player: SetSearchPlayer, n_games: int, pause_file: Optional[Path], pause_poll_seconds: float
+) -> None:
+    """`player.ladder(n_games)`, but able to pause between games.
+
+    `Player.ladder` has no hook to pause mid-run, so this calls its own
+    `ladder(1)` once per game instead - equivalent to a single `ladder(n)`
+    call (poke_env's `_ladder` already loops battle-by-battle internally;
+    see this module's docstring), but with a real point to check a pause
+    flag between iterations. Checked only between games, never mid-battle -
+    pausing mid-battle would go silent on a live opponent's connection,
+    the exact failure this exists to avoid.
+    """
+    for game_index in range(n_games):
+        if pause_file is not None:
+            announced = False
+            while pause_file.exists():
+                if not announced:
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] paused ({pause_file} exists) - "
+                        f"{game_index}/{n_games} games played so far",
+                        flush=True,
+                    )
+                    announced = True
+                await asyncio.sleep(pause_poll_seconds)
+            if announced:
+                print(f"[{time.strftime('%H:%M:%S')}] resumed", flush=True)
+        await player.ladder(1)
 
 
 def _load_dotenv(path: Path) -> None:
@@ -156,6 +209,20 @@ async def main() -> None:
         "sequential). See the module docstring for why this player has not been "
         "verified safe above 1, unlike ladder_ppo.py's policy player.",
     )
+    parser.add_argument(
+        "--pause-file",
+        type=Path,
+        default=None,
+        help="if this path exists, pause before searching for the next game (the current "
+        "game, if any, always finishes first). Not created by this script - an external "
+        "`touch`/`rm` controls it. Default: no pause file, never pauses.",
+    )
+    parser.add_argument(
+        "--pause-poll-seconds",
+        type=float,
+        default=10.0,
+        help="how often to check --pause-file while paused (default: 10s)",
+    )
     args = parser.parse_args()
 
     if args.max_concurrent_battles > 1:
@@ -183,18 +250,20 @@ async def main() -> None:
         server_configuration=ShowdownServerConfiguration,
         save_replays=args.save_replays,
         max_concurrent_battles=args.max_concurrent_battles,
+        start_timer_on_battle_start=True,
     )
 
     _instrument_progress(player)
 
     try:
+        pause_note = f", pause file: {args.pause_file}" if args.pause_file else ""
         print(
             f"laddering as {args.username} on {args.format} for {args.n_games} games "
             f"({args.search_time_ms}ms over {args.opponent_samples} sampled opponents, "
-            f"{args.threads} threads)...",
+            f"{args.threads} threads{pause_note})...",
             flush=True,
         )
-        await player.ladder(args.n_games)
+        await _play_with_pause_support(player, args.n_games, args.pause_file, args.pause_poll_seconds)
         print(
             f"\n{player.n_won_battles}/{args.n_games} won "
             f"({player.n_won_battles / args.n_games:.1%}), "

@@ -39,7 +39,7 @@ Status section below are the surviving record of phases 0-3.)
 Working history lives in `notes/`, not in this file — see
 [[battle-engine/notes/index|notes/index]] for the full map.
 
-Current state, as of 2026-08-31:
+Current state, as of 2026-09-01:
 
 - **Phase 0** (harness, baselines) — gate met.
 - **Phase 1** (classical search) — gate met. `TwoPlySearchPlayer` beats `MaxBasePowerPlayer`
@@ -70,19 +70,19 @@ Current state, as of 2026-08-31:
   feature blocks, correctness harness passing. Numbered as Phase 5 in `README.md`'s public phase
   table; note that some existing notes use "Phase 5" for plan-local milestone numbering inside
   the Phase 4 plan instead.
-- **Phase 6** (the Foul Play architecture) — **now the project's active focus**, started
-  2026-08-30. Diagnosis: Phase 4 did not fail to build a search, it built a good search over a
-  forward model that cannot represent the game (`forward_model.cpp` mentions `Status` exactly
-  once, an early `return 0.0f` — no boosts, items, abilities, residuals, weather effects, or
-  Tera). Phase 6 binds [poke-engine](https://github.com/pmariglia/poke-engine) as a complete
-  gen9 forward model, adds usage-stats-based opponent set prediction, and searches under a
-  wall-clock budget with root parallelism — the architecture
+- **Phase 6** (the Foul Play architecture) — **complete, gate met, 2026-09-01**. Diagnosis:
+  Phase 4 did not fail to build a search, it built a good search over a forward model that
+  cannot represent the game (`forward_model.cpp` mentions `Status` exactly once, an early
+  `return 0.0f` — no boosts, items, abilities, residuals, weather effects, or Tera). Phase 6
+  binds [poke-engine](https://github.com/pmariglia/poke-engine) as a complete gen9 forward
+  model, adds usage-stats-based opponent set prediction, and searches under a wall-clock budget
+  with root parallelism — the architecture
   [pmariglia/foul-play](https://github.com/pmariglia/foul-play) uses to reach 80% GXE and top
   100 in gen9 OU with no RL at all. **Gate: GXE above 50% on the real gen9ou ladder**, against
-  Phase 3's measured 26.3% baseline. Full plan:
+  Phase 3's measured 26.3% baseline — **measured at 68.2% GXE** (M6, below). Full plan:
   `/Users/edward/.claude/plans/phase-6-foul-play-architecture.md`.
 
-  Milestone state as of 2026-08-31:
+  Milestone state as of 2026-09-01:
 
   - **M1** (gen9 toolchain) — built and verified; `scripts/build_poke_engine.sh` plus the
     gen9 guard test.
@@ -139,18 +139,29 @@ Current state, as of 2026-08-31:
     every sample in a turn fails this way the bot falls through to a default move for that turn.
     Full numbers and the panic-clustering finding:
     [[battle-engine/notes/phase-6-m5-the-player|the log note]].
-  - **M6** (real-ladder GXE) — started 2026-08-31, **blocked on a decision**.
-    `scripts/ladder_setsearch.py` plays `SetSearchPlayer` on the real gen9ou ladder; a 10-game
-    canary went cleanly (6/10 won, no crashes, panic-recovery behavior confirmed live). But it
-    reused `battle-engine-test`, the same alt Phase 3's `ladder_ppo.py` used, and that account's
-    GXE after the canary (26.5%, Glicko 1307 +/- 41) is essentially Phase 3's PPO endpoint
-    unmoved (26.3%, 1305 +/- 39) — a converged rating from 45+ prior games doesn't shift
-    meaningfully in 10 more. **The gate cannot be measured on this account without a very large
-    game count.** Needs either a fresh dedicated alt (the real fix, but registration needs a
-    human — not attempted autonomously) or a deliberate decision to grind a much larger count on
-    the shared account. Full findings:
+  - **M6** (real-ladder GXE) — started 2026-08-31, **done, gate met**.
+    `scripts/ladder_setsearch.py` plays `SetSearchPlayer` on the real gen9ou ladder. A first
+    10-game canary reused `battle-engine-test` (Phase 3's `ladder_ppo.py` alt) and found that
+    unusable: its GXE after 10 more games (26.5%, Glicko 1307 +/- 41) was essentially Phase 3's
+    PPO endpoint unmoved (26.3%, 1305 +/- 39) — a converged rating from 45+ prior games doesn't
+    shift meaningfully in 10 more, so the gate could not be measured on a reused account. Fixed
+    with a fresh dedicated alt, `battle-engine-p6` (credentials in the gitignored `.env.local`
+    as `POKE_SHOWDOWN_USERNAME_M6`/`POKE_SHOWDOWN_PASSWORD_M6`). Full canary findings:
     [[battle-engine/notes/phase-6-m6-ladder-canary-and-account-contamination|the log note]].
-    **Phase 6 gate: GXE above 50%**, against Phase 3's measured 26.3% baseline.
+
+    A 50-game run on the fresh alt finished 2026-09-01: **34-16 (68.0%), GXE 68.2%** — clears
+    the 50% gate bar by a wide margin and more than doubles Phase 3's RL-era 26.3% baseline, with
+    no learned policy anywhere in the pipeline. One real operational fix along the way:
+    `start_timer_on_battle_start=True` (poke-env's own `/timer on` support, not previously
+    wired up) cut the worst-case battle from 1h41m to under 15 minutes across the final
+    44-battle run. Real-ladder concurrency (`--max-concurrent-battles`) was not used — the
+    script's pause-safe play loop calls `player.ladder(1)` sequentially, which doesn't compose
+    with `max_concurrent_battles` the way `run_benchmark`'s fix does; see
+    [[battle-engine/notes/decision-ladder-concurrency-needs-its-own-scheduling-fix|the decision
+    note]]. Full numbers, the per-run breakdown, and the panic-rate comparison against M5's local
+    benchmark: [[battle-engine/notes/phase-6-m6-ladder-run-results|the log note]].
+
+    **Phase 6 gate: GXE above 50% — MET (68.2%)**, against Phase 3's measured 26.3% baseline.
 
 ## Working notes
 
@@ -361,6 +372,19 @@ git clone --depth 1 --branch v0.0.48 https://github.com/pmariglia/poke-engine.gi
 # at 8 over the same 1,000 ms) - so samples buy opponent coverage, not depth.
 .venv/bin/python scripts/benchmark.py --p1 setsearch --p2 search --format gen9ou \
   --n-battles 500 --search-time-ms 400 --opponent-samples 4
+
+# --max-concurrent-battles N (default 1): run N battles at once instead of
+# strictly one at a time - real, measured throughput gain for CPU-light
+# players (~26% faster for random-vs-maxdamage at N=4), but NOT for
+# "setsearch": poke_engine.monte_carlo_tree_search holds Python's GIL for its
+# whole call and never releases it (confirmed against the pinned Rust
+# source), so concurrent setsearch battles fully serialize on the search step
+# and measured ~12% SLOWER than sequential (pure thread-switching overhead,
+# zero parallelism). Use this flag for lighter --p1/--p2 choices; leave it at
+# the default for setsearch until poke-engine's binding or the offload
+# mechanism changes.
+.venv/bin/python scripts/benchmark.py --p1 random --p2 maxdamage \
+  --n-battles 500 --max-concurrent-battles 4
 
 # Diagnostic (not a benchmark): plays real games and prints what the search
 # chose each turn, its share of the visit mass, its win-probability estimate

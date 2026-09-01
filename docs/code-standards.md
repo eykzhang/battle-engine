@@ -1,9 +1,62 @@
-<!-- base-commit: be5d78c401377de01e36f2797f0fa9016eddf467 -->
-<!-- generated: 2026-08-24 -->
+<!-- base-commit: 112a8079b53b830ab9f701a76dc8ddd8fd7edec1 -->
+<!-- generated: 2026-08-31 -->
 
 # Code Standards
 
 ## Forbidden Patterns
+
+**Never let "not observable" collapse into `None`/`0`/falsy.** Phase 6's replay parser
+(`battle_engine/replay_log.py`) introduced a real sentinel type for this rather than reusing
+`None`, specifically because `if mon.item:` on an unknown item would silently read as "no
+item."
+```python
+# BAD — collapses two different facts into one falsy value
+mon.item = None  # means... not observable? or confirmed no item? can't tell later.
+
+# GOOD — from replay_log.py's UnknownType: refuses to be truthy-tested at all
+class UnknownType:
+    def __bool__(self) -> bool:
+        raise TypeError(
+            "UNKNOWN has no truth value - it means 'not observable from the log', "
+            "which is not the same as None ('known absent') or 0. Branch on "
+            "is_known(value) instead."
+        )
+
+UNKNOWN = UnknownType()
+```
+
+**Never assume a library/API's behavior — verify against real source or real data first.** This
+project's hard rule ("Evidence over assumption," `CLAUDE.md`) exists because poke-env's API has
+silently shifted across versions and cost real debugging time when trusted blind.
+```python
+# BAD — guesses poke-env's field semantics from the name alone
+protect_streak = mon.protect_counter  # assumed: increments every turn Protect is chosen
+
+# GOOD — from encoding.py's module docstring: verified against poke-env's actual source,
+# with the exact wrong assumption named and the real behavior measured against ground truth
+# (player_prev_move is "last move ever used," NOT "move used this transition" — a first
+# version that assumed the latter was wrong on 59.4% of real streak-2 reconstructions)
+```
+
+**Never let a Rust-extension panic hide behind `except Exception`.** `poke_engine`'s threaded
+search raises a pyo3 `PanicException`, which `except Exception` does not catch — this cost a
+whole turn's search before it was diagnosed (`set_search.py`'s `_search_each`).
+```python
+# BAD — a PanicException sails straight past this and crashes the whole battle
+try:
+    result = poke_engine.monte_carlo_tree_search(state, ...)
+except Exception:
+    ...
+
+# GOOD — from set_search.py's _search_each: BaseException, with the reason stated inline,
+# and scoped to one sample so one panicking sample costs 1/8 of a turn's search, not the turn
+try:
+    results.append(poke_engine.monte_carlo_tree_search(state, ...))
+except BaseException as exc:  # noqa: BLE001
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        raise
+    self.search_stats.sample_failures += 1
+```
 
 **Never assume a library/API's behavior — verify against real source or real data first.** This
 project's hard rule ("Evidence over assumption," `CLAUDE.md`) exists because poke-env's API has
@@ -142,6 +195,15 @@ Battle fixtures use `SimpleNamespace` wrapping real `poke_env` `Pokemon`/`Move` 
 reads — not a live server connection, and not a hand-rolled fake `Pokemon` class. Run the native
 suite via `./scripts/pytest_native.sh`, never bare `pytest`, whenever `_native` is exercised.
 
+**Testing async code: plain `asyncio.run(...)` inside an ordinary `def test_...`, never
+`pytest.mark.asyncio`.** This repo has no `pytest-asyncio` dependency and shouldn't gain one —
+`tests/test_benchmark.py` already establishes the pattern for anything that awaits a coroutine
+(`run_benchmark`, and by the same convention any `async def choose_move`):
+```python
+# From tests/test_benchmark.py
+result = asyncio.run(run_benchmark(p1, p2, n_battles=4))
+```
+
 ## Naming Conventions
 
 C++: `snake_case` functions/variables, `PascalCase` types, `kCamelCase` for `constexpr`
@@ -211,3 +273,18 @@ required reference for `scripts/export_weights.py`/M3's C++ forward pass.
 project's convention of recording every simplification's rationale (and, where one exists, the
 bug/measurement that produced it) directly in the module docstring rather than in an external
 design doc.
+
+**`battle_engine/set_search.py`** (Phase 6 M5) — the project's exemplar for a player wired
+directly to a real-time, real-opponent context: every failure path (translation error, all
+samples panicking, no legal action in the aggregated result) falls through to
+`choose_default_move()` rather than raising out of `choose_move`, because the caller is a live
+Showdown turn timer, not a batch job that can afford to crash. `SearchStats` + `note_failure`
+show the project's convention for a running diagnostic tally attached to the player instance
+itself, read by both the diagnostic script (`scripts/inspect_set_search.py`) and the phase-gate
+scripts, rather than logged and thrown away.
+
+**`battle_engine/poke_engine_state.py`** (Phase 6 M3) — the project's exemplar for a translator
+between two systems that separates *what was observed* from *what was assumed to fill a gap*: an
+injectable `filler` seam plus a provenance ledger recording which fields were real vs. assumed,
+so a downstream consumer (M3's fidelity harness, M4's set-prediction eval) can score assumption
+quality separately from translation correctness.
