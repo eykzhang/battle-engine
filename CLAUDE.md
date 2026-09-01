@@ -24,11 +24,12 @@ state representation, set prediction, PPO in the historical code), explain what 
 and why it's the right tool before/while using it. Small, understood steps beat big
 opaque ones.
 
-Plans, in roadmap order (read the active one before making architectural decisions):
+Plans, in roadmap order (the project is complete — Phase 6's gate is met — but these
+are still the record of the architectural decisions behind each phase):
 
 - Phase 4, the C++ search core: `/Users/edward/.claude/plans/precious-crafting-bachman.md`
 - Phase 4 close-out (M7 + enhancement track): `/Users/edward/.claude/plans/zesty-zooming-wozniak.md`
-- **Phase 6, active** — the Foul Play architecture:
+- **Phase 6, complete** — the Foul Play architecture:
   `/Users/edward/.claude/plans/phase-6-foul-play-architecture.md`
 
 (The original roadmap plan file no longer exists on disk; `notes/index.md` plus the
@@ -443,9 +444,7 @@ harness/training scripts land — don't leave this stale.
   poke-engine MCTS over K sampled opponent teams on a wall-clock budget, with
   a root legality backstop and a `BaseException` catch that turns a Rust panic
   into a bad move rather than a forfeited game);
-  Phase 4:
-  pure-Python MCTS/DUCT
-  validation prototype (`mcts_prototype.py`, throwaway, see Status), compiled C++
+  compiled C++
   extension lands here as `_native*.so` (gitignored)
 - `cpp/` — Phase 4's C++ engine (M1 toolchain + M4 `BattleState`/hand-crafted-eval
   port done, see Status; `include/be/`, `src/`, `bindings/module.cpp`, `tests/` per
