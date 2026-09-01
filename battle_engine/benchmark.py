@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from poke_env.concurrency import handle_threaded_coroutines
 from poke_env.player import Player
 
 
@@ -65,6 +66,111 @@ class BenchmarkResult:
         )
 
 
+async def _run_concurrent_battles(
+    p1: Player,
+    p2: Player,
+    *,
+    n_battles: int,
+    progress_interval: int,
+    checkpoint_path: Path | None,
+    stop_requested: asyncio.Event,
+    start: float,
+) -> int:
+    """max_concurrent_battles > 1 path: one bulk battle_against(..., n_battles=
+    n_battles) call, with per-battle checkpoint/progress signaled via
+    p1._battle_finished_callback rather than derived from battle_against's own
+    (batched, whole-instance) completion.
+
+    Why not N separate battle_against(p2, n_battles=1) calls instead: each one
+    internally ends on `await self._battle_count_queue.join()`, which is
+    shared across the whole player instance - so N concurrent calls would all
+    return together once every battle currently tracked on p1 finishes, not
+    each independently. That would batch completions together and break the
+    per-battle checkpoint requirement, hence the single bulk call here plus
+    the _battle_finished_callback hook (poke-env's own native per-battle hook,
+    fired synchronously from _handle_battle_message's win/tie handling,
+    independent of battle_against's own completion) for real per-battle
+    signaling instead.
+
+    The callback fires on POKE_LOOP (poke-env's own dedicated background-
+    thread event loop, poke_env/concurrency.py) - single-threaded and
+    cooperative, so two battles' finish callbacks never run concurrently with
+    each other, only interleaved. No lock is needed around the bookkeeping
+    below as a result.
+    """
+    original_callback = p1._battle_finished_callback
+    completed = 0
+
+    def _on_battle_finished(battle) -> None:
+        nonlocal completed
+        original_callback(battle)
+        completed += 1
+        elapsed = time.monotonic() - start
+
+        if checkpoint_path is not None:
+            checkpoint_path.write_text(
+                json.dumps(
+                    {
+                        "p1_name": p1.__class__.__name__,
+                        "p2_name": p2.__class__.__name__,
+                        "n_completed": completed,
+                        "n_battles_target": n_battles,
+                        "p1_wins": p1.n_won_battles,
+                        "p2_wins": p1.n_lost_battles,
+                        "ties": p1.n_tied_battles,
+                        "elapsed_s": round(elapsed, 1),
+                    }
+                )
+            )
+
+        if progress_interval and (completed % progress_interval == 0 or completed == n_battles):
+            rate = elapsed / completed
+            eta = rate * (n_battles - completed)
+            print(
+                f"[{completed}/{n_battles}] {p1.n_won_battles}W-{p1.n_lost_battles}L-"
+                f"{p1.n_tied_battles}T ({p1.n_won_battles / completed:.1%}) | "
+                f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining",
+                flush=True,
+            )
+
+    p1._battle_finished_callback = _on_battle_finished
+    try:
+        task = asyncio.create_task(p1.battle_against(p2, n_battles=n_battles))
+        stop_waiter = asyncio.create_task(stop_requested.wait())
+        try:
+            done, _pending = await asyncio.wait({task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if task not in done:
+                task.cancel()
+                print(
+                    f"\nStop requested - stopping after {completed}/{n_battles} battles "
+                    "so far (a real, partial result, not a crash). Waiting for any "
+                    "already in-flight battles to finish...",
+                    flush=True,
+                )
+        finally:
+            if not stop_waiter.done():
+                stop_waiter.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Cross-loop: battle_against runs (via handle_threaded_coroutines) on
+        # POKE_LOOP, not this coroutine's own loop, so a bare
+        # `await p1._battle_count_queue.join()` here raises RuntimeError
+        # (bound to a different event loop) - route through the same bridge
+        # poke-env's own public methods use internally. A no-op when task
+        # already completed normally (battle_against's own internal
+        # _battle_count_queue.join() already resolved it); the real drain
+        # only matters after the cancel-on-early-exit branch above.
+        await handle_threaded_coroutines(p1._battle_count_queue.join(), p1.ps_client.loop)
+    finally:
+        p1._battle_finished_callback = original_callback
+
+    return completed
+
+
 async def run_benchmark(
     p1: Player,
     p2: Player,
@@ -72,6 +178,7 @@ async def run_benchmark(
     progress_interval: int = 0,
     checkpoint_path: Path | None = None,
     graceful_early_exit: bool = False,
+    max_concurrent_battles: int = 1,
 ) -> BenchmarkResult:
     """Play p1 vs p2 for up to n_battles and report p1's win rate with a 95% CI.
 
@@ -106,6 +213,20 @@ async def run_benchmark(
     handler around every call would be a real behavior change for existing
     callers (e.g. training-loop code that has its own Ctrl+C handling) that
     never asked for it - scripts/benchmark.py's CLI opts in explicitly.
+
+    max_concurrent_battles: at the default (1, or anything <= 1), battles
+    are played strictly one at a time via the loop above - unchanged from
+    before this parameter existed. At > 1, a separate code path launches a
+    single bulk p1.battle_against(p2, n_battles=n_battles) call as a
+    background task and lets poke-env's own bounded _battle_count_queue
+    (sized by whatever max_concurrent_battles each player was itself
+    constructed with) pace how many battles are actually in flight at once.
+    Per-battle checkpoint/progress signaling still fires after every
+    individual completed battle (via Player._battle_finished_callback,
+    poke-env's own native per-battle hook), not batched at the end - see
+    _run_concurrent_battles for why a naive N-separate-battle_against-calls
+    design does not give that per-battle signal (battle_against's own
+    completion is shared/batched across the whole player instance).
     """
     p1.reset_battles()
     p2.reset_battles()
@@ -124,44 +245,55 @@ async def run_benchmark(
     start = time.monotonic()
     completed = 0
     try:
-        for i in range(1, n_battles + 1):
-            await p1.battle_against(p2, n_battles=1)
-            completed = i
-            elapsed = time.monotonic() - start
+        if max_concurrent_battles <= 1:
+            for i in range(1, n_battles + 1):
+                await p1.battle_against(p2, n_battles=1)
+                completed = i
+                elapsed = time.monotonic() - start
 
-            if checkpoint_path is not None:
-                checkpoint_path.write_text(
-                    json.dumps(
-                        {
-                            "p1_name": p1.__class__.__name__,
-                            "p2_name": p2.__class__.__name__,
-                            "n_completed": completed,
-                            "n_battles_target": n_battles,
-                            "p1_wins": p1.n_won_battles,
-                            "p2_wins": p1.n_lost_battles,
-                            "ties": p1.n_tied_battles,
-                            "elapsed_s": round(elapsed, 1),
-                        }
+                if checkpoint_path is not None:
+                    checkpoint_path.write_text(
+                        json.dumps(
+                            {
+                                "p1_name": p1.__class__.__name__,
+                                "p2_name": p2.__class__.__name__,
+                                "n_completed": completed,
+                                "n_battles_target": n_battles,
+                                "p1_wins": p1.n_won_battles,
+                                "p2_wins": p1.n_lost_battles,
+                                "ties": p1.n_tied_battles,
+                                "elapsed_s": round(elapsed, 1),
+                            }
+                        )
                     )
-                )
 
-            if progress_interval and (i % progress_interval == 0 or i == n_battles):
-                rate = elapsed / i
-                eta = rate * (n_battles - i)
-                print(
-                    f"[{i}/{n_battles}] {p1.n_won_battles}W-{p1.n_lost_battles}L-"
-                    f"{p1.n_tied_battles}T ({p1.n_won_battles / i:.1%}) | "
-                    f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining",
-                    flush=True,
-                )
+                if progress_interval and (i % progress_interval == 0 or i == n_battles):
+                    rate = elapsed / i
+                    eta = rate * (n_battles - i)
+                    print(
+                        f"[{i}/{n_battles}] {p1.n_won_battles}W-{p1.n_lost_battles}L-"
+                        f"{p1.n_tied_battles}T ({p1.n_won_battles / i:.1%}) | "
+                        f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining",
+                        flush=True,
+                    )
 
-            if stop_requested.is_set():
-                print(
-                    f"\nStop requested - stopping after {completed}/{n_battles} battles "
-                    "(a real, partial result, not a crash).",
-                    flush=True,
-                )
-                break
+                if stop_requested.is_set():
+                    print(
+                        f"\nStop requested - stopping after {completed}/{n_battles} battles "
+                        "(a real, partial result, not a crash).",
+                        flush=True,
+                    )
+                    break
+        else:
+            completed = await _run_concurrent_battles(
+                p1,
+                p2,
+                n_battles=n_battles,
+                progress_interval=progress_interval,
+                checkpoint_path=checkpoint_path,
+                stop_requested=stop_requested,
+                start=start,
+            )
     finally:
         if graceful_early_exit:
             for sig in installed_signals:

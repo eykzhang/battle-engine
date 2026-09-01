@@ -18,9 +18,13 @@ ground truth the backstop checks against.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
+import threading
+import time
 from types import SimpleNamespace
+from typing import Awaitable
 
 import pytest
 
@@ -216,7 +220,7 @@ class TestChooseMove:
             lambda state, **kw: _result([("icespinner", 100, 60.0), ("headlongrush", 10, 4.0)]),
         )
         player = _player(stats, n_opponent_samples=2, search_time_ms=10)
-        assert "icespinner" in player.choose_move(_battle()).message
+        assert "icespinner" in asyncio.run(player.choose_move(_battle())).message
         assert player.search_stats.root_pick_illegal == 0
 
     def test_walks_down_the_ranking_when_the_top_pick_is_not_really_legal(self, stats, monkeypatch):
@@ -229,7 +233,7 @@ class TestChooseMove:
             lambda state, **kw: _result([("earthquake", 900, 500.0), ("icespinner", 100, 60.0)]),
         )
         player = _player(stats, n_opponent_samples=1, search_time_ms=10)
-        assert "icespinner" in player.choose_move(_battle()).message
+        assert "icespinner" in asyncio.run(player.choose_move(_battle())).message
         assert player.search_stats.root_pick_illegal == 1
         assert player.search_stats.defaulted == 0
 
@@ -240,7 +244,7 @@ class TestChooseMove:
             lambda state, **kw: _result([("earthquake", 900, 500.0)]),
         )
         player = _player(stats, n_opponent_samples=1, search_time_ms=10)
-        player.choose_move(_battle())
+        asyncio.run(player.choose_move(_battle()))
         assert player.search_stats.failures == {"no_legal_action_in_search": 1}
 
     def test_a_rust_panic_is_a_bad_move_not_a_forfeited_game(self, stats, monkeypatch):
@@ -255,7 +259,7 @@ class TestChooseMove:
 
         monkeypatch.setattr(set_search.poke_engine, "monte_carlo_tree_search", boom)
         player = _player(stats, n_opponent_samples=1, search_time_ms=10)
-        assert player.choose_move(_battle()) is not None
+        assert asyncio.run(player.choose_move(_battle())) is not None
         assert player.search_stats.failures == {"sample:Panic": 1, "all_searches_failed": 1}
 
     def test_one_failed_sample_costs_a_sample_not_the_turn(self, stats, monkeypatch):
@@ -278,7 +282,7 @@ class TestChooseMove:
         seen = []
         player = _player(stats, n_opponent_samples=4, search_time_ms=40, on_decision=seen.append)
 
-        assert "icespinner" in player.choose_move(_battle()).message
+        assert "icespinner" in asyncio.run(player.choose_move(_battle())).message
         assert player.search_stats.defaulted == 0
         assert player.search_stats.sample_failures == 1
         assert player.search_stats.samples_run == 3
@@ -292,7 +296,7 @@ class TestChooseMove:
             lambda state, **kw: (_ for _ in ()).throw(RuntimeError("nope")),
         )
         player = _player(stats, n_opponent_samples=3, search_time_ms=30)
-        assert player.choose_move(_battle()) is not None
+        assert asyncio.run(player.choose_move(_battle())) is not None
         assert player.search_stats.sample_failures == 3
         assert player.search_stats.failures["all_searches_failed"] == 1
 
@@ -304,7 +308,7 @@ class TestChooseMove:
 
         monkeypatch.setattr(set_search.poke_engine, "monte_carlo_tree_search", boom)
         with pytest.raises(interrupt):
-            _player(stats, n_opponent_samples=1, search_time_ms=10).choose_move(_battle())
+            asyncio.run(_player(stats, n_opponent_samples=1, search_time_ms=10).choose_move(_battle()))
 
     def test_a_translation_failure_is_recorded_and_survived(self, stats, monkeypatch):
         monkeypatch.setattr(
@@ -313,7 +317,7 @@ class TestChooseMove:
             lambda *a, **k: (_ for _ in ()).throw(ValueError("team preview")),
         )
         player = _player(stats, n_opponent_samples=1, search_time_ms=10)
-        assert player.choose_move(_battle()) is not None
+        assert asyncio.run(player.choose_move(_battle())) is not None
         assert player.search_stats.failures == {"translation:ValueError": 1}
 
     def test_a_turn_with_no_choice_never_reaches_the_search(self, stats, monkeypatch):
@@ -324,7 +328,7 @@ class TestChooseMove:
         battle = _battle()
         battle.parse_request({"wait": True, "side": _REQUEST["side"], "rqid": 9})
         player = _player(stats, n_opponent_samples=1, search_time_ms=10)
-        assert player.choose_move(battle) is not None
+        assert asyncio.run(player.choose_move(battle)) is not None
         assert player.search_stats.defaulted == 1
 
 
@@ -346,7 +350,7 @@ class TestBudget:
 
         monkeypatch.setattr(set_search.poke_engine, "monte_carlo_tree_search", record)
         player = _player(stats, search_time_ms=400, n_opponent_samples=4, threads=3)
-        player.choose_move(_battle())
+        asyncio.run(player.choose_move(_battle()))
         assert len(calls) == 4
         assert {c["duration_ms"] for c in calls} == {100}
         assert {c["threads"] for c in calls} == {3}
@@ -390,7 +394,7 @@ class TestDecisionLog:
         )
         seen = []
         player = _player(stats, n_opponent_samples=2, search_time_ms=10, on_decision=seen.append)
-        player.choose_move(_battle())
+        asyncio.run(player.choose_move(_battle()))
         assert len(seen) == 1
         decision = seen[0]
         assert isinstance(decision, Decision)
@@ -407,7 +411,7 @@ class TestDecisionLog:
         )
         seen = []
         player = _player(stats, n_opponent_samples=1, search_time_ms=10, on_decision=seen.append)
-        player.choose_move(_battle())
+        asyncio.run(player.choose_move(_battle()))
         assert seen[0].fallback_reason == "all_searches_failed"
 
     def test_stats_accumulate_across_turns(self, stats, monkeypatch):
@@ -418,7 +422,144 @@ class TestDecisionLog:
         )
         player = _player(stats, n_opponent_samples=1, search_time_ms=10)
         for _ in range(3):
-            player.choose_move(_battle())
+            asyncio.run(player.choose_move(_battle()))
         assert player.search_stats.turns == 3
         assert player.search_stats.visits == 30
         assert player.search_stats.ms_per_turn > 0
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking / thread-safety: `choose_move` offloads to a thread pool so a
+# blocked search no longer stalls poke-env's single asyncio event loop, and
+# is safe to call concurrently for different battles on one player instance.
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrency:
+    def test_choose_move_returns_an_awaitable(self, stats):
+        # poke-env's own `_handle_battle_request` checks
+        # `isinstance(choice, Awaitable)` before awaiting - this is the shape
+        # that check must see, and no caller-side change is needed for it.
+        player = _player(stats, n_opponent_samples=1, search_time_ms=10)
+        coro = player.choose_move(_battle())
+        assert isinstance(coro, Awaitable)
+        coro.close()
+
+    def test_executor_is_sized_from_max_concurrent_battles(self, stats):
+        default_player = _player(stats, n_opponent_samples=1, search_time_ms=10)
+        assert default_player._max_concurrent_battles == 1
+        assert default_player._executor._max_workers == 1
+
+        wide_player = _player(
+            stats, n_opponent_samples=1, search_time_ms=10, max_concurrent_battles=4
+        )
+        assert wide_player._executor._max_workers == 4
+
+    def test_two_concurrent_choose_move_calls_do_not_corrupt_stats(self, stats, monkeypatch):
+        # A tiny real sleep forces genuine thread interleaving instead of one
+        # call finishing before the other is even dispatched to the pool -
+        # the actual concurrency stress case, not just a shape check.
+        def slow(state, **kw):
+            time.sleep(0.01)
+            return _result([("icespinner", 10, 6.0)], total_visits=10)
+
+        monkeypatch.setattr(set_search.poke_engine, "monte_carlo_tree_search", slow)
+        player = _player(
+            stats, n_opponent_samples=2, search_time_ms=20, max_concurrent_battles=2
+        )
+
+        async def run_both():
+            return await asyncio.gather(
+                player.choose_move(_battle()), player.choose_move(_battle())
+            )
+
+        orders = asyncio.run(run_both())
+        assert len(orders) == 2
+        assert all(order is not None and "icespinner" in order.message for order in orders)
+
+        # No lost increments across the two concurrent calls: each of the two
+        # turns ran 2 samples successfully, so totals must be exactly
+        # additive, not short by whatever the lock failed to serialize.
+        assert player.search_stats.turns == 2
+        assert player.search_stats.samples_run == 4
+        # Each turn's `total_visits` is summed across its 2 samples (10 each);
+        # two turns must add exactly, not lose an update to the race.
+        assert player.search_stats.visits == 40
+        assert player.search_stats.defaulted == 0
+        assert player.search_stats.sample_failures == 0
+
+    def test_a_battle_mutation_during_search_is_not_validated_against_stale_state(
+        self, stats, monkeypatch
+    ):
+        # DW-1.9 / the review's Probe B: only the search itself may run off
+        # the event loop. Translation happens before the executor hand-off,
+        # so it sees the battle as it is at the start of the turn (moves
+        # available). While the search is in flight on a worker thread, a
+        # `parse_request` lands on the loop - the real shape poke-env's
+        # ps_client.py delivers with no per-battle serialization - and
+        # empties `available_moves`/`available_switches` (a real `wait=True`
+        # request does exactly this). If the legality walk still ran on the
+        # worker thread against a stale battle snapshot, it would validate
+        # "icespinner" as legal and play it. Because the walk now runs back
+        # on the loop after the search returns, it must see the CURRENT
+        # (mutated, empty) battle state and fall through to the default
+        # move instead.
+        #
+        # The value-only assertion below is not, by itself, proof the race is
+        # gone - under this exact timing (mutation strictly between the
+        # translation and legality-walk phases) even the old fully-offloaded
+        # implementation would land on the same default, since both phases
+        # ran sequentially inside the one worker-thread call. What actually
+        # distinguishes the fix is WHICH THREAD performs the legality walk:
+        # before the fix it ran on the executor's worker thread, racing
+        # poke-env's own `parse_request` calls on the loop thread by
+        # construction; after the fix it runs back on the loop thread itself,
+        # so there is no second thread touching `battle` at all. That is
+        # asserted directly below rather than left implicit.
+        real_order_from_choice = set_search.order_from_choice
+        seen_threads = []
+
+        def recording_order_from_choice(choice, battle):
+            seen_threads.append(threading.current_thread())
+            return real_order_from_choice(choice, battle)
+
+        monkeypatch.setattr(set_search, "order_from_choice", recording_order_from_choice)
+
+        def slow_search(state, **kw):
+            time.sleep(0.05)
+            return _result([("icespinner", 100, 60.0), ("headlongrush", 10, 4.0)])
+
+        monkeypatch.setattr(set_search.poke_engine, "monte_carlo_tree_search", slow_search)
+        battle = _battle()
+        player = _player(stats, n_opponent_samples=1, search_time_ms=10)
+
+        async def mutate_mid_search():
+            await asyncio.sleep(0.01)
+            battle.parse_request({"wait": True, "side": _REQUEST["side"], "rqid": 9})
+
+        main_thread = threading.current_thread()
+
+        async def run():
+            return await asyncio.gather(player.choose_move(battle), mutate_mid_search())
+
+        order, _ = asyncio.run(run())
+        assert order is not None
+        assert player.search_stats.defaulted == 1
+        assert player.search_stats.failures.get("no_legal_action_in_search") == 1
+        # The legality walk ran on the same thread as the event loop and the
+        # mutation, not on a worker thread - the structural fix, not luck.
+        assert seen_threads and all(t is main_thread for t in seen_threads)
+
+    def test_a_single_caller_behaves_exactly_as_before(self, stats, monkeypatch):
+        # Every current caller (scripts/benchmark.py, scripts/ladder_setsearch.py,
+        # scripts/inspect_set_search.py) calls choose_move once per turn, never
+        # concurrently on one player - this must still work unchanged.
+        monkeypatch.setattr(
+            set_search.poke_engine,
+            "monte_carlo_tree_search",
+            lambda state, **kw: _result([("icespinner", 10, 6.0)], total_visits=10),
+        )
+        player = _player(stats, n_opponent_samples=1, search_time_ms=10)
+        order = asyncio.run(player.choose_move(_battle()))
+        assert order is not None and "icespinner" in order.message
+        assert player.search_stats.turns == 1
