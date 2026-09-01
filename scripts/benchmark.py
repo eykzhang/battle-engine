@@ -124,6 +124,7 @@ def _make_player(
     opponent_samples: int = 8,
     threads: int = 4,
     usage_cutoff: int = 1500,
+    max_concurrent_battles: int = 1,
 ) -> Player:
     team = None if battle_format in _AUTO_TEAM_FORMATS else RandomTeamFromPool()
     # rand=True (a random 5-char suffix, not poke-env's own default per-process
@@ -146,6 +147,7 @@ def _make_player(
             eval_fn=make_eval_fn(model),
             switch_urgency_weight=LEARNED_SWITCH_URGENCY_WEIGHT,
             account_configuration=account_configuration,
+            max_concurrent_battles=max_concurrent_battles,
         )
     if name == "ppo":
         return load_ppo_player(
@@ -153,6 +155,7 @@ def _make_player(
             battle_format=battle_format,
             team=team,
             account_configuration=account_configuration,
+            max_concurrent_battles=max_concurrent_battles,
         )
     if name == "mcts":
         from battle_engine.mcts_player import MctsPlayer  # see the deferred-import comment above
@@ -162,6 +165,7 @@ def _make_player(
             team=team,
             n_simulations=n_simulations,
             account_configuration=account_configuration,
+            max_concurrent_battles=max_concurrent_battles,
         )
     if name == "mcts_puct":
         from battle_engine.mcts_player import MctsPuctPlayer  # see the deferred-import comment above
@@ -172,6 +176,7 @@ def _make_player(
             ppo_bin_path=str(ppo_bin_path),
             n_simulations=n_simulations,
             account_configuration=account_configuration,
+            max_concurrent_battles=max_concurrent_battles,
         )
     if name == "setsearch":
         # Deferred for the same reason as "mcts" above, plus one of its own:
@@ -187,8 +192,14 @@ def _make_player(
             threads=threads,
             cutoff=usage_cutoff,
             account_configuration=account_configuration,
+            max_concurrent_battles=max_concurrent_battles,
         )
-    return PLAYERS[name](battle_format=battle_format, team=team, account_configuration=account_configuration)
+    return PLAYERS[name](
+        battle_format=battle_format,
+        team=team,
+        account_configuration=account_configuration,
+        max_concurrent_battles=max_concurrent_battles,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -254,6 +265,21 @@ def parse_args() -> argparse.Namespace:
             "/tmp/benchmark_checkpoint_<p1>_vs_<p2>.json."
         ),
     )
+    parser.add_argument(
+        "--max-concurrent-battles",
+        type=int,
+        default=1,
+        help=(
+            "Play up to this many battles concurrently (default 1 - sequential, "
+            "today's behavior, unchanged). Threaded to both players' own "
+            "max_concurrent_battles (poke-env's own bound on how many battles a "
+            "player has in flight at once) and to run_benchmark's own scheduling. "
+            "Real wall-clock speedup depends on the player type - SetSearchPlayer's "
+            "poke-engine MCTS call holds the GIL for its whole duration, so raising "
+            "this does not deliver parallel search for it specifically, only true "
+            "concurrent battle scheduling at the asyncio/poke-env level."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -264,6 +290,7 @@ async def main() -> None:
         opponent_samples=args.opponent_samples,
         threads=args.threads,
         usage_cutoff=args.usage_cutoff,
+        max_concurrent_battles=args.max_concurrent_battles,
     )
     p1 = _make_player(
         args.p1, args.format, args.model_path, args.ppo_model_path, args.n_simulations, args.ppo_bin_path, **extras
@@ -284,6 +311,7 @@ async def main() -> None:
         progress_interval=args.progress_interval,
         checkpoint_path=checkpoint_path,
         graceful_early_exit=True,
+        max_concurrent_battles=args.max_concurrent_battles,
     )
     print(result)
 
