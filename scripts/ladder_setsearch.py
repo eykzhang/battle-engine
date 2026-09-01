@@ -27,17 +27,24 @@ real GXE at https://pokemonshowdown.com/users/<username> after playing
 (needs enough games for both the ladder rating and its displayed GXE to
 settle - Showdown's own FAQ is the source for how many).
 
-**Concurrency is 1 by default and should stay there for this player**,
-unlike ladder_ppo.py's PPO policy. SetSearchPlayer.choose_move is a
-synchronous, CPU-bound call that blocks poke-env's single asyncio event loop
-for its entire search_time_ms budget (poke_engine.monte_carlo_tree_search is
-not awaited - it can't be, it's a Rust extension call) - so a second
-concurrent battle's server messages, including its own turn timer, cannot be
-processed while a search is running. ladder_ppo.py's higher concurrency was
-verified safe there because FrozenPolicyPlayer.choose_move has no blocking
-work in it at all; that verification does not transfer to this player, and
-raising --max-concurrent-battles here has not been tested against a real
-opponent's turn timer.
+**Concurrency defaults to 1 but is now real.** SetSearchPlayer.choose_move is
+`async def` (battle_engine/set_search.py) - translation and the post-search
+legality check run on poke-env's event loop, and only the actual
+poke_engine.monte_carlo_tree_search call is offloaded to a thread, so a
+second concurrent battle's server messages (including its own turn timer)
+are processed normally while a search is in flight. --max-concurrent-battles
+raises the player's own bound on how many ladder games it has in flight at
+once (poke-env's Player._ladder already paces `search_ladder_game` requests
+against that bound internally - verified directly against
+poke_env/player/player.py, the same mechanism battle_against uses). One
+real, still-open caveat: poke_engine.monte_carlo_tree_search holds Python's
+GIL for its whole call and does not release it (verified against the pinned
+Rust source - see notes/gotcha-poke-engine-mcts-holds-the-gil.md), so
+concurrent battles do not search in parallel - they interleave, each search
+still fully serialized against the others. Concurrency here buys real games
+in flight at once (server-side wait time, turn timers, opponent think-time
+all overlap), not faster search. Not yet run against real opponents above
+concurrency 1 - start small.
 
 Each ladder game is real and real-time, unlike the local benchmark harness's
 batched near-instant battles, and --search-time-ms (default: set_search.py's
@@ -47,18 +54,29 @@ is added directly to Showdown's own per-turn clock from the bot's side - a
 real cost against a human opponent's patience, not just wall-clock
 housekeeping. Start with a small --n-games.
 
-**Pause/resume**: games are played one at a time via a Python-level loop
-around poke_env's own `Player.ladder(1)` (not a single `ladder(n)` call),
-checking --pause-file between iterations - the only point in a ladder run
-where stopping doesn't strand a real opponent mid-game. `Player.ladder`'s own
-internals (poke_env/player/player.py's `_ladder`) already loop battle-by-
-battle this way internally, so calling it once per game from here is
-equivalent, not a behavior change. Touch the pause file (`touch <path>`) to
-pause before the next game is searched for, `rm` it to resume; the process
-polls for it every --pause-poll-seconds. A SIGSTOP/SIGCONT on the process
-itself would NOT be safe here - it would freeze the websocket mid-battle,
-which is exactly the "goes silent, opponent's connection times out, game gets
-abandoned" failure this avoids.
+**Pause/resume**: one bulk `player.ladder(remaining_games)` call runs as a
+background task, raced against a --pause-file watcher via
+`asyncio.wait(..., return_when=FIRST_COMPLETED)` - the same design
+battle_engine/benchmark.py's run_benchmark uses for graceful concurrent
+early-exit. Real per-game completion is tracked via
+`Player._battle_finished_callback` (poke-env's own native per-game hook),
+not by counting `ladder()`'s own return, which only fires once ALL games in
+that bulk call are done. When the pause file appears: the ladder task is
+cancelled (safe - only stops issuing new `search_ladder_game` requests for
+NEW games; already-in-flight games' own message handling runs as
+independent tasks and is untouched), then in-flight games are drained via
+`Player._battle_count_queue.join()` (bridged through poke-env's
+`handle_threaded_coroutines`, since poke-env runs its own coroutines on a
+separate event-loop thread - a bare `await` on that queue raises
+`RuntimeError`). At `--max-concurrent-battles 1` this is one game, same as
+before; above 1, pausing lets every currently in-flight game finish first,
+which can be more than one - never a mid-battle stop. Once drained, the
+process waits for the pause file to be removed, then relaunches `ladder()`
+for whatever games remain - repeatable across multiple pause/resume cycles
+in one run. A SIGSTOP/SIGCONT on the process itself would NOT be safe here -
+it would freeze the websocket mid-battle, which is exactly the "goes
+silent, opponent's connection times out, game gets abandoned" failure this
+avoids.
 
 Usage:
     echo 'POKE_SHOWDOWN_USERNAME=my-bot-alt' >> .env.local
@@ -74,10 +92,12 @@ import argparse
 import asyncio
 import getpass
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 
+from poke_env.concurrency import handle_threaded_coroutines
 from poke_env.player.battle_order import BattleOrder
 from poke_env.ps_client import AccountConfiguration, ShowdownServerConfiguration
 
@@ -122,34 +142,116 @@ def _instrument_progress(player: SetSearchPlayer) -> None:
     player._battle_finished_callback = logged_finished_callback
 
 
+async def _wait_for_pause_file(pause_file: Path, poll_seconds: float) -> None:
+    """Completes once `pause_file` exists - a wakeup signal to race against
+    the in-flight `ladder()` task, not itself the paused-wait loop below."""
+    while not pause_file.exists():
+        await asyncio.sleep(poll_seconds)
+
+
 async def _play_with_pause_support(
     player: SetSearchPlayer, n_games: int, pause_file: Optional[Path], pause_poll_seconds: float
 ) -> None:
-    """`player.ladder(n_games)`, but able to pause between games.
+    """Plays n_games on the ladder with real concurrency (bounded by the
+    player's own max_concurrent_battles) and pause/resume support.
 
-    `Player.ladder` has no hook to pause mid-run, so this calls its own
-    `ladder(1)` once per game instead - equivalent to a single `ladder(n)`
-    call (poke_env's `_ladder` already loops battle-by-battle internally;
-    see this module's docstring), but with a real point to check a pause
-    flag between iterations. Checked only between games, never mid-battle -
-    pausing mid-battle would go silent on a live opponent's connection,
-    the exact failure this exists to avoid.
+    poke_env's Player.ladder(n) already implements bounded concurrency
+    correctly internally (`_ladder`'s `while self._battle_count_queue.full():
+    wait` loop, verified directly against poke_env/player/player.py) - the
+    same shape battle_engine/benchmark.py's run_benchmark uses via
+    battle_against. So this calls `ladder(remaining)` in one bulk background
+    task per pause/resume segment, rather than one `ladder(1)` call per game
+    - a sequential ladder(1)-per-game loop would defeat max_concurrent_battles
+    entirely, the same bug run_benchmark had before its own fix.
+
+    Real per-game completion (for the pause-safe game count, not for
+    `ladder()`'s own return - that only fires once every game in the whole
+    bulk call is done) comes from wrapping `Player._battle_finished_callback`,
+    poke-env's native per-game hook, fired synchronously and independently of
+    `ladder()`'s own completion.
     """
-    for game_index in range(n_games):
-        if pause_file is not None:
-            announced = False
-            while pause_file.exists():
-                if not announced:
-                    print(
-                        f"[{time.strftime('%H:%M:%S')}] paused ({pause_file} exists) - "
-                        f"{game_index}/{n_games} games played so far",
-                        flush=True,
+    completed = 0
+    # _on_finished runs on poke-env's own POKE_LOOP background thread (fired
+    # from _handle_battle_message on the win/tie message - see
+    # poke_env/concurrency.py), while the while-loop below reads `completed`
+    # from this coroutine's own thread. A bare `completed += 1` happens to be
+    # safe under CPython's GIL for a single int, but every other cross-thread
+    # touch in this function goes through an explicit synchronization
+    # primitive (handle_threaded_coroutines below) - match that rather than
+    # lean on GIL incidental behavior, so a future refactor that batches the
+    # increment can't silently drop or double-count completions.
+    completed_lock = threading.Lock()
+    original_callback = player._battle_finished_callback
+
+    def _on_finished(battle) -> None:
+        nonlocal completed
+        original_callback(battle)
+        with completed_lock:
+            completed += 1
+
+    player._battle_finished_callback = _on_finished
+    try:
+        while True:
+            with completed_lock:
+                if completed >= n_games:
+                    break
+                remaining = n_games - completed
+            ladder_task = asyncio.create_task(player.ladder(remaining))
+
+            if pause_file is not None:
+                pause_signal = asyncio.create_task(_wait_for_pause_file(pause_file, pause_poll_seconds))
+                try:
+                    done, _pending = await asyncio.wait(
+                        {ladder_task, pause_signal}, return_when=asyncio.FIRST_COMPLETED
                     )
-                    announced = True
-                await asyncio.sleep(pause_poll_seconds)
-            if announced:
+                    if ladder_task not in done:
+                        ladder_task.cancel()
+                        with completed_lock:
+                            so_far = completed
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] pause requested - stopping after "
+                            f"{so_far}/{n_games} games so far, letting in-flight games finish...",
+                            flush=True,
+                        )
+                    else:
+                        pause_signal.cancel()
+                finally:
+                    if not pause_signal.done():
+                        pause_signal.cancel()
+
+            try:
+                await ladder_task
+            except asyncio.CancelledError:
+                pass
+
+            # Cross-loop: ladder() runs (via handle_threaded_coroutines) on
+            # POKE_LOOP, not this coroutine's own loop, so a bare
+            # `await player._battle_count_queue.join()` here raises
+            # RuntimeError (bound to a different event loop) - route through
+            # the same bridge poke-env's own public methods use internally.
+            # A no-op when ladder_task already completed normally; the real
+            # drain only matters after the cancel-on-pause branch above.
+            await handle_threaded_coroutines(player._battle_count_queue.join(), player.ps_client.loop)
+
+            with completed_lock:
+                so_far, target_reached = completed, completed >= n_games
+            # Only wait to be un-paused if there's still something left to
+            # resume - otherwise this segment's ladder(remaining) simply
+            # finished on its own with the pause file still sitting there
+            # (e.g. touched during the very last game), and there is nothing
+            # left to pause before. Without this check the run hangs forever
+            # here even though every requested game already completed.
+            if pause_file is not None and pause_file.exists() and not target_reached:
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] paused ({pause_file} exists) - "
+                    f"{so_far}/{n_games} games played so far",
+                    flush=True,
+                )
+                while pause_file.exists():
+                    await asyncio.sleep(pause_poll_seconds)
                 print(f"[{time.strftime('%H:%M:%S')}] resumed", flush=True)
-        await player.ladder(1)
+    finally:
+        player._battle_finished_callback = original_callback
 
 
 def _load_dotenv(path: Path) -> None:
@@ -206,16 +308,18 @@ async def main() -> None:
         type=int,
         default=1,
         help="how many ladder battles this account plays simultaneously (default: 1, "
-        "sequential). See the module docstring for why this player has not been "
-        "verified safe above 1, unlike ladder_ppo.py's policy player.",
+        "sequential). Real as of this fix - poke-env's own Player.ladder() paces "
+        "concurrent games against this bound internally. Not yet run against real "
+        "opponents above 1 - see the module docstring's concurrency section.",
     )
     parser.add_argument(
         "--pause-file",
         type=Path,
         default=None,
-        help="if this path exists, pause before searching for the next game (the current "
-        "game, if any, always finishes first). Not created by this script - an external "
-        "`touch`/`rm` controls it. Default: no pause file, never pauses.",
+        help="if this path exists, pause before searching for new games (any currently "
+        "in-flight games - one at the default concurrency, possibly more above it - always "
+        "finish first). Not created by this script - an external `touch`/`rm` controls it. "
+        "Default: no pause file, never pauses.",
     )
     parser.add_argument(
         "--pause-poll-seconds",
@@ -227,11 +331,13 @@ async def main() -> None:
 
     if args.max_concurrent_battles > 1:
         print(
-            f"WARNING: --max-concurrent-battles {args.max_concurrent_battles} raises "
-            "poke-env's own battle concurrency, but SetSearchPlayer.choose_move blocks "
-            "the single asyncio event loop for its whole search budget - unlike "
-            "ladder_ppo.py's policy player, this has not been verified safe above 1. "
-            "See this script's module docstring. Proceeding anyway.",
+            f"NOTE: --max-concurrent-battles {args.max_concurrent_battles} - real concurrent "
+            "games now (SetSearchPlayer.choose_move is async/thread-safe as of the Phase 1 "
+            "concurrency fix), but this is the first time it's being run against real ladder "
+            "opponents above 1 - watch the first few games. Search itself does not run in "
+            "parallel across battles (poke_engine.monte_carlo_tree_search holds the GIL for "
+            "its whole call) - this buys overlapping wait/think time, not faster search. See "
+            "the module docstring.",
             flush=True,
         )
 
