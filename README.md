@@ -21,6 +21,24 @@ It's the intelligence layer behind [BattleBrain](https://github.com/eykzhang/bat
 a native iOS app that surfaces the engine's per-turn analysis for replay review, the
 same relationship Stockfish has to a chess GUI.
 
+`scripts/analyze_replay.py` is the seam between them. It walks a Showdown replay turn
+by turn, searches over sampled opponent teams at each turn, and emits one JSON
+document holding the win probability, the engine's ranked candidate actions, and what
+the move actually played cost against the best one. The engine needs a compiled gen9
+poke-engine build and cannot run on a phone, so the app ships those documents
+pre-computed rather than calling a service:
+
+```bash
+.venv/bin/python scripts/analyze_replay.py \
+  --replay gen9ou-2672927322 --perspective p1 --out analysis.json
+```
+
+Two coverage rates come out of it, and they are different questions. **Every** turn of
+a real replay translates into a position the engine can evaluate, so a win-probability
+curve is continuous. Only about half of them let the search also express the move the
+player actually chose, which is what grading requires — the limit there is that replays
+never reveal EV spreads or items, the same gap M4's set prediction measures.
+
 ## Why Pokémon is a hard AI problem
 
 Chess engines get to assume a lot that Pokémon takes away. Every turn is:
