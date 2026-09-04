@@ -74,10 +74,6 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: List[str]) -> int:
     args = _parse_args(argv)
 
-    # poke-env logs a warning per unrecognized protocol effect; not useful
-    # noise for a single-replay run.
-    logging.disable(logging.WARNING)
-
     try:
         path = _resolve_replay_path(args.replay, args.corpus)
     except FileNotFoundError as exc:
@@ -86,7 +82,13 @@ def main(argv: List[str]) -> int:
 
     try:
         payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError alongside the two obvious ones: a pathologically
+        # deep-nested JSON document (still third-party input reaching this
+        # process's trust boundary) blows Python's parser stack before it
+        # ever becomes a dict, so it can't be caught downstream the way a
+        # malformed `players`/`log` field is - json.JSONDecodeError doesn't
+        # cover it.
         print(f"error: could not read {path}: {exc}", file=sys.stderr)
         return 1
     if not isinstance(payload, dict):
@@ -108,8 +110,21 @@ def main(argv: List[str]) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(document, indent=2) + "\n")
+    try:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        # allow_nan=False: a backstop, not the primary defense (that's
+        # replay_analysis.py routing a non-finite score through the
+        # existing null/no-data path before it ever reaches here). If some
+        # case that check doesn't anticipate still produces a non-finite
+        # value, this fails the write loudly with a typed error instead of
+        # silently shipping a document `JSONDecoder` cannot load at all.
+        args.out.write_text(json.dumps(document, indent=2, allow_nan=False) + "\n")
+    except (OSError, ValueError) as exc:
+        # Mirrors the read path's guard: the write is just as capable of
+        # hitting a permissions/disk error as the read is, and previously
+        # was not wrapped at all.
+        print(f"error: could not write {args.out}: {exc}", file=sys.stderr)
+        return 1
 
     if not args.quiet:
         eval_bar, grading = coverage(document)
@@ -123,4 +138,11 @@ def main(argv: List[str]) -> int:
 
 
 if __name__ == "__main__":
+    # poke-env logs a warning per unrecognized protocol effect; not useful
+    # noise for a single-replay run. Scoped to running as a script, not
+    # inside main() itself: main() is imported and called directly by
+    # DW-2.15's tests, and logging.disable() is a permanent, process-global
+    # mutation that would otherwise leak into every test ordered after the
+    # first one that calls main().
+    logging.disable(logging.WARNING)
     raise SystemExit(main(sys.argv[1:]))
